@@ -16,10 +16,16 @@ from flag_gems.utils.triton_version_utils import HAS_TLE, HAS_TLE_DEVICE_MESH
 
 logger = logging.getLogger("flag_gems.runtime.backend._nvidia.hopper.ops.mm")
 CACHE_USAGE_THRESHOLD = 0.8
+HOPPER_MM_VERSION_ENV = "FLAG_GEMS_HOPPER_MM_VERSION"
 EXPAND_CONFIG_FILENAME = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "mm_hopper_expand.yaml")
 )
 _SHARED_MEM_SAFETY_MARGIN_BYTES = 1024
+
+if HAS_TLE:
+    import triton.experimental.tle.language as tle
+else:
+    tle = None
 
 
 def _get_shared_memory_limit_bytes():
@@ -61,6 +67,42 @@ else:
     TLE_REMOTE_NUM_WARPS = 8
     TLE_REMOTE_NUM_STAGES = 2
     TLE_REMOTE_A_SLOTS = 2
+
+WASP_BM = 128
+WASP_BN = 128
+WASP_BK = 64
+WASP_GROUP_SIZE_M = 8
+WASP_NUM_STAGES = 3
+WASP_NUM_MMA_GROUPS = 2
+WASP_NUM_MMA_WARPS = 8
+WASP_PRODUCER_NUM_WARPS = 4
+
+
+def _selected_mm_version() -> str:
+    version = os.environ.get(HOPPER_MM_VERSION_ENV, "original").strip().lower()
+    if version not in ("original", "wasp"):
+        logger.warning(
+            "Unknown %s=%r; falling back to original Hopper mm path.",
+            HOPPER_MM_VERSION_ENV,
+            version,
+        )
+        return "original"
+    return version
+
+
+def _next_power_of_2(value: int) -> int:
+    assert value > 0
+    return 1 << (value - 1).bit_length()
+
+
+def _ensure_tma_allocator(device):
+    if not hasattr(triton, "set_allocator"):
+        raise RuntimeError("TMA descriptor support requires triton.set_allocator")
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    triton.set_allocator(alloc_fn)
 
 
 def is_tma_compatible(a, b, N, K):
@@ -693,6 +735,286 @@ def splitk_mm(a, b, c, M, N, K, op_name="mm"):
     return c
 
 
+if HAS_TLE:
+
+    @triton.jit
+    def _wasp_compute_pid(tile_id, num_pid_n, num_pid_m, group_size_m: tl.constexpr):
+        num_pid_in_group = group_size_m * num_pid_n
+        group_id = tile_id // num_pid_in_group
+        first_pid_m = group_id * group_size_m
+        cur_group_size_m = min(num_pid_m - first_pid_m, group_size_m)
+        pid_m = first_pid_m + (tile_id % cur_group_size_m)
+        pid_n = (tile_id % num_pid_in_group) // cur_group_size_m
+        return pid_m, pid_n
+
+
+    @triton.jit
+    def _wasp_buf_phase(count, num_stages: tl.constexpr):
+        buf = count % num_stages
+        phase = (count // num_stages) & 1
+        return buf, phase
+
+
+    @libentry()
+    @triton.jit
+    def _wasp_mm_kernel(
+        a_desc,
+        b_desc,
+        c_desc,
+        M,
+        N,
+        K,
+        NUM_SMS: tl.constexpr,
+        BM: tl.constexpr,
+        BN: tl.constexpr,
+        BK: tl.constexpr,
+        GROUP_SIZE_M: tl.constexpr,
+        NUM_STAGES: tl.constexpr,
+        NUM_MMA_GROUPS: tl.constexpr,
+        NUM_MMA_WARPS: tl.constexpr,
+        A_STAGE_CAPACITY: tl.constexpr,
+        B_STAGE_CAPACITY: tl.constexpr,
+    ):
+        # WASP path: one producer TMA-loads A/B into staged shared memory and
+        # two replicated MMA consumers split the output tile along M.
+        BM_SPLIT: tl.constexpr = BM // 2
+
+        a_smem = tle.gpu.alloc(
+            [A_STAGE_CAPACITY, BM_SPLIT, BK],
+            dtype=tl.float16,
+            layout=None,
+            scope=tle.gpu.smem,
+        )
+        b_smem = tle.gpu.alloc(
+            [B_STAGE_CAPACITY, BK, BN],
+            dtype=tl.float16,
+            layout=None,
+            scope=tle.gpu.smem,
+        )
+
+        empty_a = tle.gpu.alloc_barriers(
+            num_barriers=A_STAGE_CAPACITY,
+            arrive_count=1,
+            init=tle.gpu.READY,
+        )
+        empty_b = tle.gpu.alloc_barriers(
+            num_barriers=B_STAGE_CAPACITY,
+            arrive_count=NUM_MMA_GROUPS,
+            init=tle.gpu.READY,
+        )
+        full_a = tle.gpu.alloc_barriers(
+            num_barriers=A_STAGE_CAPACITY,
+            arrive_count=1,
+            expect_bytes=BM_SPLIT * BK * 2,
+        )
+        full_b = tle.gpu.alloc_barriers(
+            num_barriers=B_STAGE_CAPACITY,
+            arrive_count=1,
+            expect_bytes=BK * BN * 2,
+        )
+
+        with tle.gpu.async_tasks():
+            with tle.gpu.async_task("producer"):
+                sm_id = tl.program_id(0)
+                num_pid_m = tl.cdiv(M, BM)
+                num_pid_n = tl.cdiv(N, BN)
+                num_tiles = num_pid_m * num_pid_n
+
+                tile_id = sm_id
+                smem_count = 0
+                while tile_id < num_tiles:
+                    pid_m, pid_n = _wasp_compute_pid(
+                        tile_id, num_pid_n, num_pid_m, GROUP_SIZE_M
+                    )
+                    off_m = pid_m * BM
+                    off_n = pid_n * BN
+
+                    for k_iter in range(0, tl.cdiv(K, BK)):
+                        buf, phase = _wasp_buf_phase(smem_count, NUM_STAGES)
+                        off_k = k_iter * BK
+
+                        a0_idx = buf
+                        a1_idx = buf + NUM_STAGES
+
+                        tle.gpu.barrier_wait(empty_a[a0_idx], phaseIdx=phase)
+                        tle.gpu.copy(
+                            a_desc,
+                            a_smem.slot(a0_idx),
+                            [BM_SPLIT, BK],
+                            [off_m, off_k],
+                            barrier=full_a[a0_idx],
+                        )
+
+                        tle.gpu.barrier_wait(empty_b[buf], phaseIdx=phase)
+                        tle.gpu.copy(
+                            b_desc,
+                            b_smem.slot(buf),
+                            [BK, BN],
+                            [off_k, off_n],
+                            barrier=full_b[buf],
+                        )
+
+                        tle.gpu.barrier_wait(empty_a[a1_idx], phaseIdx=phase)
+                        tle.gpu.copy(
+                            a_desc,
+                            a_smem.slot(a1_idx),
+                            [BM_SPLIT, BK],
+                            [off_m + BM_SPLIT, off_k],
+                            barrier=full_a[a1_idx],
+                        )
+
+                        smem_count += 1
+
+                    tile_id += NUM_SMS
+
+            with tle.gpu.async_task(
+                num_warps=NUM_MMA_WARPS // NUM_MMA_GROUPS,
+                registers=168,
+                replicate=NUM_MMA_GROUPS,
+                name="mma",
+            ):
+                cid: tl.constexpr = tle.gpu.async_task_replica_id()
+                sm_id = tl.program_id(0)
+                num_pid_m = tl.cdiv(M, BM)
+                num_pid_n = tl.cdiv(N, BN)
+                num_tiles = num_pid_m * num_pid_n
+
+                tile_id = sm_id
+                smem_count = 0
+                while tile_id < num_tiles:
+                    pid_m, pid_n = _wasp_compute_pid(
+                        tile_id, num_pid_n, num_pid_m, GROUP_SIZE_M
+                    )
+                    off_m = pid_m * BM + cid * BM_SPLIT
+                    off_n = pid_n * BN
+
+                    acc = tl.zeros((BM_SPLIT, BN), dtype=tl.float32)
+                    buf, phase = _wasp_buf_phase(smem_count, NUM_STAGES)
+                    a_idx = buf + cid * NUM_STAGES
+
+                    tle.gpu.barrier_wait(full_a[a_idx], phaseIdx=phase)
+                    tle.gpu.barrier_wait(full_b[buf], phaseIdx=phase)
+                    acc = tle.gpu.wgmma(a_smem.slot(a_idx), b_smem.slot(buf), acc)
+
+                    last_buf = buf
+                    last_phase = phase
+                    last_a_idx = a_idx
+                    smem_count += 1
+
+                    for k_iter in range(1, tl.cdiv(K, BK)):
+                        buf, phase = _wasp_buf_phase(smem_count, NUM_STAGES)
+                        a_idx = buf + cid * NUM_STAGES
+
+                        tle.gpu.barrier_wait(full_a[a_idx], phaseIdx=phase)
+                        tle.gpu.barrier_wait(full_b[buf], phaseIdx=phase)
+                        acc = tle.gpu.wgmma(a_smem.slot(a_idx), b_smem.slot(buf), acc)
+                        acc = tle.gpu.wgmma_wait(1, acc)
+
+                        tle.gpu.barrier_arrive(empty_a[last_a_idx], phaseIdx=last_phase)
+                        tle.gpu.barrier_arrive(empty_b[last_buf], phaseIdx=last_phase)
+                        last_buf = buf
+                        last_phase = phase
+                        last_a_idx = a_idx
+                        smem_count += 1
+
+                    acc = tle.gpu.wgmma_wait(0, acc)
+                    tle.gpu.barrier_arrive(empty_a[last_a_idx], phaseIdx=last_phase)
+                    tle.gpu.barrier_arrive(empty_b[last_buf], phaseIdx=last_phase)
+
+                    c_desc.store((off_m, off_n), acc.to(tl.float16))
+                    tile_id += NUM_SMS
+
+
+def is_wasp_mm_supported():
+    if not HAS_TLE:
+        return False
+    if not torch.cuda.is_available():
+        return False
+    if get_device_capability()[0] < 9:
+        return False
+    if not hasattr(triton, "set_allocator"):
+        return False
+    try:
+        from triton.tools.tensor_descriptor import TensorDescriptor  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def wasp_mm_scenario(a, b, c, M, N, K):
+    return (
+        is_wasp_mm_supported()
+        and a.is_cuda
+        and b.is_cuda
+        and c.is_cuda
+        and a.dtype == torch.float16
+        and b.dtype == torch.float16
+        and c.dtype == torch.float16
+        and a.is_contiguous()
+        and b.is_contiguous()
+        and c.is_contiguous()
+        and M >= WASP_BM
+        and N >= WASP_BN
+        and K >= WASP_BK
+        and M % WASP_BM == 0
+        and N % WASP_BN == 0
+        and K % WASP_BK == 0
+    )
+
+
+def _make_tensor_descriptor(tensor, block_shape):
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    if hasattr(TensorDescriptor, "from_tensor"):
+        return TensorDescriptor.from_tensor(tensor, block_shape=list(block_shape))
+    return TensorDescriptor(tensor, tensor.shape, tensor.stride(), list(block_shape))
+
+
+def wasp_mm(a, b, c, M, N, K, op_name="mm"):
+    logger.debug(
+        "GEMS MM-hopper, [op]: %s, [mm scenario]: wasp, [shape info]: [-, %s, %s, %s](batch, M, N, K)",
+        op_name,
+        M,
+        N,
+        K,
+    )
+    _ensure_tma_allocator(a.device)
+    bm = WASP_BM
+    bn = WASP_BN
+    bk = WASP_BK
+    bm_split = bm // WASP_NUM_MMA_GROUPS
+
+    a_desc = _make_tensor_descriptor(a, [bm_split, bk])
+    b_desc = _make_tensor_descriptor(b, [bk, bn])
+    c_desc = _make_tensor_descriptor(c, [bm_split, bn])
+    num_sms = torch.cuda.get_device_properties(a.device).multi_processor_count
+    grid = (min(num_sms, triton.cdiv(M, bm) * triton.cdiv(N, bn)),)
+    a_stage_capacity = _next_power_of_2(WASP_NUM_STAGES * WASP_NUM_MMA_GROUPS)
+    b_stage_capacity = _next_power_of_2(WASP_NUM_STAGES)
+
+    with torch_device_fn.device(a.device):
+        _wasp_mm_kernel[grid](
+            a_desc,
+            b_desc,
+            c_desc,
+            M,
+            N,
+            K,
+            NUM_SMS=num_sms,
+            BM=bm,
+            BN=bn,
+            BK=bk,
+            GROUP_SIZE_M=WASP_GROUP_SIZE_M,
+            NUM_STAGES=WASP_NUM_STAGES,
+            NUM_MMA_GROUPS=WASP_NUM_MMA_GROUPS,
+            NUM_MMA_WARPS=WASP_NUM_MMA_WARPS,
+            A_STAGE_CAPACITY=a_stage_capacity,
+            B_STAGE_CAPACITY=b_stage_capacity,
+            num_warps=WASP_PRODUCER_NUM_WARPS,
+        )
+    return c
+
+
 def streamk_scenario(a, b, M, N, K):
     # TODO: this my change sometime according to the realbenchmark result
     # Currently, the best configuration for streamk has only been tested on A100(capability[0] == 8).
@@ -955,6 +1277,7 @@ def cluster_remote_mm(a, b, c, M, N, K):
 
 def mm(a, b):
     device = a.device
+    mm_version = _selected_mm_version()
     # handle non-contiguous inputs if necessary
     if a.stride(0) > 1 and a.stride(1) > 1:
         a = a.contiguous()
@@ -968,6 +1291,8 @@ def mm(a, b):
     c_dtype = get_higher_dtype(a.dtype, b.dtype)
     c = torch.empty((M, N), device=device, dtype=c_dtype)
 
+    if mm_version == "wasp" and wasp_mm_scenario(a, b, c, M, N, K):
+        return wasp_mm(a, b, c, M, N, K)
     # Optimize for N=1 case (matrix-vector multiplication)
     if N == 1:
         return gemv_mm(a, b, c, M, K)
@@ -986,6 +1311,7 @@ def mm(a, b):
 
 
 def mm_out(a, b, *, out):
+    mm_version = _selected_mm_version()
     # handle non-contiguous inputs if necessary
     if a.stride(0) > 1 and a.stride(1) > 1:
         a = a.contiguous()
@@ -996,6 +1322,8 @@ def mm_out(a, b, *, out):
     M, K = a.shape
     _, N = b.shape
 
+    if mm_version == "wasp" and wasp_mm_scenario(a, b, out, M, N, K):
+        return wasp_mm(a, b, out, M, N, K)
     # Optimize for N=1 case (matrix-vector multiplication)
     if N == 1:
         return gemv_mm(a, b, out, M, K)

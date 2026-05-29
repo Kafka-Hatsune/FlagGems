@@ -70,6 +70,20 @@ def pytest_addoption(parser):
 
     try:
         parser.addoption(
+            "--hopper-mm-version",
+            action="store",
+            default="original",
+            required=False,
+            choices=["original", "wasp"],
+            help="Hopper mm implementation used by mm accuracy and benchmark tests.",
+        )
+    except ValueError:
+        # Mixed test+benchmark pytest runs may already register this option in
+        # benchmark/conftest.py. Reuse the existing option in that case.
+        pass
+
+    try:
+        parser.addoption(
             "--record",
             action="store",
             default="none",
