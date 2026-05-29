@@ -79,8 +79,12 @@ WASP_PRODUCER_NUM_WARPS = 4
 
 
 def _selected_mm_version() -> str:
-    version = os.environ.get(HOPPER_MM_VERSION_ENV, "original").strip().lower()
-    if version not in ("original", "wasp"):
+    # Unset env keeps the historical Hopper dispatcher, including any existing
+    # experimental auto paths. Tests/benchmarks set this env explicitly:
+    #   original -> stable non-WASP baseline
+    #   wasp     -> prefer the new TLE async_tasks WASP path
+    version = os.environ.get(HOPPER_MM_VERSION_ENV, "auto").strip().lower()
+    if version not in ("auto", "original", "wasp"):
         logger.warning(
             "Unknown %s=%r; falling back to original Hopper mm path.",
             HOPPER_MM_VERSION_ENV,
@@ -88,6 +92,13 @@ def _selected_mm_version() -> str:
         )
         return "original"
     return version
+
+
+def _should_use_cluster_remote(mm_version: str) -> bool:
+    # The pre-existing cluster-remote path is left in the historical "auto"
+    # dispatcher only. Explicit benchmark version "original" means a stable
+    # non-WASP baseline and should not be polluted by that experimental path.
+    return mm_version == "auto"
 
 
 def _next_power_of_2(value: int) -> int:
@@ -1300,7 +1311,11 @@ def mm(a, b):
     sm_count = get_sm_count()
     if streamk_scenario(a, b, M, N, K):
         return streamk_mm(a, b, c, M, N, K, sm_count=sm_count)
-    if HAS_TLE and BLOCK_CLUSTER_MESH is not None:
+    if (
+        _should_use_cluster_remote(mm_version)
+        and HAS_TLE
+        and BLOCK_CLUSTER_MESH is not None
+    ):
         if cluster_remote_mm_scenario(a, b, c, M, N, K):
             return cluster_remote_mm(a, b, c, M, N, K)
     # Use splitk for small M
@@ -1331,7 +1346,11 @@ def mm_out(a, b, *, out):
     sm_count = get_sm_count()
     if streamk_scenario(a, b, M, N, K):
         return streamk_mm(a, b, out, M, N, K, sm_count=sm_count)
-    if HAS_TLE and BLOCK_CLUSTER_MESH is not None:
+    if (
+        _should_use_cluster_remote(mm_version)
+        and HAS_TLE
+        and BLOCK_CLUSTER_MESH is not None
+    ):
         if cluster_remote_mm_scenario(a, b, out, M, N, K):
             return cluster_remote_mm(a, b, out, M, N, K)
     # Use splitk for small M
