@@ -110,7 +110,7 @@ def test_flash_attn_varlen_func_hopper_fa3_dispatch(pytestconfig):
 @pytest.mark.parametrize(
     "shape", hopper_fa3_accuracy_shapes(), ids=lambda shape: shape.name
 )
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float16])
 @torch.inference_mode()
 def test_flash_attn_varlen_func_hopper_fa3_accuracy(pytestconfig, shape, dtype):
     _skip_unless_hopper_fa3(pytestconfig)
@@ -125,6 +125,17 @@ def test_flash_attn_varlen_func_hopper_fa3_accuracy(pytestconfig, shape, dtype):
         f"max_abs={max_abs:.3e}, mean_abs={mean_abs:.3e}"
     )
     torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=rtol, msg=msg)
+
+
+@pytest.mark.hopper_fa3
+@pytest.mark.flash_attn_varlen_func
+@torch.inference_mode()
+def test_flash_attn_varlen_func_hopper_fa3_bf16_unsupported(pytestconfig):
+    _skip_unless_hopper_fa3(pytestconfig)
+    shape = hopper_fa3_accuracy_shapes()[0]
+    tensors = make_hopper_fa3_varlen(shape, torch.bfloat16, flag_gems.device, seed=2026)
+    with pytest.raises(RuntimeError, match="torch.float16"):
+        run_hopper_fa3(tensors, shape, fa_version=3)
 
 
 # Following varlen and paged attn tests are copied from
@@ -240,6 +251,10 @@ def test_flash_attn_varlen_func(
     if vendor_name == "mthreads":
         monkeypatch.setenv("MUSA_ENABLE_SQMMA", "1")
     fa_version = _selected_fa_version(pytestconfig)
+    if fa_version == 3 and dtype != torch.float16:
+        pytest.skip("TLE-only Hopper FA3 currently supports fp16 only.")
+    if fa_version == 3 and optimize_init:
+        pytest.skip("FA3 opt-init path is not implemented for this test.")
 
     # (Issue) numerical stability concern
     if alibi is True and soft_cap is not None:
@@ -361,6 +376,8 @@ def test_flash_attn_varlen_func_swap_qg(
     if vendor_name == "mthreads":
         monkeypatch.setenv("MUSA_ENABLE_SQMMA", "1")
     fa_version = _selected_fa_version(pytestconfig)
+    if fa_version == 3 and dtype != torch.float16:
+        pytest.skip("TLE-only Hopper FA3 currently supports fp16 only.")
 
     with torch.device(flag_gems.device):
         utils.init_seed(1234567890)
