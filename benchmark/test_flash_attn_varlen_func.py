@@ -41,11 +41,16 @@ def _is_fa3_supported() -> bool:
         return torch.cuda.get_device_capability()[0] >= 9
 
 
-def _skip_unless_hopper_fa3(pytestconfig) -> None:
-    if _selected_fa_version(pytestconfig) != 3:
-        pytest.skip("Hopper FA3 benchmark only runs with fa_version=3.")
-    if not is_hopper_fa3_supported():
-        pytest.skip("requires CUDA Hopper with Triton FA3 support.")
+def _skip_unless_selected_fa_supported(pytestconfig) -> None:
+    fa_version = _selected_fa_version(pytestconfig)
+    if fa_version == 3 and not is_hopper_fa3_supported():
+        pytest.skip("FA3 requires CUDA Hopper with Triton FA3 support.")
+
+
+def _hopper_benchmark_shape_skip_reason(shape: HopperFA3Shape) -> Optional[str]:
+    if shape.paged and not (VLLM_FA_HAS_BLOCK_TABLE and VLLM_FA_HAS_SEQUSED_K):
+        return "vLLM flash-attention lacks paged KV benchmark support"
+    return None
 
 
 class FlashAttnVarlenBenchmark(base.Benchmark):
@@ -277,17 +282,30 @@ class HopperFA3Benchmark(base.Benchmark):
     DEFAULT_SHAPE_DESC = (
         "name, seq_lens, num_query_heads, num_kv_heads, head_dim, causal, paged"
     )
+    fa_version = 3
 
     def set_shapes(self, shape_file_path=None):
-        shapes = hopper_fa3_benchmark_shapes()
-        if not (VLLM_FA_HAS_BLOCK_TABLE and VLLM_FA_HAS_SEQUSED_K):
-            shapes = [shape for shape in shapes if not shape.paged]
-        self.shapes = shapes
+        self.shapes = hopper_fa3_benchmark_shapes()
+
+    def init_user_config(self):
+        super().init_user_config()
+        supported_shapes = []
+        skipped_reasons = []
+        for shape in self.shapes:
+            skip_reason = _hopper_benchmark_shape_skip_reason(shape)
+            if skip_reason:
+                skipped_reasons.append(f"{shape.name}: {skip_reason}")
+                continue
+            supported_shapes.append(shape)
+        if not supported_shapes:
+            details = "; ".join(skipped_reasons) if skipped_reasons else "none"
+            pytest.skip(f"No Hopper varlen benchmark shapes are supported ({details}).")
+        self.shapes = supported_shapes
 
     def get_input_iter(self, dtype):
         for idx, shape in enumerate(self.shapes):
             tensors = make_hopper_fa3_varlen(shape, dtype, self.device, seed=2026 + idx)
-            yield tensors, shape, 3
+            yield tensors, shape, self.fa_version
 
     def unpack_to_args_kwargs(self, input_tuple):
         return list(input_tuple), {}
@@ -425,11 +443,13 @@ def test_flash_attn_varlen_func(monkeypatch, pytestconfig):
     reason="requires vLLM flash-attention as the benchmark baseline",
 )
 def test_flash_attn_varlen_func_hopper_fa3(pytestconfig):
-    _skip_unless_hopper_fa3(pytestconfig)
+    _skip_unless_selected_fa_supported(pytestconfig)
+    fa_version = _selected_fa_version(pytestconfig)
     bench = HopperFA3Benchmark(
         op_name="hopper_fa3",
         torch_op=_hopper_fa3_vllm_wrapper,
         gems_op=_hopper_fa3_gems_wrapper,
         dtypes=[torch.float16, torch.bfloat16],
+        fa_version=fa_version,
     )
     bench.run()

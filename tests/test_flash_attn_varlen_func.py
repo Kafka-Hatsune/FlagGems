@@ -34,6 +34,12 @@ def _skip_unless_hopper_fa3(pytestconfig) -> None:
         pytest.skip("requires CUDA Hopper with Triton FA3 support.")
 
 
+def _skip_unless_selected_fa_supported(pytestconfig) -> None:
+    fa_version = _selected_fa_version(pytestconfig)
+    if fa_version == 3 and not is_hopper_fa3_supported():
+        pytest.skip("FA3 requires CUDA Hopper with Triton FA3 support.")
+
+
 def _is_fa3_supported() -> bool:
     try:
         from flag_gems.runtime.backend._nvidia.hopper.ops.flash_api_v3 import (
@@ -113,15 +119,20 @@ def test_flash_attn_varlen_func_hopper_fa3_dispatch(pytestconfig):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @torch.inference_mode()
 def test_flash_attn_varlen_func_hopper_fa3_accuracy(pytestconfig, shape, dtype):
-    _skip_unless_hopper_fa3(pytestconfig)
+    _skip_unless_selected_fa_supported(pytestconfig)
+    fa_version = _selected_fa_version(pytestconfig)
     tensors = make_hopper_fa3_varlen(shape, dtype, flag_gems.device, seed=2026)
-    ref, ref_kind = build_hopper_fa3_reference(tensors, shape, fa_version=3)
-    out = hopper_fa3_output_tensor(run_hopper_fa3(tensors, shape, fa_version=3))
+    ref, ref_kind = build_hopper_fa3_reference(
+        tensors, shape, fa_version=fa_version
+    )
+    out = hopper_fa3_output_tensor(
+        run_hopper_fa3(tensors, shape, fa_version=fa_version)
+    )
     atol, rtol = hopper_fa3_tolerances(dtype, tensors.max_seqlen_k, ref_kind)
 
     max_abs, mean_abs = hopper_fa3_max_mean_abs(out, ref)
     msg = (
-        f"shape={shape.name}, dtype={dtype}, ref={ref_kind}, "
+        f"shape={shape.name}, dtype={dtype}, fa_version={fa_version}, ref={ref_kind}, "
         f"max_abs={max_abs:.3e}, mean_abs={mean_abs:.3e}"
     )
     torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=rtol, msg=msg)
@@ -221,6 +232,7 @@ def ref_paged_attn(
     return torch.cat(outputs, dim=0)
 
 
+@pytest.mark.hopper_fa3
 @pytest.mark.flash_attn_varlen_func
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="Issue #2815: Not supported")
 @pytest.mark.skipif(vendor_name == "hygon", reason="Issue #2816: Not working")
@@ -257,7 +269,7 @@ def test_flash_attn_varlen_func(
 
     # (Issue) numerical stability concern
     if alibi is True and soft_cap is not None:
-        return
+        pytest.skip("ALiBi + softcap reference is disabled for this test.")
 
     with torch.device(flag_gems.device):
         utils.init_seed(1234567890)
@@ -350,6 +362,7 @@ def test_flash_attn_varlen_func(
 
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="Issue #2815: Not working")
 @pytest.mark.skipif(vendor_name == "hygon", reason="Issue #2816: Not working")
+@pytest.mark.hopper_fa3
 @pytest.mark.flash_attn_varlen_func
 @pytest.mark.parametrize("seq_lens", [[(1, 1328), (1, 18), (1, 463)]])
 @pytest.mark.parametrize("num_heads", [(8, 2)])
