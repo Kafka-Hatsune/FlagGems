@@ -72,12 +72,15 @@ def _round_multiple(value: int, multiple: int) -> int:
     return (value + multiple - 1) // multiple * multiple
 
 
-def _tle_tile_config(head_size: int) -> tuple[int, int]:
+def _tle_tile_config(head_size: int) -> tuple[int, int, int]:
     if head_size <= 128:
-        return 128, 128
+        return 128, 128, 2
+    # BLOCK_K rounds head_dim=192 up to 256. Keeping two K/V stages for
+    # head_dim > 128 over-allocates shared memory before the compiler can
+    # report a Python exception, so use a single K/V stage for these variants.
     if head_size <= 192:
-        return 128, 96
-    return 128, 64
+        return 128, 64, 1
+    return 128, 64, 1
 
 
 def _tma_strides_are_aligned(tensor: torch.Tensor) -> bool:
@@ -393,9 +396,8 @@ def mha_varlan_fwd_v3(
         )
 
         _ensure_tma_allocator()
-        block_m, block_n = _tle_tile_config(head_size)
+        block_m, block_n, num_buffers_kv = _tle_tile_config(head_size)
         num_buffers_q = 1
-        num_buffers_kv = 2
         num_mma_groups = 2
         num_mma_warps = 8
         total_tiles = triton.cdiv(max_seqlen_q, block_m) * batch_size * num_heads
