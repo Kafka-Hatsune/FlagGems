@@ -12,7 +12,7 @@ This module intentionally exposes a single FA3 kernel:
 
 Supported subset:
 
-* fp16 inputs/outputs
+* fp16/bf16 inputs/outputs
 * no dropout / no returned softmax matrix
 * dense varlen and paged KV
 * causal, local window, ALiBi, and softcap score transforms
@@ -208,11 +208,12 @@ def _copy_paged_kv_tile_to_smem(
             cols = col_base + tl.arange(0, 32)
             src_ptrs = src_base + cache_idx[:, None] * row_stride + cols[None, :]
             load_mask = row_valid[:, None] & (cols[None, :] < d)
+            # Keep paged gather loads on Triton's default cache policy. On this
+            # TLE producer path, evict_last can lower to an illegal instruction.
             vals = tl.load(
                 src_ptrs,
                 mask=load_mask,
                 other=0.0,
-                eviction_policy="evict_last",
             )
             smem_rows = tl.broadcast_to(rows[:, None], (32, 32))
             smem_cols = tl.broadcast_to(cols[None, :], (32, 32))
@@ -312,23 +313,24 @@ def flash_varlen_fwd_v3_tle_kernel(
 ):
     BM_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
     HEAD_DIM_PADDED: tl.constexpr = BLOCK_K
+    INPUT_DTYPE: tl.constexpr = q_ptr.dtype.element_ty
     THREADS_IN_MMA_GROUPS: tl.constexpr = NUM_MMA_WARPS * 32
 
     q_smem = tle.gpu.alloc(
         [Q_STAGE_CAPACITY, BM_SPLIT, HEAD_DIM_PADDED],
-        dtype=tl.float16,
+        dtype=INPUT_DTYPE,
         layout=None,
         scope=tle.gpu.smem,
     )
     k_smem = tle.gpu.alloc(
         [KV_STAGE_CAPACITY, BLOCK_N, HEAD_DIM_PADDED],
-        dtype=tl.float16,
+        dtype=INPUT_DTYPE,
         layout=None,
         scope=tle.gpu.smem,
     )
     v_smem = tle.gpu.alloc(
         [KV_STAGE_CAPACITY, BLOCK_N, HEAD_DIM_PADDED],
-        dtype=tl.float16,
+        dtype=INPUT_DTYPE,
         layout=None,
         scope=tle.gpu.smem,
     )
@@ -852,7 +854,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                                     v_fulls[v_buf], phaseIdx=v_phase_idx
                                 )
                             acc = tle.gpu.wgmma(
-                                p.to(tl.float16),
+                                p.to(INPUT_DTYPE),
                                 v_smem.slot(v_buf),
                                 acc,
                             )
@@ -914,7 +916,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                             tle.gpu.barrier_wait(
                                 v_fulls[v_buf], phaseIdx=v_phase_idx
                             )
-                        acc = tle.gpu.wgmma(p.to(tl.float16), v_smem.slot(v_buf), acc)
+                        acc = tle.gpu.wgmma(p.to(INPUT_DTYPE), v_smem.slot(v_buf), acc)
 
                         acc = tle.gpu.wgmma_wait(1, acc)
                         tle.gpu.barrier_arrive(q_empties[q_idx], phaseIdx=q_phase_idx)

@@ -412,7 +412,7 @@ def test_flash_attn_varlen_func(monkeypatch, pytestconfig):
         op_name="flash_attn_varlen_func",
         torch_op=flash_attn_varlen_func,
         gems_op=gems_op,
-        dtypes=[torch.float16] if fa_version == 3 else [torch.float16, torch.bfloat16],
+        dtypes=[torch.float16, torch.bfloat16],
         fa_version=fa_version,
     )
     bench.run()
@@ -430,6 +430,6 @@ def test_flash_attn_varlen_func_hopper_fa3(pytestconfig):
         op_name="hopper_fa3",
         torch_op=_hopper_fa3_vllm_wrapper,
         gems_op=_hopper_fa3_gems_wrapper,
-        dtypes=[torch.float16],
+        dtypes=[torch.float16, torch.bfloat16],
     )
     bench.run()

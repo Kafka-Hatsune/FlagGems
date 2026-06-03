@@ -106,8 +106,12 @@ def _require_tle_supported(
             "TLE FA3 requires CUDA Hopper, Triton TMA descriptors, and "
             "triton.experimental.tle."
         )
-    if q.dtype != torch.float16 or k.dtype != torch.float16 or v.dtype != torch.float16:
-        raise RuntimeError("TLE FA3 currently supports torch.float16 inputs only.")
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        raise RuntimeError(
+            "TLE FA3 currently supports torch.float16 and torch.bfloat16 inputs only."
+        )
+    if k.dtype != q.dtype or v.dtype != q.dtype:
+        raise RuntimeError("TLE FA3 requires q, k, and v to have the same dtype.")
     if p_dropout != 0:
         raise RuntimeError("TLE FA3 does not support dropout.")
     if return_softmax:
@@ -149,8 +153,8 @@ def _require_tle_supported(
         if not _tma_strides_are_aligned(k) or not _tma_strides_are_aligned(v):
             raise RuntimeError("TLE FA3 dense K/V TMA strides must be 16-byte aligned.")
 
-    if out is not None and out.dtype != torch.float16:
-        raise RuntimeError("TLE FA3 requires fp16 output.")
+    if out is not None and out.dtype != q.dtype:
+        raise RuntimeError("TLE FA3 requires output dtype to match q.")
     if alibi_slopes is not None:
         if alibi_slopes.dtype != torch.float32 or alibi_slopes.stride(-1) != 1:
             raise RuntimeError("TLE FA3 requires fp32 ALiBi slopes with last stride 1.")
@@ -309,10 +313,10 @@ def mha_varlan_fwd_v3(
         if out is not None:
             out_ = out
             if seqlenq_ngroups_swapped:
-                out = torch.empty_like(q, dtype=torch.float16)
+                out = torch.empty_like(q)
         else:
             out_ = None
-            out = torch.empty_like(q, dtype=torch.float16)
+            out = torch.empty_like(q)
 
         if not _tma_strides_are_aligned(q) or not _tma_strides_are_aligned(out):
             raise RuntimeError("TLE FA3 Q/O TMA strides must be 16-byte aligned.")
