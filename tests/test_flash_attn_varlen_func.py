@@ -40,6 +40,23 @@ def _skip_unless_selected_fa_supported(pytestconfig) -> None:
         pytest.skip("FA3 requires CUDA Hopper with Triton FA3 support.")
 
 
+def _skip_unsupported_fa3_legacy_paged_case(
+    pytestconfig,
+    *,
+    head_size: int,
+    optimize_init: bool = False,
+) -> None:
+    if _selected_fa_version(pytestconfig) != 3:
+        return
+    _skip_unless_selected_fa_supported(pytestconfig)
+    if optimize_init:
+        pytest.skip("FA3 opt-init path is not implemented for this test.")
+    if head_size != 128:
+        pytest.skip(
+            "FA3 TLE paged legacy coverage is currently limited to head_dim=128."
+        )
+
+
 def _is_fa3_supported() -> bool:
     try:
         from flag_gems.runtime.backend._nvidia.hopper.ops.flash_api_v3 import (
@@ -264,8 +281,9 @@ def test_flash_attn_varlen_func(
     if vendor_name == "mthreads":
         monkeypatch.setenv("MUSA_ENABLE_SQMMA", "1")
     fa_version = _selected_fa_version(pytestconfig)
-    if fa_version == 3 and optimize_init:
-        pytest.skip("FA3 opt-init path is not implemented for this test.")
+    _skip_unsupported_fa3_legacy_paged_case(
+        pytestconfig, head_size=head_size, optimize_init=optimize_init
+    )
 
     # (Issue) numerical stability concern
     if alibi is True and soft_cap is not None:
@@ -388,6 +406,7 @@ def test_flash_attn_varlen_func_swap_qg(
     if vendor_name == "mthreads":
         monkeypatch.setenv("MUSA_ENABLE_SQMMA", "1")
     fa_version = _selected_fa_version(pytestconfig)
+    _skip_unsupported_fa3_legacy_paged_case(pytestconfig, head_size=head_size)
     with torch.device(flag_gems.device):
         utils.init_seed(1234567890)
         num_seqs = len(seq_lens)
