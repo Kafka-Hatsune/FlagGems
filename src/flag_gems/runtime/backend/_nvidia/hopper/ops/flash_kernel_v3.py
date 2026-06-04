@@ -211,10 +211,14 @@ def _fa3_tle_config_smem_bytes(cfg, head_dim: int) -> int:
 
 
 def _prune_fa3_tle_configs(configs, nargs, **kwargs):
-    head_dim = nargs["d"]
-    is_paged = nargs["is_paged"]
-    shape_bucket = nargs["SHAPE_BUCKET"]
-    force_family_id = nargs["FORCE_FAMILY_ID"]
+    head_dim = kwargs.get("d", nargs.get("d"))
+    is_paged = kwargs.get("is_paged", nargs.get("is_paged"))
+    shape_bucket = kwargs.get(
+        "SHAPE_BUCKET", nargs.get("SHAPE_BUCKET", _FA3_TLE_BUCKET_LONG)
+    )
+    force_family_id = kwargs.get(
+        "FORCE_FAMILY_ID", nargs.get("FORCE_FAMILY_ID", _FA3_TLE_FAMILY_AUTO)
+    )
 
     kept = []
     for cfg in configs:
