@@ -103,18 +103,8 @@ def fa3_tle_select_plan(
             max_q_len=64,
         )
 
-    avg_q = total_q / max(batch_size, 1)
-    if max_seqlen_q > 512 and avg_q <= 128:
-        return FA3TlePlan(
-            "mixed",
-            _FA3_TLE_BUCKET_MIXED_SHORT,
-            force_family_id,
-            max_q_len=64,
-        )
-    if is_paged and avg_q <= 64 and max_seqlen_k >= 1024:
-        return FA3TlePlan("splitkv", _FA3_TLE_BUCKET_SPLITKV, force_family_id)
-    if is_paged and (max_seqlen_q <= 128 or avg_q <= 128):
-        return FA3TlePlan("short", _FA3_TLE_BUCKET_SHORT, force_family_id)
+    # Keep auto on the compile-safe TMA path until direct local-pointer staging
+    # no longer trips TritonTleDowngradeInvalidAsyncCopy in short/split kernels.
     return FA3TlePlan("long", _FA3_TLE_BUCKET_LONG, force_family_id)
 
 
