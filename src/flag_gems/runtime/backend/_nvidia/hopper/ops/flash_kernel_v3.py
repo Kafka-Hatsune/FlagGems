@@ -7,7 +7,7 @@ TLE Hopper features:
 
 * a producer async task stages Q/K/V into shared memory
 * the long-sequence specialization uses two replicated MMA consumers split along M
-* the short/decode specialization uses a separate non-persistent kernel
+* short/decode/ws_simple configs use one MMA consumer group and non-TMA staging
 * TMA copies are used by long dense Q/K/V/O configs
 * paged K/V is gathered by the producer into dense shared-memory tiles
 * WGMMA QK and PV are coordinated by explicit user ``wgmma_wait`` calls
@@ -46,6 +46,7 @@ _FA3_TLE_FAMILY_PAGED_DECODE = 5
 _FA3_TLE_FAMILY_SERVE = 6
 _FA3_TLE_FAMILY_PAGED_SERVE = 7
 _FA3_TLE_FAMILY_DIRECT = 8
+_FA3_TLE_FAMILY_WS_SIMPLE = 9
 _FA3_TLE_FAMILY_AUTO = -1
 
 _FA3_TLE_BUCKET_LONG = 0
@@ -62,6 +63,9 @@ _FA3_TLE_BUCKET_PAGED_MEDIUM = 10
 _FA3_TLE_BUCKET_DIRECT_DECODE = 11
 _FA3_TLE_BUCKET_DIRECT_PAGED_DECODE = 12
 _FA3_TLE_BUCKET_DIRECT_SMALL = 13
+_FA3_TLE_BUCKET_WS_SMALL_DENSE = 14
+_FA3_TLE_BUCKET_WS_DECODE = 15
+_FA3_TLE_BUCKET_WS_PAGED_DECODE = 16
 
 _FA3_TLE_FORCE_PATHS = {
     "auto": _FA3_TLE_FAMILY_AUTO,
@@ -74,6 +78,7 @@ _FA3_TLE_FORCE_PATHS = {
     "serve": _FA3_TLE_FAMILY_SERVE,
     "paged_serve": _FA3_TLE_FAMILY_PAGED_SERVE,
     "direct": _FA3_TLE_FAMILY_DIRECT,
+    "ws_simple": _FA3_TLE_FAMILY_WS_SIMPLE,
 }
 
 
@@ -127,6 +132,17 @@ def fa3_tle_small_strategy() -> str:
     return value
 
 
+def fa3_tle_ws_strategy() -> str:
+    value = os.getenv("FLAG_GEMS_FA3_TLE_WS_STRATEGY", "auto").strip().lower()
+    allowed = ("auto", "ws_simple", "legacy")
+    if value not in allowed:
+        raise RuntimeError(
+            "invalid FLAG_GEMS_FA3_TLE_WS_STRATEGY="
+            f"{value!r}; expected one of {', '.join(allowed)}"
+        )
+    return value
+
+
 def fa3_tle_select_plan(
     *,
     total_q: int,
@@ -138,6 +154,7 @@ def fa3_tle_select_plan(
     force_family_id: int,
     decode_strategy: str = "auto",
     small_strategy: str = "auto",
+    ws_strategy: str = "auto",
     num_sms: int = 0,
 ) -> FA3TlePlan:
     avg_q = total_q / max(batch_size, 1)
@@ -170,6 +187,24 @@ def fa3_tle_select_plan(
             _FA3_TLE_BUCKET_DIRECT_SMALL,
             force_family_id,
             decode_strategy="onepass",
+            direct_kind="small_dense",
+        )
+    if force_family_id == _FA3_TLE_FAMILY_WS_SIMPLE:
+        if avg_q <= 4 and max_seqlen_q <= 64:
+            return FA3TlePlan(
+                "ws_simple",
+                _FA3_TLE_BUCKET_WS_PAGED_DECODE
+                if is_paged
+                else _FA3_TLE_BUCKET_WS_DECODE,
+                force_family_id,
+                decode_strategy="ws_simple",
+                direct_kind="paged_decode" if is_paged else "decode",
+            )
+        return FA3TlePlan(
+            "ws_simple",
+            _FA3_TLE_BUCKET_WS_SMALL_DENSE,
+            force_family_id,
+            decode_strategy="ws_simple",
             direct_kind="small_dense",
         )
     if force_family_id == _FA3_TLE_FAMILY_MIXED:
@@ -236,14 +271,7 @@ def fa3_tle_select_plan(
                 force_family_id,
                 decode_strategy="short",
             )
-        should_split = _fa3_tle_should_splitkv(
-            batch_size=batch_size,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            head_dim=head_dim,
-            is_paged=is_paged,
-            num_sms=num_sms,
-        )
+        should_split = False
         if decode_strategy == "splitkv":
             should_split = max_seqlen_k >= 1024
         elif decode_strategy == "onepass":
@@ -258,6 +286,21 @@ def fa3_tle_select_plan(
                 pack_gqa=max_seqlen_q > 1,
                 effective_batch_heads=batch_size * max_seqlen_q,
             )
+        if ws_strategy != "legacy":
+            if (not is_paged and max_seqlen_k < 4096) or (
+                is_paged and head_dim >= 192
+            ):
+                return FA3TlePlan(
+                    "ws_simple",
+                    _FA3_TLE_BUCKET_WS_PAGED_DECODE
+                    if is_paged
+                    else _FA3_TLE_BUCKET_WS_DECODE,
+                    force_family_id,
+                    decode_strategy="ws_simple",
+                    direct_kind="paged_decode" if is_paged else "decode",
+                    pack_gqa=max_seqlen_q > 1,
+                    effective_batch_heads=batch_size * max_seqlen_q,
+                )
         if is_paged:
             return FA3TlePlan(
                 "direct",
@@ -279,16 +322,17 @@ def fa3_tle_select_plan(
         )
     if (
         small_strategy != "short"
+        and ws_strategy != "legacy"
         and not is_paged
         and total_q <= 512
         and max_seqlen_q <= 640
         and max_seqlen_k <= 1024
     ):
         return FA3TlePlan(
-            "direct",
-            _FA3_TLE_BUCKET_DIRECT_SMALL,
+            "ws_simple",
+            _FA3_TLE_BUCKET_WS_SMALL_DENSE,
             force_family_id,
-            decode_strategy="onepass",
+            decode_strategy="ws_simple",
             direct_kind="small_dense",
         )
     if (
@@ -415,6 +459,46 @@ def _fa3_tle_configs():
             use_tma_qo=True,
             use_tma_kv=True,
         ),
+        _fa3_tle_config(
+            family_id=_FA3_TLE_FAMILY_WS_SIMPLE,
+            block_m=64,
+            block_n=64,
+            num_buffers_kv=1,
+            num_mma_groups=1,
+            num_mma_warps=4,
+            use_tma_qo=False,
+            use_tma_kv=False,
+        ),
+        _fa3_tle_config(
+            family_id=_FA3_TLE_FAMILY_WS_SIMPLE,
+            block_m=64,
+            block_n=128,
+            num_buffers_kv=1,
+            num_mma_groups=1,
+            num_mma_warps=4,
+            use_tma_qo=False,
+            use_tma_kv=False,
+        ),
+        _fa3_tle_config(
+            family_id=_FA3_TLE_FAMILY_WS_SIMPLE,
+            block_m=128,
+            block_n=64,
+            num_buffers_kv=1,
+            num_mma_groups=1,
+            num_mma_warps=4,
+            use_tma_qo=False,
+            use_tma_kv=False,
+        ),
+        _fa3_tle_config(
+            family_id=_FA3_TLE_FAMILY_WS_SIMPLE,
+            block_m=128,
+            block_n=128,
+            num_buffers_kv=1,
+            num_mma_groups=1,
+            num_mma_warps=4,
+            use_tma_qo=False,
+            use_tma_kv=False,
+        ),
     ]
 
 
@@ -452,6 +536,7 @@ def _prune_fa3_tle_configs(configs, nargs, **kwargs):
             _FA3_TLE_FAMILY_LONG,
             _FA3_TLE_FAMILY_SHORT,
             _FA3_TLE_FAMILY_SPLITKV,
+            _FA3_TLE_FAMILY_WS_SIMPLE,
         ) and family_id != force_family_id:
             continue
         if force_family_id == _FA3_TLE_FAMILY_MIXED:
@@ -471,6 +556,13 @@ def _prune_fa3_tle_configs(configs, nargs, **kwargs):
             elif shape_bucket == _FA3_TLE_BUCKET_SHORT:
                 if family_id != _FA3_TLE_FAMILY_SHORT:
                     continue
+            elif shape_bucket in (
+                _FA3_TLE_BUCKET_WS_SMALL_DENSE,
+                _FA3_TLE_BUCKET_WS_DECODE,
+                _FA3_TLE_BUCKET_WS_PAGED_DECODE,
+            ):
+                if family_id != _FA3_TLE_FAMILY_WS_SIMPLE:
+                    continue
             else:
                 if family_id not in (
                     _FA3_TLE_FAMILY_SHORT,
@@ -478,9 +570,28 @@ def _prune_fa3_tle_configs(configs, nargs, **kwargs):
                 ):
                     continue
 
+        if family_id == _FA3_TLE_FAMILY_WS_SIMPLE:
+            if shape_bucket == _FA3_TLE_BUCKET_WS_DECODE and block_m != 64:
+                continue
+            if (
+                shape_bucket == _FA3_TLE_BUCKET_WS_PAGED_DECODE
+                and (block_m != 64 or block_n != 64)
+            ):
+                continue
+            if shape_bucket == _FA3_TLE_BUCKET_WS_SMALL_DENSE and block_m < 64:
+                continue
+            if head_dim >= 192 and block_n > 64:
+                continue
+            if is_paged and block_n > 64:
+                continue
+
         if head_dim > 128 and block_n > 64:
             continue
-        if head_dim >= 128 and family_id != _FA3_TLE_FAMILY_LONG and block_m > 64:
+        if (
+            head_dim >= 128
+            and family_id not in (_FA3_TLE_FAMILY_LONG, _FA3_TLE_FAMILY_WS_SIMPLE)
+            and block_m > 64
+        ):
             continue
         if head_dim > 128 and cfg.kwargs["NUM_BUFFERS_KV"] > 1 and block_n >= 64:
             continue
@@ -907,6 +1018,9 @@ def _store_dense_tile_from_regs(
         "is_causal",
         "is_local",
         "is_alibi",
+        "seqlen_q",
+        "seqlen_k",
+        "total_q",
         "SHAPE_BUCKET",
         "FORCE_FAMILY_ID",
     ],
@@ -1775,6 +1889,10 @@ def flash_varlen_fwd_v3_tle_kernel(
                     tl.store(lse_ptr, lse, mask=row_idx_q < q_len)
 
                 tile_idx += num_progs
+
+
+flash_varlen_fwd_v3_tle_ws_simple_kernel = flash_varlen_fwd_v3_tle_kernel
+
 
 @libentry()
 @triton.autotune(

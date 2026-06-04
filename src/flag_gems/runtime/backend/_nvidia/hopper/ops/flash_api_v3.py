@@ -23,11 +23,13 @@ from .flash_kernel_v3 import (
     fa3_tle_mixed_long_plan,
     fa3_tle_select_plan,
     fa3_tle_small_strategy,
+    fa3_tle_ws_strategy,
     flash_varlen_fwd_v3_tle_direct_kernel,
     flash_varlen_fwd_v3_tle_kernel,
     flash_varlen_fwd_v3_tle_short_kernel,
     flash_varlen_fwd_v3_tle_splitkv_combine_kernel,
     flash_varlen_fwd_v3_tle_splitkv_kernel,
+    flash_varlen_fwd_v3_tle_ws_simple_kernel,
 )
 
 logger = logging.getLogger(__name__)
@@ -392,6 +394,7 @@ def mha_varlan_fwd_v3(
         force_family_id = fa3_tle_force_family_id()
         decode_strategy = fa3_tle_decode_strategy()
         small_strategy = fa3_tle_small_strategy()
+        ws_strategy = fa3_tle_ws_strategy()
         plan = fa3_tle_select_plan(
             total_q=total_q,
             batch_size=batch_size,
@@ -402,6 +405,7 @@ def mha_varlan_fwd_v3(
             force_family_id=force_family_id,
             decode_strategy=decode_strategy,
             small_strategy=small_strategy,
+            ws_strategy=ws_strategy,
             num_sms=num_sms,
         )
 
@@ -448,6 +452,23 @@ def mha_varlan_fwd_v3(
                     DIRECT_SHAPE_BUCKET=run_plan.shape_bucket,
                     MIN_Q_LEN_TO_PROCESS=run_plan.min_q_len,
                     MAX_Q_LEN_TO_PROCESS=run_plan.max_q_len,
+                )
+            elif run_plan.family == "ws_simple":
+                grid = lambda meta: (
+                    min(
+                        num_sms,
+                        triton.cdiv(max_seqlen_q, meta["BLOCK_M"])
+                        * batch_size
+                        * num_heads,
+                    ),
+                )
+                flash_varlen_fwd_v3_tle_ws_simple_kernel[grid](
+                    *args,
+                    SHAPE_BUCKET=run_plan.shape_bucket,
+                    FORCE_FAMILY_ID=run_plan.force_family_id,
+                    MIN_Q_LEN_TO_PROCESS=run_plan.min_q_len,
+                    MAX_Q_LEN_TO_PROCESS=run_plan.max_q_len,
+                    tle_wgmma_pipeline_mode="user_promise",
                 )
             elif run_plan.family in (
                 "short",
