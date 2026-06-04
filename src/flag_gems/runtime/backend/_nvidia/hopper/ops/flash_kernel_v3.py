@@ -311,7 +311,7 @@ def fa3_tle_select_plan(
                 pack_gqa=max_seqlen_q > 1,
                 effective_batch_heads=batch_size * max_seqlen_q,
             )
-        if ws_strategy in ("auto", "ws_short"):
+        if ws_strategy == "ws_short":
             if (not is_paged and max_seqlen_k < 4096) or (
                 is_paged and head_dim >= 192
             ):
@@ -362,7 +362,7 @@ def fa3_tle_select_plan(
         )
     if (
         small_strategy != "short"
-        and ws_strategy in ("auto", "ws_short")
+        and ws_strategy == "ws_short"
         and not is_paged
         and total_q <= 512
         and max_seqlen_q <= 640
@@ -671,7 +671,7 @@ def _fa3_ws_short_configs():
             family_id=_FA3_TLE_FAMILY_WS_SHORT,
             block_m=64,
             block_n=64,
-            num_buffers_kv=2,
+            num_buffers_kv=1,
             num_mma_groups=1,
             num_mma_warps=4,
             use_tma_qo=True,
@@ -681,7 +681,7 @@ def _fa3_ws_short_configs():
             family_id=_FA3_TLE_FAMILY_WS_SHORT,
             block_m=64,
             block_n=128,
-            num_buffers_kv=2,
+            num_buffers_kv=1,
             num_mma_groups=1,
             num_mma_warps=4,
             use_tma_qo=True,
@@ -2569,29 +2569,14 @@ def flash_varlen_fwd_v3_tle_ws_short_kernel(
                             tle.gpu.barrier_wait(
                                 k_full[kv_buf], phaseIdx=kv_phase_idx
                             )
+                        p_prev = p
                         qk = tle.gpu.wgmma(
                             q_smem.slot(0),
                             k_smem.slot(kv_buf),
                             out_dtype=tl.float32,
                             trans_b=True,
                         )
-
-                        v_buf, v_phase_idx = _buf_phase_tle(
-                            accum_cnt_kv - 1, NUM_BUFFERS_KV
-                        )
-                        if is_paged:
-                            tle.gpu.barrier_wait(
-                                v_full_manual[v_buf], phaseIdx=v_phase_idx
-                            )
-                        else:
-                            tle.gpu.barrier_wait(v_full[v_buf], phaseIdx=v_phase_idx)
-                        acc = tle.gpu.wgmma(
-                            p.to(INPUT_DTYPE),
-                            v_smem.slot(v_buf),
-                            acc,
-                        )
-
-                        qk = tle.gpu.wgmma_wait(1, qk)
+                        qk = tle.gpu.wgmma_wait(0, qk)
                         tle.gpu.barrier_arrive(
                             k_empty[kv_buf], phaseIdx=kv_phase_idx
                         )
@@ -2628,6 +2613,20 @@ def flash_varlen_fwd_v3_tle_ws_short_kernel(
                             IS_BORDER=True,
                         )
 
+                        v_buf, v_phase_idx = _buf_phase_tle(
+                            accum_cnt_kv - 1, NUM_BUFFERS_KV
+                        )
+                        if is_paged:
+                            tle.gpu.barrier_wait(
+                                v_full_manual[v_buf], phaseIdx=v_phase_idx
+                            )
+                        else:
+                            tle.gpu.barrier_wait(v_full[v_buf], phaseIdx=v_phase_idx)
+                        acc = tle.gpu.wgmma(
+                            p_prev.to(INPUT_DTYPE),
+                            v_smem.slot(v_buf),
+                            acc,
+                        )
                         acc = tle.gpu.wgmma_wait(0, acc)
                         tle.gpu.barrier_arrive(v_empty[v_buf], phaseIdx=v_phase_idx)
                         acc = acc * alpha[:, None]
@@ -2646,10 +2645,8 @@ def flash_varlen_fwd_v3_tle_ws_short_kernel(
                         tle.gpu.barrier_wait(v_full[v_buf], phaseIdx=v_phase_idx)
                     acc = tle.gpu.wgmma(p.to(INPUT_DTYPE), v_smem.slot(v_buf), acc)
 
-                    acc = tle.gpu.wgmma_wait(1, acc)
-                    tle.gpu.barrier_arrive(q_empty[0], phaseIdx=0)
-
                     acc = tle.gpu.wgmma_wait(0, acc)
+                    tle.gpu.barrier_arrive(q_empty[0], phaseIdx=0)
                     tle.gpu.barrier_arrive(v_empty[v_buf], phaseIdx=v_phase_idx)
 
                     invalid = (rowsum == 0) | (rowsum != rowsum)
