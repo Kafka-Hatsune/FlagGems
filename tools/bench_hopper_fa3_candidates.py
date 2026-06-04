@@ -79,6 +79,7 @@ def _standard_configs():
 
 
 STANDARD_CASES = {cfg["name"]: cfg for cfg in _standard_configs()}
+RISKY_PAGED_SMALL_CASES = tuple(STANDARD_CASES)
 
 CASE_GROUPS = {
     "ws_sync_decode": (
@@ -93,7 +94,9 @@ CASE_GROUPS = {
         "decode_b8_kv1k_d256_gqa4",
         "decode_b32_kv2k_d128_gqa4",
     ),
-    "ws_sync_small": tuple(STANDARD_CASES),
+    # Paged std#0..std#3 currently expose a ws_sync_small barrier deadlock.  Keep
+    # this candidate dense-only by default; use the risky flags below for debug.
+    "ws_sync_small": (),
     "ws_sync_paged_decode": (
         "paged_decode_b16_kvmix_bs16_d128_gqa4",
         "paged_decode_b8_bs16_d192_gqa4",
@@ -270,9 +273,14 @@ def _run_one(
     warmup: int,
     rep: int,
     seed: int,
+    allow_risky_paged_small: bool,
 ) -> dict:
     device = flag_gems.device
     os.environ["FLAG_GEMS_FA3_TLE_FORCE_PATH"] = candidate
+    if allow_risky_paged_small:
+        os.environ["FLAG_GEMS_FA3_TLE_ALLOW_RISKY_PAGED_SMALL"] = "1"
+    else:
+        os.environ.pop("FLAG_GEMS_FA3_TLE_ALLOW_RISKY_PAGED_SMALL", None)
     os.environ.pop("FLAG_GEMS_FA3_TLE_DECODE_STRATEGY", None)
     os.environ.pop("FLAG_GEMS_FA3_TLE_SMALL_STRATEGY", None)
     os.environ.pop("FLAG_GEMS_FA3_TLE_WS_STRATEGY", None)
@@ -308,10 +316,16 @@ def _run_one(
     return record
 
 
-def _selected_cases(candidates: tuple[str, ...], explicit_cases: tuple[str, ...]):
+def _selected_cases(
+    candidates: tuple[str, ...],
+    explicit_cases: tuple[str, ...],
+    include_risky_paged_small: bool,
+):
     selected = {}
     for candidate in candidates:
         cases = CASE_GROUPS[candidate]
+        if include_risky_paged_small and candidate == "ws_sync_small":
+            cases = cases + RISKY_PAGED_SMALL_CASES
         if explicit_cases:
             cases = tuple(case for case in cases if case in explicit_cases)
         selected[candidate] = cases
@@ -343,6 +357,16 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--rep", type=int, default=30)
     parser.add_argument("--seed", type=int, default=2030)
+    parser.add_argument(
+        "--include-risky-paged-small",
+        action="store_true",
+        help="Include std#0..std#3 under ws_sync_small. This is known risky.",
+    )
+    parser.add_argument(
+        "--allow-risky-paged-small-kernel",
+        action="store_true",
+        help="Actually let ws_sync_small launch paged small kernels.",
+    )
     args = parser.parse_args()
 
     candidates = _parse_csv(args.candidates, CANDIDATES)
@@ -360,10 +384,18 @@ def main() -> int:
 
     out_dir = args.out_dir or _default_out_dir(args.tag)
     out_dir.mkdir(parents=True, exist_ok=True)
-    selected = _selected_cases(candidates, explicit_cases)
+    selected = _selected_cases(
+        candidates, explicit_cases, args.include_risky_paged_small
+    )
 
     for candidate in candidates:
         records = []
+        if not selected[candidate]:
+            print(
+                f"[{candidate}] no default cases; use --include-risky-paged-small "
+                "for std#0..std#3 debug",
+                flush=True,
+            )
         for case_idx, case_name in enumerate(selected[candidate]):
             for dtype in dtypes:
                 print(f"[{candidate}] {case_name} {dtype}", flush=True)
@@ -375,6 +407,7 @@ def main() -> int:
                         warmup=args.warmup,
                         rep=args.rep,
                         seed=args.seed + case_idx,
+                        allow_risky_paged_small=args.allow_risky_paged_small_kernel,
                     )
                 )
         payload = {

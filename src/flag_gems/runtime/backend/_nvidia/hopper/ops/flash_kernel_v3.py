@@ -234,6 +234,13 @@ def _fa3_tle_ws_candidate_plan(
             f"got avg_q={avg_q:.3f}, max_q={max_seqlen_q}"
         )
     if force_family_id == _FA3_TLE_FAMILY_WS_SYNC_SMALL:
+        if is_paged and os.getenv("FLAG_GEMS_FA3_TLE_ALLOW_RISKY_PAGED_SMALL") != "1":
+            raise RuntimeError(
+                f"{name} is currently dense-small only. Paged small/medium varlen "
+                "uses a risky hand-staged K/V barrier path; set "
+                "FLAG_GEMS_FA3_TLE_ALLOW_RISKY_PAGED_SMALL=1 only for timeout-guarded "
+                "debug runs."
+            )
         if max_seqlen_q > 640:
             raise RuntimeError(
                 f"{name} expects small/medium Q input with max_q<=640, "
