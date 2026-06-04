@@ -23,6 +23,8 @@ from .flash_kernel_v3 import (
     fa3_tle_select_plan,
     flash_varlen_fwd_v3_tle_kernel,
     flash_varlen_fwd_v3_tle_short_kernel,
+    flash_varlen_fwd_v3_tle_splitkv_combine_kernel,
+    flash_varlen_fwd_v3_tle_splitkv_kernel,
 )
 
 logger = logging.getLogger(__name__)
@@ -390,6 +392,7 @@ def mha_varlan_fwd_v3(
             batch_size=batch_size,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            head_dim=head_size,
             is_paged=is_paged,
             force_family_id=force_family_id,
         )
@@ -426,7 +429,6 @@ def mha_varlan_fwd_v3(
             )
             if run_plan.family in (
                 "short",
-                "splitkv",
                 "mixed",
                 "decode",
                 "paged_decode",
@@ -443,6 +445,59 @@ def mha_varlan_fwd_v3(
                     SHORT_SHAPE_BUCKET=run_plan.shape_bucket,
                     MIN_Q_LEN_TO_PROCESS=run_plan.min_q_len,
                     MAX_Q_LEN_TO_PROCESS=run_plan.max_q_len,
+                )
+            elif run_plan.family == "splitkv":
+                num_splits = run_plan.num_splits
+                partial_out = torch.empty(
+                    (num_splits, num_heads, total_q, head_size),
+                    dtype=torch.float32,
+                    device=q_device,
+                )
+                partial_m = torch.empty(
+                    (num_splits, num_heads, total_q),
+                    dtype=torch.float32,
+                    device=q_device,
+                )
+                partial_l = torch.empty_like(partial_m)
+                split_grid = lambda meta: (
+                    triton.cdiv(max_seqlen_q, meta["BLOCK_M"]),
+                    batch_size,
+                    num_heads * num_splits,
+                )
+                flash_varlen_fwd_v3_tle_splitkv_kernel[split_grid](
+                    *args,
+                    partial_out,
+                    partial_m,
+                    partial_l,
+                    NUM_SPLITS=num_splits,
+                )
+                combine_block_m = 32
+                combine_grid = (
+                    triton.cdiv(max_seqlen_q, combine_block_m),
+                    batch_size,
+                    num_heads,
+                )
+                flash_varlen_fwd_v3_tle_splitkv_combine_kernel[combine_grid](
+                    out,
+                    lse,
+                    partial_out,
+                    partial_m,
+                    partial_l,
+                    out.stride(-3),
+                    out.stride(-2),
+                    o_batch_stride,
+                    cu_seqlens_q is not None,
+                    cu_seqlens_q,
+                    batch_size,
+                    num_heads,
+                    max_seqlen_q,
+                    head_size,
+                    total_q,
+                    adjusted_scale_softmax,
+                    adjusted_scale_softmax_log2e,
+                    BLOCK_M=combine_block_m,
+                    BLOCK_K=head_size_rounded,
+                    NUM_SPLITS=num_splits,
                 )
             else:
                 grid = lambda meta: (
