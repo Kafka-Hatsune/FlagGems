@@ -158,7 +158,9 @@ def test_flash_attn_varlen_func_hopper_fa3_accuracy(pytestconfig, shape, dtype):
     [
         ("long", hopper_fa3_accuracy_shapes()[0]),
         ("short", hopper_fa3_accuracy_shapes()[2]),
+        ("decode", hopper_fa3_accuracy_shapes()[2]),
         ("splitkv", hopper_fa3_accuracy_shapes()[3]),
+        ("paged_decode", hopper_fa3_accuracy_shapes()[3]),
         (
             "mixed",
             HopperFA3Shape(
@@ -171,9 +173,33 @@ def test_flash_attn_varlen_func_hopper_fa3_accuracy(pytestconfig, shape, dtype):
             ),
         ),
         (
+            "serve",
+            HopperFA3Shape(
+                "force_serve_dense",
+                [(128, 128), (1, 256), (1, 320), (1, 384)],
+                8,
+                2,
+                128,
+                True,
+            ),
+        ),
+        (
             "mixed",
             HopperFA3Shape(
                 "force_mixed_paged_serve",
+                [(128, 128), (1, 256), (1, 320), (1, 384)],
+                8,
+                2,
+                128,
+                True,
+                paged=True,
+                block_size=16,
+            ),
+        ),
+        (
+            "paged_serve",
+            HopperFA3Shape(
+                "force_paged_serve",
                 [(128, 128), (1, 256), (1, 320), (1, 384)],
                 8,
                 2,

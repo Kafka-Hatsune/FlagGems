@@ -22,6 +22,7 @@ from .flash_kernel_v3 import (
     fa3_tle_mixed_long_plan,
     fa3_tle_select_plan,
     flash_varlen_fwd_v3_tle_kernel,
+    flash_varlen_fwd_v3_tle_short_kernel,
 )
 
 logger = logging.getLogger(__name__)
@@ -394,7 +395,18 @@ def mha_varlan_fwd_v3(
         )
 
         def _run_plan(run_plan):
-            if run_plan.family in ("long", "mixed_long"):
+            uses_tma = run_plan.family in (
+                "long",
+                "mixed_long",
+                "short",
+                "splitkv",
+                "mixed",
+                "decode",
+                "paged_decode",
+                "serve",
+                "paged_serve",
+            )
+            if uses_tma:
                 if (
                     not _tma_strides_are_aligned(q)
                     or not _tma_strides_are_aligned(out)
@@ -402,17 +414,9 @@ def mha_varlan_fwd_v3(
                     or (not is_paged and not _tma_strides_are_aligned(v))
                 ):
                     raise RuntimeError(
-                        "TLE FA3 long/TMA path requires 16-byte aligned Q/K/V/O strides."
+                        "TLE FA3 TMA-backed path requires 16-byte aligned Q/K/V/O strides."
                     )
 
-            grid = lambda meta: (
-                min(
-                    num_sms,
-                    triton.cdiv(max_seqlen_q, meta["BLOCK_M"])
-                    * batch_size
-                    * num_heads,
-                ),
-            )
             logger.debug(
                 "kernel: flash_varlen_fwd_v3_tle family=%s bucket=%s q_len=[%s,%s]",
                 run_plan.family,
@@ -420,16 +424,45 @@ def mha_varlan_fwd_v3(
                 run_plan.min_q_len,
                 run_plan.max_q_len,
             )
-            flash_varlen_fwd_v3_tle_kernel[grid](
-                *args,
-                SHAPE_BUCKET=run_plan.shape_bucket,
-                FORCE_FAMILY_ID=run_plan.force_family_id,
-                MIN_Q_LEN_TO_PROCESS=run_plan.min_q_len,
-                MAX_Q_LEN_TO_PROCESS=run_plan.max_q_len,
-                tle_wgmma_pipeline_mode="user_promise",
-            )
+            if run_plan.family in (
+                "short",
+                "splitkv",
+                "mixed",
+                "decode",
+                "paged_decode",
+                "serve",
+                "paged_serve",
+            ):
+                grid = lambda meta: (
+                    triton.cdiv(max_seqlen_q, meta["BLOCK_M"]),
+                    batch_size,
+                    num_heads,
+                )
+                flash_varlen_fwd_v3_tle_short_kernel[grid](
+                    *args,
+                    SHORT_SHAPE_BUCKET=run_plan.shape_bucket,
+                    MIN_Q_LEN_TO_PROCESS=run_plan.min_q_len,
+                    MAX_Q_LEN_TO_PROCESS=run_plan.max_q_len,
+                )
+            else:
+                grid = lambda meta: (
+                    min(
+                        num_sms,
+                        triton.cdiv(max_seqlen_q, meta["BLOCK_M"])
+                        * batch_size
+                        * num_heads,
+                    ),
+                )
+                flash_varlen_fwd_v3_tle_kernel[grid](
+                    *args,
+                    SHAPE_BUCKET=run_plan.shape_bucket,
+                    FORCE_FAMILY_ID=run_plan.force_family_id,
+                    MIN_Q_LEN_TO_PROCESS=run_plan.min_q_len,
+                    MAX_Q_LEN_TO_PROCESS=run_plan.max_q_len,
+                    tle_wgmma_pipeline_mode="user_promise",
+                )
 
-        if plan.family == "mixed":
+        if plan.family in ("mixed", "serve", "paged_serve"):
             _run_plan(fa3_tle_mixed_long_plan(force_family_id))
             _run_plan(plan)
         else:
