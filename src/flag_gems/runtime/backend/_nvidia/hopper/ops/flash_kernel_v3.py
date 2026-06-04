@@ -48,6 +48,11 @@ _FA3_TLE_FAMILY_PAGED_SERVE = 7
 _FA3_TLE_FAMILY_DIRECT = 8
 _FA3_TLE_FAMILY_WS_SIMPLE = 9
 _FA3_TLE_FAMILY_WS_SHORT = 10
+_FA3_TLE_FAMILY_WS_SYNC_DECODE = 11
+_FA3_TLE_FAMILY_WS_PIPE2_DECODE = 12
+_FA3_TLE_FAMILY_WS_SYNC_SMALL = 13
+_FA3_TLE_FAMILY_WS_SYNC_PAGED_DECODE = 14
+_FA3_TLE_FAMILY_WS_PIPE2_PAGED_DECODE = 15
 _FA3_TLE_FAMILY_AUTO = -1
 
 _FA3_TLE_BUCKET_LONG = 0
@@ -70,6 +75,11 @@ _FA3_TLE_BUCKET_WS_PAGED_DECODE = 16
 _FA3_TLE_BUCKET_WS_SHORT_SMALL_DENSE = 17
 _FA3_TLE_BUCKET_WS_SHORT_DECODE = 18
 _FA3_TLE_BUCKET_WS_SHORT_PAGED_DECODE = 19
+_FA3_TLE_BUCKET_WS_SYNC_DECODE = 20
+_FA3_TLE_BUCKET_WS_PIPE2_DECODE = 21
+_FA3_TLE_BUCKET_WS_SYNC_SMALL = 22
+_FA3_TLE_BUCKET_WS_SYNC_PAGED_DECODE = 23
+_FA3_TLE_BUCKET_WS_PIPE2_PAGED_DECODE = 24
 
 _FA3_TLE_FORCE_PATHS = {
     "auto": _FA3_TLE_FAMILY_AUTO,
@@ -84,7 +94,48 @@ _FA3_TLE_FORCE_PATHS = {
     "direct": _FA3_TLE_FAMILY_DIRECT,
     "ws_simple": _FA3_TLE_FAMILY_WS_SIMPLE,
     "ws_short": _FA3_TLE_FAMILY_WS_SHORT,
+    "ws_sync_decode": _FA3_TLE_FAMILY_WS_SYNC_DECODE,
+    "ws_pipe2_decode": _FA3_TLE_FAMILY_WS_PIPE2_DECODE,
+    "ws_sync_small": _FA3_TLE_FAMILY_WS_SYNC_SMALL,
+    "ws_sync_paged_decode": _FA3_TLE_FAMILY_WS_SYNC_PAGED_DECODE,
+    "ws_pipe2_paged_decode": _FA3_TLE_FAMILY_WS_PIPE2_PAGED_DECODE,
 }
+
+_FA3_TLE_WS_CANDIDATE_NAMES = {
+    _FA3_TLE_FAMILY_WS_SYNC_DECODE: "ws_sync_decode",
+    _FA3_TLE_FAMILY_WS_PIPE2_DECODE: "ws_pipe2_decode",
+    _FA3_TLE_FAMILY_WS_SYNC_SMALL: "ws_sync_small",
+    _FA3_TLE_FAMILY_WS_SYNC_PAGED_DECODE: "ws_sync_paged_decode",
+    _FA3_TLE_FAMILY_WS_PIPE2_PAGED_DECODE: "ws_pipe2_paged_decode",
+}
+
+_FA3_TLE_WS_CANDIDATE_BUCKETS = {
+    _FA3_TLE_FAMILY_WS_SYNC_DECODE: _FA3_TLE_BUCKET_WS_SYNC_DECODE,
+    _FA3_TLE_FAMILY_WS_PIPE2_DECODE: _FA3_TLE_BUCKET_WS_PIPE2_DECODE,
+    _FA3_TLE_FAMILY_WS_SYNC_SMALL: _FA3_TLE_BUCKET_WS_SYNC_SMALL,
+    _FA3_TLE_FAMILY_WS_SYNC_PAGED_DECODE: _FA3_TLE_BUCKET_WS_SYNC_PAGED_DECODE,
+    _FA3_TLE_FAMILY_WS_PIPE2_PAGED_DECODE: _FA3_TLE_BUCKET_WS_PIPE2_PAGED_DECODE,
+}
+
+_FA3_TLE_WS_PIPE2_BUCKETS = (
+    _FA3_TLE_BUCKET_WS_PIPE2_DECODE,
+    _FA3_TLE_BUCKET_WS_PIPE2_PAGED_DECODE,
+)
+
+_FA3_TLE_WS_PAGED_DECODE_BUCKETS = (
+    _FA3_TLE_BUCKET_WS_SHORT_PAGED_DECODE,
+    _FA3_TLE_BUCKET_WS_SYNC_PAGED_DECODE,
+    _FA3_TLE_BUCKET_WS_PIPE2_PAGED_DECODE,
+)
+
+_FA3_TLE_WS_SYNC_BUCKETS = (
+    _FA3_TLE_BUCKET_WS_SHORT_SMALL_DENSE,
+    _FA3_TLE_BUCKET_WS_SHORT_DECODE,
+    _FA3_TLE_BUCKET_WS_SHORT_PAGED_DECODE,
+    _FA3_TLE_BUCKET_WS_SYNC_DECODE,
+    _FA3_TLE_BUCKET_WS_SYNC_SMALL,
+    _FA3_TLE_BUCKET_WS_SYNC_PAGED_DECODE,
+)
 
 
 def _next_power_of_2_host(value: int) -> int:
@@ -148,6 +199,71 @@ def fa3_tle_ws_strategy() -> str:
     return value
 
 
+def _fa3_tle_ws_candidate_plan(
+    *,
+    force_family_id: int,
+    avg_q: float,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    is_paged: bool,
+) -> FA3TlePlan:
+    name = _FA3_TLE_WS_CANDIDATE_NAMES[force_family_id]
+    bucket = _FA3_TLE_WS_CANDIDATE_BUCKETS[force_family_id]
+    is_decode_candidate = force_family_id in (
+        _FA3_TLE_FAMILY_WS_SYNC_DECODE,
+        _FA3_TLE_FAMILY_WS_PIPE2_DECODE,
+        _FA3_TLE_FAMILY_WS_SYNC_PAGED_DECODE,
+        _FA3_TLE_FAMILY_WS_PIPE2_PAGED_DECODE,
+    )
+    is_paged_candidate = force_family_id in (
+        _FA3_TLE_FAMILY_WS_SYNC_PAGED_DECODE,
+        _FA3_TLE_FAMILY_WS_PIPE2_PAGED_DECODE,
+    )
+    is_dense_decode_candidate = force_family_id in (
+        _FA3_TLE_FAMILY_WS_SYNC_DECODE,
+        _FA3_TLE_FAMILY_WS_PIPE2_DECODE,
+    )
+
+    if is_dense_decode_candidate and is_paged:
+        raise RuntimeError(f"{name} expects dense K/V decode input, got paged K/V")
+    if is_paged_candidate and not is_paged:
+        raise RuntimeError(f"{name} expects paged K/V decode input, got dense K/V")
+    if is_decode_candidate and (avg_q > 4 or max_seqlen_q > 64):
+        raise RuntimeError(
+            f"{name} expects decode-like input with avg_q<=4 and max_q<=64, "
+            f"got avg_q={avg_q:.3f}, max_q={max_seqlen_q}"
+        )
+    if force_family_id == _FA3_TLE_FAMILY_WS_SYNC_SMALL:
+        if max_seqlen_q > 640:
+            raise RuntimeError(
+                f"{name} expects small/medium Q input with max_q<=640, "
+                f"got max_q={max_seqlen_q}"
+            )
+        if max_seqlen_k > 4096:
+            raise RuntimeError(
+                f"{name} expects bounded K input with max_k<=4096, "
+                f"got max_k={max_seqlen_k}"
+            )
+
+    direct_kind = "small"
+    if is_paged_candidate:
+        direct_kind = "paged_decode"
+    elif is_dense_decode_candidate:
+        direct_kind = "decode"
+    elif is_paged:
+        direct_kind = "paged_small"
+
+    return FA3TlePlan(
+        "ws_short",
+        bucket,
+        force_family_id,
+        decode_strategy=name,
+        direct_kind=direct_kind,
+        pack_gqa=is_decode_candidate and max_seqlen_q > 1,
+        effective_batch_heads=0,
+    )
+
+
 def fa3_tle_select_plan(
     *,
     total_q: int,
@@ -163,6 +279,15 @@ def fa3_tle_select_plan(
     num_sms: int = 0,
 ) -> FA3TlePlan:
     avg_q = total_q / max(batch_size, 1)
+
+    if force_family_id in _FA3_TLE_WS_CANDIDATE_NAMES:
+        return _fa3_tle_ws_candidate_plan(
+            force_family_id=force_family_id,
+            avg_q=avg_q,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            is_paged=is_paged,
+        )
 
     if force_family_id == _FA3_TLE_FAMILY_LONG:
         return FA3TlePlan("long", _FA3_TLE_BUCKET_LONG, force_family_id)
@@ -687,6 +812,26 @@ def _fa3_ws_short_configs():
             use_tma_qo=True,
             use_tma_kv=True,
         ),
+        _fa3_tle_config(
+            family_id=_FA3_TLE_FAMILY_WS_SHORT,
+            block_m=64,
+            block_n=64,
+            num_buffers_kv=2,
+            num_mma_groups=1,
+            num_mma_warps=4,
+            use_tma_qo=True,
+            use_tma_kv=True,
+        ),
+        _fa3_tle_config(
+            family_id=_FA3_TLE_FAMILY_WS_SHORT,
+            block_m=64,
+            block_n=128,
+            num_buffers_kv=2,
+            num_mma_groups=1,
+            num_mma_warps=4,
+            use_tma_qo=True,
+            use_tma_kv=True,
+        ),
     ]
 
 
@@ -701,11 +846,20 @@ def _prune_fa3_ws_short_configs(configs, nargs, **kwargs):
     kept = []
     for cfg in configs:
         block_n = cfg.kwargs["BLOCK_N"]
-        if shape_bucket == _FA3_TLE_BUCKET_WS_SHORT_PAGED_DECODE and block_n != 64:
+        num_buffers_kv = cfg.kwargs["NUM_BUFFERS_KV"]
+
+        if shape_bucket in _FA3_TLE_WS_PIPE2_BUCKETS:
+            if num_buffers_kv != 2:
+                continue
+        elif shape_bucket in _FA3_TLE_WS_SYNC_BUCKETS:
+            if num_buffers_kv != 1:
+                continue
+
+        if shape_bucket in _FA3_TLE_WS_PAGED_DECODE_BUCKETS and block_n != 64:
             continue
         if head_dim >= 192 and block_n != 64:
             continue
-        if is_paged and block_n != 64:
+        if is_paged and head_dim > 128 and block_n != 64:
             continue
         if _fa3_tle_config_smem_bytes(cfg, head_dim) > 220 * 1024:
             continue
@@ -713,6 +867,11 @@ def _prune_fa3_ws_short_configs(configs, nargs, **kwargs):
 
     if kept:
         return kept
+
+    want_pipe2 = shape_bucket in _FA3_TLE_WS_PIPE2_BUCKETS
+    for cfg in configs:
+        if (cfg.kwargs["NUM_BUFFERS_KV"] == 2) == want_pipe2:
+            return [cfg]
     return [configs[0]]
 
 
