@@ -111,9 +111,9 @@ def fa3_tle_select_plan(
             force_family_id,
             max_q_len=64,
         )
-    if avg_q <= 64 and max_seqlen_k >= 1024:
+    if is_paged and avg_q <= 64 and max_seqlen_k >= 1024:
         return FA3TlePlan("splitkv", _FA3_TLE_BUCKET_SPLITKV, force_family_id)
-    if max_seqlen_q <= 128 or avg_q <= 128:
+    if is_paged and (max_seqlen_q <= 128 or avg_q <= 128):
         return FA3TlePlan("short", _FA3_TLE_BUCKET_SHORT, force_family_id)
     return FA3TlePlan("long", _FA3_TLE_BUCKET_LONG, force_family_id)
 
