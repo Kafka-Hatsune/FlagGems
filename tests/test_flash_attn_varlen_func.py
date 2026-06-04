@@ -259,6 +259,36 @@ def test_flash_attn_varlen_func_hopper_fa3_force_paths(
 
 @pytest.mark.hopper_fa3
 @pytest.mark.flash_attn_varlen_func
+@pytest.mark.parametrize(
+    "decode_strategy,shape",
+    [
+        ("onepass", hopper_fa3_accuracy_shapes()[2]),
+        ("short", hopper_fa3_accuracy_shapes()[2]),
+        ("splitkv", hopper_fa3_accuracy_shapes()[3]),
+    ],
+    ids=lambda item: item if isinstance(item, str) else item.name,
+)
+@torch.inference_mode()
+def test_flash_attn_varlen_func_hopper_fa3_decode_strategies(
+    monkeypatch, pytestconfig, decode_strategy, shape
+):
+    _skip_unless_hopper_fa3(pytestconfig)
+    monkeypatch.setenv("FLAG_GEMS_FA3_TLE_FORCE_PATH", "auto")
+    monkeypatch.setenv("FLAG_GEMS_FA3_TLE_DECODE_STRATEGY", decode_strategy)
+    tensors = make_hopper_fa3_varlen(shape, torch.float16, flag_gems.device, seed=2028)
+    ref, ref_kind = build_hopper_fa3_reference(tensors, shape, fa_version=3)
+    out = hopper_fa3_output_tensor(run_hopper_fa3(tensors, shape, fa_version=3))
+    atol, rtol = hopper_fa3_tolerances(torch.float16, tensors.max_seqlen_k, ref_kind)
+    max_abs, mean_abs = hopper_fa3_max_mean_abs(out, ref)
+    msg = (
+        f"decode_strategy={decode_strategy}, shape={shape.name}, ref={ref_kind}, "
+        f"max_abs={max_abs:.3e}, mean_abs={mean_abs:.3e}"
+    )
+    torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=rtol, msg=msg)
+
+
+@pytest.mark.hopper_fa3
+@pytest.mark.flash_attn_varlen_func
 @torch.inference_mode()
 def test_flash_attn_varlen_func_hopper_fa3_mixed_dtype_unsupported(pytestconfig):
     _skip_unless_hopper_fa3(pytestconfig)

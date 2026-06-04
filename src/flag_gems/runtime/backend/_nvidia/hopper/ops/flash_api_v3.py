@@ -18,9 +18,11 @@ from flag_gems.runtime import torch_device_fn
 
 from .flash_kernel_v3 import (
     TLE_FA3_AVAILABLE,
+    fa3_tle_decode_strategy,
     fa3_tle_force_family_id,
     fa3_tle_mixed_long_plan,
     fa3_tle_select_plan,
+    flash_varlen_fwd_v3_tle_decode_kernel,
     flash_varlen_fwd_v3_tle_kernel,
     flash_varlen_fwd_v3_tle_short_kernel,
     flash_varlen_fwd_v3_tle_splitkv_combine_kernel,
@@ -387,6 +389,7 @@ def mha_varlan_fwd_v3(
         num_sms = torch.cuda.get_device_properties(q_device).multi_processor_count
         args = tuple(getattr(params, k) for k in params.__slots__)
         force_family_id = fa3_tle_force_family_id()
+        decode_strategy = fa3_tle_decode_strategy()
         plan = fa3_tle_select_plan(
             total_q=total_q,
             batch_size=batch_size,
@@ -395,6 +398,8 @@ def mha_varlan_fwd_v3(
             head_dim=head_size,
             is_paged=is_paged,
             force_family_id=force_family_id,
+            decode_strategy=decode_strategy,
+            num_sms=num_sms,
         )
 
         def _run_plan(run_plan):
@@ -421,17 +426,30 @@ def mha_varlan_fwd_v3(
                     )
 
             logger.debug(
-                "kernel: flash_varlen_fwd_v3_tle family=%s bucket=%s q_len=[%s,%s]",
+                "kernel: flash_varlen_fwd_v3_tle family=%s bucket=%s "
+                "strategy=%s splits=%s q_len=[%s,%s]",
                 run_plan.family,
                 run_plan.shape_bucket,
+                run_plan.decode_strategy,
+                run_plan.num_splits,
                 run_plan.min_q_len,
                 run_plan.max_q_len,
             )
-            if run_plan.family in (
+            if run_plan.family in ("decode", "paged_decode"):
+                grid = lambda meta: (
+                    triton.cdiv(max_seqlen_q, meta["BLOCK_M"]),
+                    batch_size,
+                    num_heads,
+                )
+                flash_varlen_fwd_v3_tle_decode_kernel[grid](
+                    *args,
+                    SHORT_SHAPE_BUCKET=run_plan.shape_bucket,
+                    MIN_Q_LEN_TO_PROCESS=run_plan.min_q_len,
+                    MAX_Q_LEN_TO_PROCESS=run_plan.max_q_len,
+                )
+            elif run_plan.family in (
                 "short",
                 "mixed",
-                "decode",
-                "paged_decode",
                 "serve",
                 "paged_serve",
             ):

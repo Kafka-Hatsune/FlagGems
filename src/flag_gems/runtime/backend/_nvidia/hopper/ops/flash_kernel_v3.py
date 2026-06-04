@@ -84,6 +84,9 @@ class FA3TlePlan:
     min_q_len: int = 0
     max_q_len: int = 2**31 - 1
     num_splits: int = 1
+    decode_strategy: str = "auto"
+    pack_gqa: bool = False
+    effective_batch_heads: int = 0
 
 
 def fa3_tle_force_family_id() -> int:
@@ -96,6 +99,17 @@ def fa3_tle_force_family_id() -> int:
     return _FA3_TLE_FORCE_PATHS[value]
 
 
+def fa3_tle_decode_strategy() -> str:
+    value = os.getenv("FLAG_GEMS_FA3_TLE_DECODE_STRATEGY", "auto").strip().lower()
+    allowed = ("auto", "onepass", "splitkv", "short")
+    if value not in allowed:
+        raise RuntimeError(
+            "invalid FLAG_GEMS_FA3_TLE_DECODE_STRATEGY="
+            f"{value!r}; expected one of {', '.join(allowed)}"
+        )
+    return value
+
+
 def fa3_tle_select_plan(
     *,
     total_q: int,
@@ -105,6 +119,8 @@ def fa3_tle_select_plan(
     head_dim: int,
     is_paged: bool,
     force_family_id: int,
+    decode_strategy: str = "auto",
+    num_sms: int = 0,
 ) -> FA3TlePlan:
     if force_family_id == _FA3_TLE_FAMILY_LONG:
         return FA3TlePlan("long", _FA3_TLE_BUCKET_LONG, force_family_id)
@@ -116,6 +132,7 @@ def fa3_tle_select_plan(
             _FA3_TLE_BUCKET_SPLITKV,
             force_family_id,
             num_splits=_fa3_tle_decode_splits(max_seqlen_k, head_dim),
+            decode_strategy="splitkv",
         )
     if force_family_id == _FA3_TLE_FAMILY_MIXED:
         return FA3TlePlan(
@@ -127,10 +144,18 @@ def fa3_tle_select_plan(
             max_q_len=64,
         )
     if force_family_id == _FA3_TLE_FAMILY_DECODE:
-        return FA3TlePlan("decode", _FA3_TLE_BUCKET_DECODE, force_family_id)
+        return FA3TlePlan(
+            "decode",
+            _FA3_TLE_BUCKET_DECODE,
+            force_family_id,
+            decode_strategy="onepass",
+        )
     if force_family_id == _FA3_TLE_FAMILY_PAGED_DECODE:
         return FA3TlePlan(
-            "paged_decode", _FA3_TLE_BUCKET_PAGED_DECODE, force_family_id
+            "paged_decode",
+            _FA3_TLE_BUCKET_PAGED_DECODE,
+            force_family_id,
+            decode_strategy="onepass",
         )
     if force_family_id == _FA3_TLE_FAMILY_SERVE:
         return FA3TlePlan(
@@ -165,18 +190,52 @@ def fa3_tle_select_plan(
             max_q_len=64,
         )
     if avg_q <= 4 and max_seqlen_q <= 64:
-        if max_seqlen_k >= 1024:
+        if decode_strategy == "short":
+            return FA3TlePlan(
+                "short",
+                _FA3_TLE_BUCKET_SHORT,
+                force_family_id,
+                decode_strategy="short",
+            )
+        should_split = _fa3_tle_should_splitkv(
+            batch_size=batch_size,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            head_dim=head_dim,
+            is_paged=is_paged,
+            num_sms=num_sms,
+        )
+        if decode_strategy == "splitkv":
+            should_split = max_seqlen_k >= 1024
+        elif decode_strategy == "onepass":
+            should_split = False
+        if should_split:
             return FA3TlePlan(
                 "splitkv",
                 _FA3_TLE_BUCKET_SPLITKV,
                 force_family_id,
                 num_splits=_fa3_tle_decode_splits(max_seqlen_k, head_dim),
+                decode_strategy="splitkv",
+                pack_gqa=max_seqlen_q > 1,
+                effective_batch_heads=batch_size * max_seqlen_q,
             )
         if is_paged:
             return FA3TlePlan(
-                "paged_decode", _FA3_TLE_BUCKET_PAGED_DECODE, force_family_id
+                "paged_decode",
+                _FA3_TLE_BUCKET_PAGED_DECODE,
+                force_family_id,
+                decode_strategy="onepass",
+                pack_gqa=max_seqlen_q > 1,
+                effective_batch_heads=batch_size * max_seqlen_q,
             )
-        return FA3TlePlan("decode", _FA3_TLE_BUCKET_DECODE, force_family_id)
+        return FA3TlePlan(
+            "decode",
+            _FA3_TLE_BUCKET_DECODE,
+            force_family_id,
+            decode_strategy="onepass",
+            pack_gqa=max_seqlen_q > 1,
+            effective_batch_heads=batch_size * max_seqlen_q,
+        )
     if is_paged and max_seqlen_q <= 512 and max_seqlen_k <= 1024:
         if max_seqlen_q <= 128:
             return FA3TlePlan(
@@ -197,6 +256,27 @@ def _fa3_tle_decode_splits(max_seqlen_k: int, head_dim: int) -> int:
     if max_seqlen_k >= 1024:
         return 4
     return 2
+
+
+def _fa3_tle_should_splitkv(
+    *,
+    batch_size: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    head_dim: int,
+    is_paged: bool,
+    num_sms: int,
+) -> bool:
+    del head_dim
+    n_blocks = (max_seqlen_k + 63) // 64
+    if n_blocks <= 4 or max_seqlen_k < 1024:
+        return False
+    if not is_paged:
+        return False
+    effective_m_blocks = batch_size * max(max_seqlen_q, 1)
+    if effective_m_blocks >= max(num_sms, 1):
+        return False
+    return batch_size >= 64
 
 
 def fa3_tle_mixed_long_plan(force_family_id: int) -> FA3TlePlan:
@@ -375,13 +455,13 @@ def _prune_fa3_short_configs(configs, nargs, **kwargs):
             if block_m > 32 or block_n > 64:
                 continue
         elif shape_bucket == _FA3_TLE_BUCKET_SERVE_SHORT:
-            if block_m > 32 or block_n < 64:
+            if block_m < 16 or block_m > 32 or block_n < 64:
                 continue
         elif shape_bucket == _FA3_TLE_BUCKET_PAGED_SERVE_SHORT:
-            if block_m > 32 or block_n > 64:
+            if block_m < 16 or block_m > 32 or block_n > 64:
                 continue
         elif shape_bucket == _FA3_TLE_BUCKET_PAGED_SMALL:
-            if block_m > 64 or block_n > 64:
+            if block_m < 16 or block_m > 64 or block_n > 64:
                 continue
         elif shape_bucket == _FA3_TLE_BUCKET_PAGED_MEDIUM:
             if block_m < 64 or block_n < 64:
@@ -1916,6 +1996,9 @@ def flash_varlen_fwd_v3_tle_short_kernel(
         lse_row = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
         lse_ptr = softmax_lse_ptr + hid * total_q + lse_offset + lse_row
         tl.store(lse_ptr, lse, mask=lse_row < q_len)
+
+
+flash_varlen_fwd_v3_tle_decode_kernel = flash_varlen_fwd_v3_tle_short_kernel
 
 
 @libentry()
