@@ -1185,7 +1185,7 @@ def _persistent_tile_coords(tile_idx, num_pid_m, batch_size):
 @triton.jit
 def _fence_async_shared_cta():
     tl.inline_asm_elementwise(
-        "mov.u32 $0, 0x0; fence.proxy.async.shared::cta;",
+        "mov.u32 $0, 0x0; membar.cta; fence.proxy.async.shared::cta;",
         constraints="=r",
         args=(),
         dtype=(tl.int32,),
