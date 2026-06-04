@@ -163,6 +163,17 @@ def test_flash_attn_varlen_func_hopper_fa3_accuracy(pytestconfig, shape, dtype):
         ("splitkv", hopper_fa3_accuracy_shapes()[3]),
         ("paged_decode", hopper_fa3_accuracy_shapes()[3]),
         (
+            "direct",
+            HopperFA3Shape(
+                "force_direct_dense_small",
+                [(64, 64), (32, 96), (1, 128)],
+                8,
+                2,
+                128,
+                True,
+            ),
+        ),
+        (
             "auto",
             HopperFA3Shape(
                 "auto_paged_small",
@@ -282,6 +293,36 @@ def test_flash_attn_varlen_func_hopper_fa3_decode_strategies(
     max_abs, mean_abs = hopper_fa3_max_mean_abs(out, ref)
     msg = (
         f"decode_strategy={decode_strategy}, shape={shape.name}, ref={ref_kind}, "
+        f"max_abs={max_abs:.3e}, mean_abs={mean_abs:.3e}"
+    )
+    torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=rtol, msg=msg)
+
+
+@pytest.mark.hopper_fa3
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.parametrize("small_strategy", ["direct", "short"])
+@torch.inference_mode()
+def test_flash_attn_varlen_func_hopper_fa3_small_strategies(
+    monkeypatch, pytestconfig, small_strategy
+):
+    _skip_unless_hopper_fa3(pytestconfig)
+    monkeypatch.setenv("FLAG_GEMS_FA3_TLE_FORCE_PATH", "auto")
+    monkeypatch.setenv("FLAG_GEMS_FA3_TLE_SMALL_STRATEGY", small_strategy)
+    shape = HopperFA3Shape(
+        f"small_strategy_{small_strategy}",
+        [(64, 64), (32, 96), (1, 128)],
+        8,
+        2,
+        128,
+        True,
+    )
+    tensors = make_hopper_fa3_varlen(shape, torch.float16, flag_gems.device, seed=2029)
+    ref, ref_kind = build_hopper_fa3_reference(tensors, shape, fa_version=3)
+    out = hopper_fa3_output_tensor(run_hopper_fa3(tensors, shape, fa_version=3))
+    atol, rtol = hopper_fa3_tolerances(torch.float16, tensors.max_seqlen_k, ref_kind)
+    max_abs, mean_abs = hopper_fa3_max_mean_abs(out, ref)
+    msg = (
+        f"small_strategy={small_strategy}, ref={ref_kind}, "
         f"max_abs={max_abs:.3e}, mean_abs={mean_abs:.3e}"
     )
     torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=rtol, msg=msg)
