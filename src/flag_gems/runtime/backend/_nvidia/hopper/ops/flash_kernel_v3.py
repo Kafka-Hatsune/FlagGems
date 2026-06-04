@@ -321,8 +321,10 @@ def _fa3_tle_decode_splits(max_seqlen_k: int, head_dim: int) -> int:
     del head_dim
     if max_seqlen_k >= 4096:
         return 8
-    if max_seqlen_k >= 1024:
+    if max_seqlen_k >= 2048:
         return 4
+    if max_seqlen_k >= 1024:
+        return 2
     return 2
 
 
@@ -335,12 +337,18 @@ def _fa3_tle_should_splitkv(
     is_paged: bool,
     num_sms: int,
 ) -> bool:
-    del head_dim
     n_blocks = (max_seqlen_k + 63) // 64
     if n_blocks <= 4 or max_seqlen_k < 1024:
         return False
+
     if not is_paged:
-        return False
+        if max_seqlen_k >= 2048 and batch_size <= 32:
+            return True
+        return batch_size <= 16
+
+    if head_dim >= 192 and max_seqlen_k >= 1536 and batch_size <= 16:
+        return True
+
     effective_m_blocks = batch_size * max(max_seqlen_q, 1)
     if effective_m_blocks >= max(num_sms, 1):
         return False
@@ -554,19 +562,26 @@ def _fa3_direct_configs():
     configs = []
     for block_m in (16, 32, 64, 128):
         for block_n in (32, 64, 128, 256):
-            configs.append(
-                triton.Config(
-                    {"BLOCK_M": block_m, "BLOCK_N": block_n},
-                    num_stages=3,
-                    num_warps=4,
-                )
-            )
+            stage_choices = (2, 3) if block_n <= 128 else (3,)
+            warp_choices = (4,)
+            if block_m >= 64 and block_n >= 64:
+                warp_choices = (4, 8)
+            for num_stages in stage_choices:
+                for num_warps in warp_choices:
+                    configs.append(
+                        triton.Config(
+                            {"BLOCK_M": block_m, "BLOCK_N": block_n},
+                            num_stages=num_stages,
+                            num_warps=num_warps,
+                        )
+                    )
     return configs
 
 
 def _prune_fa3_direct_configs(configs, nargs, **kwargs):
     head_dim = kwargs.get("d", nargs.get("d"))
     is_paged = kwargs.get("is_paged", nargs.get("is_paged"))
+    seqlen_k = kwargs.get("seqlen_k", nargs.get("seqlen_k", 0))
     shape_bucket = kwargs.get(
         "DIRECT_SHAPE_BUCKET",
         nargs.get("DIRECT_SHAPE_BUCKET", _FA3_TLE_BUCKET_DIRECT_SMALL),
@@ -589,7 +604,9 @@ def _prune_fa3_direct_configs(configs, nargs, **kwargs):
         else:
             if block_n > 128:
                 continue
-            if block_m < 16:
+            if block_m < 64:
+                continue
+            if seqlen_k <= 128 and block_n < 64:
                 continue
             if head_dim > 128 and block_n > 64:
                 continue
@@ -2128,6 +2145,9 @@ def flash_varlen_fwd_v3_tle_short_kernel(
         "is_causal",
         "is_local",
         "is_alibi",
+        "seqlen_q",
+        "seqlen_k",
+        "total_q",
         "DIRECT_SHAPE_BUCKET",
         "MIN_Q_LEN_TO_PROCESS",
         "MAX_Q_LEN_TO_PROCESS",
