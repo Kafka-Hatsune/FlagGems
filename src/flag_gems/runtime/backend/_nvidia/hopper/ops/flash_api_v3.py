@@ -29,6 +29,7 @@ from .flash_kernel_v3 import (
     flash_varlen_fwd_v3_tle_short_kernel,
     flash_varlen_fwd_v3_tle_splitkv_combine_kernel,
     flash_varlen_fwd_v3_tle_splitkv_kernel,
+    flash_varlen_fwd_v3_tle_ws_short_kernel,
     flash_varlen_fwd_v3_tle_ws_simple_kernel,
 )
 
@@ -83,6 +84,14 @@ def _round_multiple(value: int, multiple: int) -> int:
 def _tma_strides_are_aligned(tensor: torch.Tensor) -> bool:
     elem_bytes = tensor.element_size()
     return all((stride * elem_bytes) % 16 == 0 for stride in tensor.stride()[:-1])
+
+
+def _ws_short_tma_strides_are_aligned(q, k, v, out, is_paged: bool) -> bool:
+    if not _tma_strides_are_aligned(q) or not _tma_strides_are_aligned(out):
+        return False
+    if is_paged:
+        return True
+    return _tma_strides_are_aligned(k) and _tma_strides_are_aligned(v)
 
 
 def _require_tle_supported(
@@ -414,11 +423,34 @@ def mha_varlan_fwd_v3(
                 "long",
                 "mixed_long",
                 "short",
+                "ws_short",
                 "splitkv",
                 "mixed",
                 "serve",
                 "paged_serve",
             )
+            if run_plan.family == "ws_short" and not _ws_short_tma_strides_are_aligned(
+                q, k, v, out, is_paged
+            ):
+                if run_plan.force_family_id == -1:
+                    fallback_plan = fa3_tle_select_plan(
+                        total_q=total_q,
+                        batch_size=batch_size,
+                        max_seqlen_q=max_seqlen_q,
+                        max_seqlen_k=max_seqlen_k,
+                        head_dim=head_size,
+                        is_paged=is_paged,
+                        force_family_id=force_family_id,
+                        decode_strategy=decode_strategy,
+                        small_strategy="direct",
+                        ws_strategy="legacy",
+                        num_sms=num_sms,
+                    )
+                    return _run_plan(fallback_plan)
+                raise RuntimeError(
+                    "TLE FA3 ws_short requires 16-byte aligned Q/O strides "
+                    "and dense K/V strides."
+                )
             if uses_tma:
                 if (
                     not _tma_strides_are_aligned(q)
@@ -452,6 +484,19 @@ def mha_varlan_fwd_v3(
                     DIRECT_SHAPE_BUCKET=run_plan.shape_bucket,
                     MIN_Q_LEN_TO_PROCESS=run_plan.min_q_len,
                     MAX_Q_LEN_TO_PROCESS=run_plan.max_q_len,
+                )
+            elif run_plan.family == "ws_short":
+                grid = lambda meta: (
+                    triton.cdiv(max_seqlen_q, meta["BLOCK_M"]),
+                    batch_size,
+                    num_heads,
+                )
+                flash_varlen_fwd_v3_tle_ws_short_kernel[grid](
+                    *args,
+                    WS_SHORT_SHAPE_BUCKET=run_plan.shape_bucket,
+                    MIN_Q_LEN_TO_PROCESS=run_plan.min_q_len,
+                    MAX_Q_LEN_TO_PROCESS=run_plan.max_q_len,
+                    tle_wgmma_pipeline_mode="user_promise",
                 )
             elif run_plan.family == "ws_simple":
                 grid = lambda meta: (

@@ -7,7 +7,7 @@ TLE Hopper features:
 
 * a producer async task stages Q/K/V into shared memory
 * the long-sequence specialization uses two replicated MMA consumers split along M
-* short/decode/ws_simple configs use one MMA consumer group and non-TMA staging
+* ws_short uses an independent producer/consumer CTA for short/decode traffic
 * TMA copies are used by long dense Q/K/V/O configs
 * paged K/V is gathered by the producer into dense shared-memory tiles
 * WGMMA QK and PV are coordinated by explicit user ``wgmma_wait`` calls
@@ -47,6 +47,7 @@ _FA3_TLE_FAMILY_SERVE = 6
 _FA3_TLE_FAMILY_PAGED_SERVE = 7
 _FA3_TLE_FAMILY_DIRECT = 8
 _FA3_TLE_FAMILY_WS_SIMPLE = 9
+_FA3_TLE_FAMILY_WS_SHORT = 10
 _FA3_TLE_FAMILY_AUTO = -1
 
 _FA3_TLE_BUCKET_LONG = 0
@@ -66,6 +67,9 @@ _FA3_TLE_BUCKET_DIRECT_SMALL = 13
 _FA3_TLE_BUCKET_WS_SMALL_DENSE = 14
 _FA3_TLE_BUCKET_WS_DECODE = 15
 _FA3_TLE_BUCKET_WS_PAGED_DECODE = 16
+_FA3_TLE_BUCKET_WS_SHORT_SMALL_DENSE = 17
+_FA3_TLE_BUCKET_WS_SHORT_DECODE = 18
+_FA3_TLE_BUCKET_WS_SHORT_PAGED_DECODE = 19
 
 _FA3_TLE_FORCE_PATHS = {
     "auto": _FA3_TLE_FAMILY_AUTO,
@@ -79,6 +83,7 @@ _FA3_TLE_FORCE_PATHS = {
     "paged_serve": _FA3_TLE_FAMILY_PAGED_SERVE,
     "direct": _FA3_TLE_FAMILY_DIRECT,
     "ws_simple": _FA3_TLE_FAMILY_WS_SIMPLE,
+    "ws_short": _FA3_TLE_FAMILY_WS_SHORT,
 }
 
 
@@ -134,7 +139,7 @@ def fa3_tle_small_strategy() -> str:
 
 def fa3_tle_ws_strategy() -> str:
     value = os.getenv("FLAG_GEMS_FA3_TLE_WS_STRATEGY", "auto").strip().lower()
-    allowed = ("auto", "ws_simple", "legacy")
+    allowed = ("auto", "ws_short", "ws_simple", "legacy")
     if value not in allowed:
         raise RuntimeError(
             "invalid FLAG_GEMS_FA3_TLE_WS_STRATEGY="
@@ -205,6 +210,26 @@ def fa3_tle_select_plan(
             _FA3_TLE_BUCKET_WS_SMALL_DENSE,
             force_family_id,
             decode_strategy="ws_simple",
+            direct_kind="small_dense",
+        )
+    if force_family_id == _FA3_TLE_FAMILY_WS_SHORT:
+        if avg_q <= 4 and max_seqlen_q <= 64:
+            return FA3TlePlan(
+                "ws_short",
+                _FA3_TLE_BUCKET_WS_SHORT_PAGED_DECODE
+                if is_paged
+                else _FA3_TLE_BUCKET_WS_SHORT_DECODE,
+                force_family_id,
+                decode_strategy="ws_short",
+                direct_kind="paged_decode" if is_paged else "decode",
+                pack_gqa=max_seqlen_q > 1,
+                effective_batch_heads=batch_size * max_seqlen_q,
+            )
+        return FA3TlePlan(
+            "ws_short",
+            _FA3_TLE_BUCKET_WS_SHORT_SMALL_DENSE,
+            force_family_id,
+            decode_strategy="ws_short",
             direct_kind="small_dense",
         )
     if force_family_id == _FA3_TLE_FAMILY_MIXED:
@@ -286,6 +311,21 @@ def fa3_tle_select_plan(
                 pack_gqa=max_seqlen_q > 1,
                 effective_batch_heads=batch_size * max_seqlen_q,
             )
+        if ws_strategy in ("auto", "ws_short"):
+            if (not is_paged and max_seqlen_k < 4096) or (
+                is_paged and head_dim >= 192
+            ):
+                return FA3TlePlan(
+                    "ws_short",
+                    _FA3_TLE_BUCKET_WS_SHORT_PAGED_DECODE
+                    if is_paged
+                    else _FA3_TLE_BUCKET_WS_SHORT_DECODE,
+                    force_family_id,
+                    decode_strategy="ws_short",
+                    direct_kind="paged_decode" if is_paged else "decode",
+                    pack_gqa=max_seqlen_q > 1,
+                    effective_batch_heads=batch_size * max_seqlen_q,
+                )
         if ws_strategy == "ws_simple":
             if (not is_paged and max_seqlen_k < 4096) or (
                 is_paged and head_dim >= 192
@@ -319,6 +359,21 @@ def fa3_tle_select_plan(
             direct_kind="decode",
             pack_gqa=max_seqlen_q > 1,
             effective_batch_heads=batch_size * max_seqlen_q,
+        )
+    if (
+        small_strategy != "short"
+        and ws_strategy in ("auto", "ws_short")
+        and not is_paged
+        and total_q <= 512
+        and max_seqlen_q <= 640
+        and max_seqlen_k <= 1024
+    ):
+        return FA3TlePlan(
+            "ws_short",
+            _FA3_TLE_BUCKET_WS_SHORT_SMALL_DENSE,
+            force_family_id,
+            decode_strategy="ws_short",
+            direct_kind="small_dense",
         )
     if (
         small_strategy != "short"
@@ -600,6 +655,57 @@ def _prune_fa3_tle_configs(configs, nargs, **kwargs):
         if block_m % num_groups != 0:
             continue
         if is_paged and block_n > 128:
+            continue
+        if _fa3_tle_config_smem_bytes(cfg, head_dim) > 220 * 1024:
+            continue
+        kept.append(cfg)
+
+    if kept:
+        return kept
+    return [configs[0]]
+
+
+def _fa3_ws_short_configs():
+    return [
+        _fa3_tle_config(
+            family_id=_FA3_TLE_FAMILY_WS_SHORT,
+            block_m=64,
+            block_n=64,
+            num_buffers_kv=2,
+            num_mma_groups=1,
+            num_mma_warps=4,
+            use_tma_qo=True,
+            use_tma_kv=True,
+        ),
+        _fa3_tle_config(
+            family_id=_FA3_TLE_FAMILY_WS_SHORT,
+            block_m=64,
+            block_n=128,
+            num_buffers_kv=2,
+            num_mma_groups=1,
+            num_mma_warps=4,
+            use_tma_qo=True,
+            use_tma_kv=True,
+        ),
+    ]
+
+
+def _prune_fa3_ws_short_configs(configs, nargs, **kwargs):
+    head_dim = kwargs.get("d", nargs.get("d"))
+    is_paged = kwargs.get("is_paged", nargs.get("is_paged"))
+    shape_bucket = kwargs.get(
+        "WS_SHORT_SHAPE_BUCKET",
+        nargs.get("WS_SHORT_SHAPE_BUCKET", _FA3_TLE_BUCKET_WS_SHORT_SMALL_DENSE),
+    )
+
+    kept = []
+    for cfg in configs:
+        block_n = cfg.kwargs["BLOCK_N"]
+        if shape_bucket == _FA3_TLE_BUCKET_WS_SHORT_PAGED_DECODE and block_n != 64:
+            continue
+        if head_dim >= 192 and block_n != 64:
+            continue
+        if is_paged and block_n != 64:
             continue
         if _fa3_tle_config_smem_bytes(cfg, head_dim) > 220 * 1024:
             continue
@@ -963,6 +1069,53 @@ def _copy_paged_kv_tile_to_smem(
 
 
 @triton.jit
+def _copy_paged_kv_tile_to_smem_sync_safe(
+    src_base,
+    row_stride,
+    page_table_ptr_b,
+    smem_tile,
+    n_offset,
+    k_len,
+    d: tl.constexpr,
+    block_size: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM_PADDED: tl.constexpr,
+):
+    for row_base in tl.static_range(0, BLOCK_N, 32):
+        rows = row_base + tl.arange(0, 32)
+        logical_idx = n_offset + rows
+        row_valid = logical_idx < k_len
+        if block_size % 32 == 0:
+            first_idx = n_offset + row_base
+            page_idx = first_idx // block_size
+            page_block = tl.load(
+                page_table_ptr_b + page_idx,
+                mask=first_idx < k_len,
+                other=0,
+            ).to(tl.int32)
+            cache_idx = page_block * block_size + (logical_idx % block_size)
+        else:
+            cache_idx = _virtual_to_cache(
+                logical_idx,
+                k_len,
+                page_table_ptr_b,
+                block_size,
+                BOUNDARY_CHECK=True,
+            )
+
+        for col_base in tl.static_range(0, HEAD_DIM_PADDED, 32):
+            cols = col_base + tl.arange(0, 32)
+            src_ptrs = src_base + cache_idx[:, None] * row_stride + cols[None, :]
+            load_mask = row_valid[:, None] & (cols[None, :] < d)
+            vals = tl.load(src_ptrs, mask=load_mask, other=0.0)
+            vals = vals + 0.0
+            smem_rows = tl.broadcast_to(rows[:, None], (32, 32))
+            smem_cols = tl.broadcast_to(cols[None, :], (32, 32))
+            smem_ptrs = tle.gpu.local_ptr(smem_tile, (smem_rows, smem_cols))
+            tl.store(smem_ptrs, vals)
+
+
+@triton.jit
 def _copy_dense_tile_to_smem(
     src_base,
     row_stride,
@@ -984,6 +1137,35 @@ def _copy_dense_tile_to_smem(
                 mask=row_valid[:, None] & (cols[None, :] < d),
                 other=0.0,
             )
+            smem_rows = tl.broadcast_to(rows[:, None], (32, 32))
+            smem_cols = tl.broadcast_to(cols[None, :], (32, 32))
+            smem_ptrs = tle.gpu.local_ptr(smem_tile, (smem_rows, smem_cols))
+            tl.store(smem_ptrs, vals)
+
+
+@triton.jit
+def _copy_dense_tile_to_smem_sync_safe(
+    src_base,
+    row_stride,
+    smem_tile,
+    row_offset,
+    row_count,
+    d: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    HEAD_DIM_PADDED: tl.constexpr,
+):
+    for row_base in tl.static_range(0, BLOCK_ROWS, 32):
+        rows = row_base + tl.arange(0, 32)
+        logical_rows = row_offset + rows
+        row_valid = logical_rows < row_count
+        for col_base in tl.static_range(0, HEAD_DIM_PADDED, 32):
+            cols = col_base + tl.arange(0, 32)
+            vals = tl.load(
+                src_base + logical_rows[:, None] * row_stride + cols[None, :],
+                mask=row_valid[:, None] & (cols[None, :] < d),
+                other=0.0,
+            )
+            vals = vals + 0.0
             smem_rows = tl.broadcast_to(rows[:, None], (32, 32))
             smem_cols = tl.broadcast_to(cols[None, :], (32, 32))
             smem_ptrs = tle.gpu.local_ptr(smem_tile, (smem_rows, smem_cols))
@@ -1892,6 +2074,599 @@ def flash_varlen_fwd_v3_tle_kernel(
 
 
 flash_varlen_fwd_v3_tle_ws_simple_kernel = flash_varlen_fwd_v3_tle_kernel
+
+
+@libentry()
+@triton.autotune(
+    configs=_fa3_ws_short_configs(),
+    prune_configs_by={"early_config_prune": _prune_fa3_ws_short_configs},
+    key=[
+        "d",
+        "is_paged",
+        "is_causal",
+        "is_local",
+        "is_alibi",
+        "seqlen_q",
+        "seqlen_k",
+        "total_q",
+        "WS_SHORT_SHAPE_BUCKET",
+        "MIN_Q_LEN_TO_PROCESS",
+        "MAX_Q_LEN_TO_PROCESS",
+    ],
+)
+@triton.heuristics(
+    values={
+        "BLOCK_K": _heur_block_k,
+    }
+)
+@triton.jit(
+    do_not_specialize=[
+        "q_batch_stride",
+        "k_batch_stride",
+        "v_batch_stride",
+        "o_batch_stride",
+        "b",
+        "bk",
+        "seqlen_q",
+        "seqlen_k",
+        "seqlen_q_rounded",
+        "seqlen_k_rounded",
+        "total_q",
+    ]
+)
+def flash_varlen_fwd_v3_tle_ws_short_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    o_ptr,
+    p_ptr,
+    softmax_lse_ptr,
+    q_row_stride,
+    k_row_stride,
+    v_row_stride,
+    q_head_stride,
+    k_head_stride,
+    v_head_stride,
+    o_row_stride,
+    o_head_stride,
+    q_batch_stride,
+    k_batch_stride,
+    v_batch_stride,
+    o_batch_stride,
+    is_cu_seqlens_q: tl.constexpr,
+    cu_seqlens_q_ptr,
+    is_cu_seqlens_k: tl.constexpr,
+    cu_seqlens_k_ptr,
+    is_seqused_k: tl.constexpr,
+    seqused_k_ptr,
+    b,
+    bk,
+    h: tl.constexpr,
+    hk: tl.constexpr,
+    h_hk_ratio: tl.constexpr,
+    seqlen_q,
+    seqlen_k,
+    seqlen_q_rounded,
+    seqlen_k_rounded,
+    d: tl.constexpr,
+    d_rounded: tl.constexpr,
+    is_softcap: tl.constexpr,
+    softcap: tl.constexpr,
+    scale_softmax: tl.constexpr,
+    scale_softmax_log2: tl.constexpr,
+    is_dropout: tl.constexpr,
+    p_dropout: tl.constexpr,
+    rp_dropout: tl.constexpr,
+    p_dropout_in_uint8_t: tl.constexpr,
+    philox_args,
+    return_softmax: tl.constexpr,
+    is_causal: tl.constexpr,
+    is_local: tl.constexpr,
+    window_size_left: tl.constexpr,
+    window_size_right: tl.constexpr,
+    seqlenq_ngroups_swapped: tl.constexpr,
+    is_paged: tl.constexpr,
+    is_alibi: tl.constexpr,
+    alibi_slopes_ptr,
+    alibi_slopes_batch_stride: tl.constexpr,
+    total_q,
+    page_table_ptr,
+    page_table_batch_stride: tl.constexpr,
+    block_size: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_BUFFERS_Q: tl.constexpr,
+    NUM_BUFFERS_KV: tl.constexpr,
+    NUM_MMA_WARPS: tl.constexpr,
+    NUM_MMA_GROUPS: tl.constexpr,
+    Q_STAGE_CAPACITY: tl.constexpr,
+    KV_STAGE_CAPACITY: tl.constexpr,
+    USE_TMA_QO: tl.constexpr,
+    USE_TMA_KV: tl.constexpr,
+    FAMILY_ID: tl.constexpr,
+    WS_SHORT_SHAPE_BUCKET: tl.constexpr,
+    MIN_Q_LEN_TO_PROCESS: tl.constexpr,
+    MAX_Q_LEN_TO_PROCESS: tl.constexpr,
+):
+    HEAD_DIM_PADDED: tl.constexpr = BLOCK_K
+    INPUT_DTYPE: tl.constexpr = q_ptr.dtype.element_ty
+
+    q_smem = tle.gpu.alloc(
+        [1, BLOCK_M, HEAD_DIM_PADDED],
+        dtype=INPUT_DTYPE,
+        layout=None,
+        scope=tle.gpu.smem,
+    )
+    k_smem = tle.gpu.alloc(
+        [KV_STAGE_CAPACITY, BLOCK_N, HEAD_DIM_PADDED],
+        dtype=INPUT_DTYPE,
+        layout=None,
+        scope=tle.gpu.smem,
+    )
+    v_smem = tle.gpu.alloc(
+        [KV_STAGE_CAPACITY, BLOCK_N, HEAD_DIM_PADDED],
+        dtype=INPUT_DTYPE,
+        layout=None,
+        scope=tle.gpu.smem,
+    )
+
+    q_empty = tle.gpu.alloc_barriers(
+        num_barriers=1,
+        arrive_count=1,
+        init=tle.gpu.READY,
+    )
+    q_full = tle.gpu.alloc_barriers(
+        num_barriers=1,
+        arrive_count=1,
+        expect_bytes=BLOCK_M * HEAD_DIM_PADDED * 2,
+    )
+    q_full_manual = tle.gpu.alloc_barriers(num_barriers=1, arrive_count=1)
+    k_empty = tle.gpu.alloc_barriers(
+        num_barriers=KV_STAGE_CAPACITY,
+        arrive_count=1,
+        init=tle.gpu.READY,
+    )
+    k_full = tle.gpu.alloc_barriers(
+        num_barriers=KV_STAGE_CAPACITY,
+        arrive_count=1,
+        expect_bytes=BLOCK_N * HEAD_DIM_PADDED * 2,
+    )
+    k_full_manual = tle.gpu.alloc_barriers(
+        num_barriers=KV_STAGE_CAPACITY,
+        arrive_count=1,
+    )
+    v_empty = tle.gpu.alloc_barriers(
+        num_barriers=KV_STAGE_CAPACITY,
+        arrive_count=1,
+        init=tle.gpu.READY,
+    )
+    v_full = tle.gpu.alloc_barriers(
+        num_barriers=KV_STAGE_CAPACITY,
+        arrive_count=1,
+        expect_bytes=BLOCK_N * HEAD_DIM_PADDED * 2,
+    )
+    v_full_manual = tle.gpu.alloc_barriers(
+        num_barriers=KV_STAGE_CAPACITY,
+        arrive_count=1,
+    )
+
+    with tle.gpu.async_tasks():
+        with tle.gpu.async_task("producer"):
+            m_block = tl.program_id(0)
+            bid = tl.program_id(1)
+            hid = tl.program_id(2)
+
+            if is_cu_seqlens_q:
+                q_eos = tl.load(cu_seqlens_q_ptr + bid + 1).to(tl.int32)
+                q_bos = tl.load(cu_seqlens_q_ptr + bid).to(tl.int32)
+                q_len = q_eos - q_bos
+                q_offset = q_bos * q_row_stride
+            else:
+                q_len = seqlen_q
+                q_offset = bid * q_batch_stride
+
+            if is_cu_seqlens_k:
+                k_eos = tl.load(cu_seqlens_k_ptr + bid + 1).to(tl.int32)
+                k_bos = tl.load(cu_seqlens_k_ptr + bid).to(tl.int32)
+                k_len_cache = k_eos - k_bos
+            else:
+                k_len_cache = seqlen_k
+                k_bos = 0
+
+            if is_seqused_k:
+                k_len = tl.load(seqused_k_ptr + bid).to(tl.int32)
+            else:
+                k_len = k_len_cache
+
+            process_q_tile = (q_len >= MIN_Q_LEN_TO_PROCESS) & (
+                q_len <= MAX_Q_LEN_TO_PROCESS
+            )
+            valid_q_tile = (m_block * BLOCK_M < q_len) & process_q_tile
+            if valid_q_tile:
+                if is_local:
+                    n_block_min = tl.maximum(
+                        0,
+                        (
+                            m_block * BLOCK_M
+                            + k_len
+                            - q_len
+                            - window_size_left
+                        )
+                        // BLOCK_N,
+                    )
+                else:
+                    n_block_min = 0
+
+                n_block_max = tl.cdiv(k_len, BLOCK_N)
+                if is_causal or is_local:
+                    n_block_max = tl.minimum(
+                        n_block_max,
+                        tl.cdiv(
+                            (m_block + 1) * BLOCK_M
+                            + k_len
+                            - q_len
+                            + window_size_right,
+                            BLOCK_N,
+                        ),
+                    )
+
+                if n_block_min < n_block_max:
+                    kv_head = hid // h_hk_ratio
+                    q_base = q_ptr + q_offset + hid * q_head_stride
+                    q_desc = tl.make_tensor_descriptor(
+                        base=q_base,
+                        shape=[q_len, d],
+                        strides=[q_row_stride, 1],
+                        block_shape=[BLOCK_M, HEAD_DIM_PADDED],
+                    )
+                    if is_paged:
+                        page_table_ptr_b = page_table_ptr + bid * page_table_batch_stride
+                        k_base = k_ptr + kv_head * k_head_stride
+                        v_base = v_ptr + kv_head * v_head_stride
+                    else:
+                        k_base = k_ptr + k_bos * k_row_stride + kv_head * k_head_stride
+                        v_base = v_ptr + k_bos * v_row_stride + kv_head * v_head_stride
+                        k_desc = tl.make_tensor_descriptor(
+                            base=k_base,
+                            shape=[k_len_cache, d],
+                            strides=[k_row_stride, 1],
+                            block_shape=[BLOCK_N, HEAD_DIM_PADDED],
+                        )
+                        v_desc = tl.make_tensor_descriptor(
+                            base=v_base,
+                            shape=[k_len_cache, d],
+                            strides=[v_row_stride, 1],
+                            block_shape=[BLOCK_N, HEAD_DIM_PADDED],
+                        )
+
+                    tle.gpu.barrier_wait(q_empty[0], phaseIdx=0)
+                    tle.gpu.copy(
+                        q_desc,
+                        q_smem.slot(0),
+                        [BLOCK_M, HEAD_DIM_PADDED],
+                        [m_block * BLOCK_M, 0],
+                        barrier=q_full[0],
+                    )
+
+                    accum_cnt_kv = 0
+                    n_block = n_block_min
+                    while n_block < n_block_max:
+                        kv_buf, kv_phase_idx = _buf_phase_tle(
+                            accum_cnt_kv, NUM_BUFFERS_KV
+                        )
+                        kv_offset = n_block * BLOCK_N
+
+                        tle.gpu.barrier_wait(k_empty[kv_buf], phaseIdx=kv_phase_idx)
+                        if is_paged:
+                            _copy_paged_kv_tile_to_smem_sync_safe(
+                                k_base,
+                                k_row_stride,
+                                page_table_ptr_b,
+                                k_smem.slot(kv_buf),
+                                kv_offset,
+                                k_len,
+                                d,
+                                block_size,
+                                BLOCK_N,
+                                HEAD_DIM_PADDED,
+                            )
+                            _fence_async_shared_cta()
+                            tle.gpu.barrier_arrive(
+                                k_full_manual[kv_buf], phaseIdx=kv_phase_idx
+                            )
+                        else:
+                            tle.gpu.copy(
+                                k_desc,
+                                k_smem.slot(kv_buf),
+                                [BLOCK_N, HEAD_DIM_PADDED],
+                                [kv_offset, 0],
+                                barrier=k_full[kv_buf],
+                            )
+
+                        tle.gpu.barrier_wait(v_empty[kv_buf], phaseIdx=kv_phase_idx)
+                        if is_paged:
+                            _copy_paged_kv_tile_to_smem_sync_safe(
+                                v_base,
+                                v_row_stride,
+                                page_table_ptr_b,
+                                v_smem.slot(kv_buf),
+                                kv_offset,
+                                k_len,
+                                d,
+                                block_size,
+                                BLOCK_N,
+                                HEAD_DIM_PADDED,
+                            )
+                            _fence_async_shared_cta()
+                            tle.gpu.barrier_arrive(
+                                v_full_manual[kv_buf], phaseIdx=kv_phase_idx
+                            )
+                        else:
+                            tle.gpu.copy(
+                                v_desc,
+                                v_smem.slot(kv_buf),
+                                [BLOCK_N, HEAD_DIM_PADDED],
+                                [kv_offset, 0],
+                                barrier=v_full[kv_buf],
+                            )
+
+                        accum_cnt_kv += 1
+                        n_block += 1
+
+        with tle.gpu.async_task(
+            num_warps=NUM_MMA_WARPS,
+            registers=232,
+            name="mma",
+        ):
+            m_block = tl.program_id(0)
+            bid = tl.program_id(1)
+            hid = tl.program_id(2)
+
+            if is_cu_seqlens_q:
+                q_eos = tl.load(cu_seqlens_q_ptr + bid + 1).to(tl.int32)
+                q_bos = tl.load(cu_seqlens_q_ptr + bid).to(tl.int32)
+                q_len = q_eos - q_bos
+                o_offset = q_bos * o_row_stride
+                lse_offset = q_bos
+            else:
+                q_len = seqlen_q
+                o_offset = bid * o_batch_stride
+                lse_offset = bid * seqlen_q
+
+            if is_cu_seqlens_k:
+                k_eos = tl.load(cu_seqlens_k_ptr + bid + 1).to(tl.int32)
+                k_bos = tl.load(cu_seqlens_k_ptr + bid).to(tl.int32)
+                k_len_cache = k_eos - k_bos
+            else:
+                k_len_cache = seqlen_k
+
+            if is_seqused_k:
+                k_len = tl.load(seqused_k_ptr + bid).to(tl.int32)
+            else:
+                k_len = k_len_cache
+
+            if is_alibi:
+                alibi_slope = tl.load(
+                    alibi_slopes_ptr + bid * alibi_slopes_batch_stride + hid
+                )
+                alibi_slope = alibi_slope / scale_softmax
+            else:
+                alibi_slope = 0.0
+
+            process_q_tile = (q_len >= MIN_Q_LEN_TO_PROCESS) & (
+                q_len <= MAX_Q_LEN_TO_PROCESS
+            )
+            valid_q_tile = (m_block * BLOCK_M < q_len) & process_q_tile
+            if valid_q_tile:
+                if is_local:
+                    n_block_min = tl.maximum(
+                        0,
+                        (
+                            m_block * BLOCK_M
+                            + k_len
+                            - q_len
+                            - window_size_left
+                        )
+                        // BLOCK_N,
+                    )
+                else:
+                    n_block_min = 0
+
+                n_block_max = tl.cdiv(k_len, BLOCK_N)
+                if is_causal or is_local:
+                    n_block_max = tl.minimum(
+                        n_block_max,
+                        tl.cdiv(
+                            (m_block + 1) * BLOCK_M
+                            + k_len
+                            - q_len
+                            + window_size_right,
+                            BLOCK_N,
+                        ),
+                    )
+
+                row_idx_q = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+                o_base = o_ptr + o_offset + hid * o_head_stride
+                o_desc = tl.make_tensor_descriptor(
+                    base=o_base,
+                    shape=[q_len, d],
+                    strides=[o_row_stride, 1],
+                    block_shape=[BLOCK_M, HEAD_DIM_PADDED],
+                )
+
+                if n_block_min < n_block_max:
+                    rowmax = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+                    rowsum = tl.zeros([BLOCK_M], dtype=tl.float32)
+                    acc = tl.zeros([BLOCK_M, HEAD_DIM_PADDED], dtype=tl.float32)
+
+                    tle.gpu.barrier_wait(q_full[0], phaseIdx=0)
+
+                    accum_cnt_kv = 0
+                    kv_buf, kv_phase_idx = _buf_phase_tle(
+                        accum_cnt_kv, NUM_BUFFERS_KV
+                    )
+                    if is_paged:
+                        tle.gpu.barrier_wait(
+                            k_full_manual[kv_buf], phaseIdx=kv_phase_idx
+                        )
+                    else:
+                        tle.gpu.barrier_wait(k_full[kv_buf], phaseIdx=kv_phase_idx)
+
+                    qk = tle.gpu.wgmma(
+                        q_smem.slot(0),
+                        k_smem.slot(kv_buf),
+                        out_dtype=tl.float32,
+                        trans_b=True,
+                    )
+                    qk = tle.gpu.wgmma_wait(0, qk)
+                    tle.gpu.barrier_arrive(k_empty[kv_buf], phaseIdx=kv_phase_idx)
+
+                    n_block = n_block_min
+                    col_idx = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+                    qk = _apply_softcap_v3(qk, softcap, is_softcap)
+                    qk = _apply_alibi_v3(
+                        qk,
+                        col_idx,
+                        row_idx_q,
+                        q_len,
+                        k_len,
+                        IS_CAUSAL=is_causal,
+                        IS_ALIBI=is_alibi,
+                        alibi_slope=alibi_slope,
+                    )
+                    qk = _apply_mask_v3(
+                        qk,
+                        col_idx,
+                        row_idx_q,
+                        q_len,
+                        k_len,
+                        window_size_left,
+                        window_size_right,
+                        IS_EVEN_MN=False,
+                        IS_CAUSAL=is_causal,
+                        IS_LOCAL=is_local,
+                    )
+                    alpha, p, rowmax, rowsum = _softmax_online_deferred(
+                        qk,
+                        rowmax,
+                        rowsum,
+                        softmax_scale_log2e=scale_softmax_log2,
+                        IS_BORDER=True,
+                    )
+
+                    accum_cnt_kv += 1
+                    n_block += 1
+                    while n_block < n_block_max:
+                        kv_buf, kv_phase_idx = _buf_phase_tle(
+                            accum_cnt_kv, NUM_BUFFERS_KV
+                        )
+                        if is_paged:
+                            tle.gpu.barrier_wait(
+                                k_full_manual[kv_buf], phaseIdx=kv_phase_idx
+                            )
+                        else:
+                            tle.gpu.barrier_wait(
+                                k_full[kv_buf], phaseIdx=kv_phase_idx
+                            )
+                        qk = tle.gpu.wgmma(
+                            q_smem.slot(0),
+                            k_smem.slot(kv_buf),
+                            out_dtype=tl.float32,
+                            trans_b=True,
+                        )
+
+                        v_buf, v_phase_idx = _buf_phase_tle(
+                            accum_cnt_kv - 1, NUM_BUFFERS_KV
+                        )
+                        if is_paged:
+                            tle.gpu.barrier_wait(
+                                v_full_manual[v_buf], phaseIdx=v_phase_idx
+                            )
+                        else:
+                            tle.gpu.barrier_wait(v_full[v_buf], phaseIdx=v_phase_idx)
+                        acc = tle.gpu.wgmma(
+                            p.to(INPUT_DTYPE),
+                            v_smem.slot(v_buf),
+                            acc,
+                        )
+
+                        qk = tle.gpu.wgmma_wait(1, qk)
+                        tle.gpu.barrier_arrive(
+                            k_empty[kv_buf], phaseIdx=kv_phase_idx
+                        )
+
+                        col_idx = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+                        qk = _apply_softcap_v3(qk, softcap, is_softcap)
+                        qk = _apply_alibi_v3(
+                            qk,
+                            col_idx,
+                            row_idx_q,
+                            q_len,
+                            k_len,
+                            IS_CAUSAL=is_causal,
+                            IS_ALIBI=is_alibi,
+                            alibi_slope=alibi_slope,
+                        )
+                        qk = _apply_mask_v3(
+                            qk,
+                            col_idx,
+                            row_idx_q,
+                            q_len,
+                            k_len,
+                            window_size_left,
+                            window_size_right,
+                            IS_EVEN_MN=False,
+                            IS_CAUSAL=is_causal,
+                            IS_LOCAL=is_local,
+                        )
+                        alpha, p, rowmax, rowsum = _softmax_online_deferred(
+                            qk,
+                            rowmax,
+                            rowsum,
+                            softmax_scale_log2e=scale_softmax_log2,
+                            IS_BORDER=True,
+                        )
+
+                        acc = tle.gpu.wgmma_wait(0, acc)
+                        tle.gpu.barrier_arrive(v_empty[v_buf], phaseIdx=v_phase_idx)
+                        acc = acc * alpha[:, None]
+
+                        accum_cnt_kv += 1
+                        n_block += 1
+
+                    v_buf, v_phase_idx = _buf_phase_tle(
+                        accum_cnt_kv - 1, NUM_BUFFERS_KV
+                    )
+                    if is_paged:
+                        tle.gpu.barrier_wait(
+                            v_full_manual[v_buf], phaseIdx=v_phase_idx
+                        )
+                    else:
+                        tle.gpu.barrier_wait(v_full[v_buf], phaseIdx=v_phase_idx)
+                    acc = tle.gpu.wgmma(p.to(INPUT_DTYPE), v_smem.slot(v_buf), acc)
+
+                    acc = tle.gpu.wgmma_wait(1, acc)
+                    tle.gpu.barrier_arrive(q_empty[0], phaseIdx=0)
+
+                    acc = tle.gpu.wgmma_wait(0, acc)
+                    tle.gpu.barrier_arrive(v_empty[v_buf], phaseIdx=v_phase_idx)
+
+                    invalid = (rowsum == 0) | (rowsum != rowsum)
+                    inv_sum = tl.where(invalid, 1.0, 1.0 / rowsum)
+                    acc = acc * inv_sum[:, None]
+                    lse = tl.where(
+                        invalid,
+                        float("inf"),
+                        rowmax * scale_softmax + tl.log(rowsum),
+                    )
+                else:
+                    acc = tl.zeros([BLOCK_M, HEAD_DIM_PADDED], dtype=tl.float32)
+                    lse = tl.full([BLOCK_M], float("inf"), dtype=tl.float32)
+
+                o_desc.store([m_block * BLOCK_M, 0], acc.to(o_ptr.dtype.element_ty))
+                lse_ptr = softmax_lse_ptr + hid * total_q + lse_offset + row_idx_q
+                tl.store(lse_ptr, lse, mask=row_idx_q < q_len)
 
 
 @libentry()
