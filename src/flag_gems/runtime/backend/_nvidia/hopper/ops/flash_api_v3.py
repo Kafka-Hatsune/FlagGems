@@ -496,7 +496,7 @@ def mha_varlan_fwd_v3(
                     adjusted_scale_softmax,
                     adjusted_scale_softmax_log2e,
                     BLOCK_M=combine_block_m,
-                    BLOCK_K=head_size_rounded,
+                    BLOCK_K=1 << (head_size - 1).bit_length(),
                     NUM_SPLITS=num_splits,
                 )
             else:
