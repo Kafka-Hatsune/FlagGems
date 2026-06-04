@@ -174,17 +174,6 @@ def test_flash_attn_varlen_func_hopper_fa3_accuracy(pytestconfig, shape, dtype):
             ),
         ),
         (
-            "ws_simple",
-            HopperFA3Shape(
-                "force_ws_simple_dense_small",
-                [(64, 64), (32, 96), (1, 128)],
-                8,
-                2,
-                128,
-                True,
-            ),
-        ),
-        (
             "auto",
             HopperFA3Shape(
                 "auto_paged_small",

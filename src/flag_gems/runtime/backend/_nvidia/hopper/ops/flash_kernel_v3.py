@@ -286,7 +286,7 @@ def fa3_tle_select_plan(
                 pack_gqa=max_seqlen_q > 1,
                 effective_batch_heads=batch_size * max_seqlen_q,
             )
-        if ws_strategy != "legacy":
+        if ws_strategy == "ws_simple":
             if (not is_paged and max_seqlen_k < 4096) or (
                 is_paged and head_dim >= 192
             ):
@@ -322,7 +322,7 @@ def fa3_tle_select_plan(
         )
     if (
         small_strategy != "short"
-        and ws_strategy != "legacy"
+        and ws_strategy == "ws_simple"
         and not is_paged
         and total_q <= 512
         and max_seqlen_q <= 640
