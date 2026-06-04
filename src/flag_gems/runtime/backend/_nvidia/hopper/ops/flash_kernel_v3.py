@@ -205,6 +205,7 @@ def _fa3_tle_ws_candidate_plan(
     avg_q: float,
     max_seqlen_q: int,
     max_seqlen_k: int,
+    head_dim: int,
     is_paged: bool,
 ) -> FA3TlePlan:
     name = _FA3_TLE_WS_CANDIDATE_NAMES[force_family_id]
@@ -228,6 +229,16 @@ def _fa3_tle_ws_candidate_plan(
         raise RuntimeError(f"{name} expects dense K/V decode input, got paged K/V")
     if is_paged_candidate and not is_paged:
         raise RuntimeError(f"{name} expects paged K/V decode input, got dense K/V")
+    if (
+        is_paged_candidate
+        and head_dim < 192
+        and os.getenv("FLAG_GEMS_FA3_TLE_ALLOW_RISKY_PAGED_D128") != "1"
+    ):
+        raise RuntimeError(
+            f"{name} is only enabled for paged high-D decode by default. "
+            f"Got head_dim={head_dim}; set FLAG_GEMS_FA3_TLE_ALLOW_RISKY_PAGED_D128=1 "
+            "only for timeout-guarded debug runs."
+        )
     if is_decode_candidate and (avg_q > 4 or max_seqlen_q > 64):
         raise RuntimeError(
             f"{name} expects decode-like input with avg_q<=4 and max_q<=64, "
@@ -293,6 +304,7 @@ def fa3_tle_select_plan(
             avg_q=avg_q,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            head_dim=head_dim,
             is_paged=is_paged,
         )
 

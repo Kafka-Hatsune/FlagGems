@@ -11,6 +11,8 @@ import argparse
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import time
 from typing import Callable
 
@@ -98,16 +100,12 @@ CASE_GROUPS = {
     # this candidate dense-only by default; use the risky flags below for debug.
     "ws_sync_small": (),
     "ws_sync_paged_decode": (
-        "paged_decode_b16_kvmix_bs16_d128_gqa4",
         "paged_decode_b8_bs16_d192_gqa4",
         "paged_decode_b8_bs16_d256_gqa4",
-        "paged_decode_b64_bs16_d128_gqa4",
     ),
     "ws_pipe2_paged_decode": (
-        "paged_decode_b16_kvmix_bs16_d128_gqa4",
         "paged_decode_b8_bs16_d192_gqa4",
         "paged_decode_b8_bs16_d256_gqa4",
-        "paged_decode_b64_bs16_d128_gqa4",
     ),
 }
 
@@ -118,6 +116,21 @@ def _dtype_from_name(name: str) -> torch.dtype:
     if name in ("bf16", "bfloat16", "torch.bfloat16"):
         return torch.bfloat16
     raise ValueError(f"unsupported dtype {name!r}")
+
+
+def _dtype_from_name_without_torch(name: str) -> str:
+    if name in ("fp16", "float16", "torch.float16"):
+        return "float16"
+    if name in ("bf16", "bfloat16", "torch.bfloat16"):
+        return "bfloat16"
+    return name
+
+
+def _dtype_names(args) -> tuple[str, ...]:
+    dtype_names = ("fp16",) if args.smoke else ("fp16", "bf16")
+    if args.dtypes:
+        dtype_names = _parse_csv(args.dtypes, ("fp16", "bf16"))
+    return dtype_names
 
 
 def _load_runtime() -> None:
@@ -274,6 +287,7 @@ def _run_one(
     rep: int,
     seed: int,
     allow_risky_paged_small: bool,
+    allow_risky_paged_d128: bool,
 ) -> dict:
     device = flag_gems.device
     os.environ["FLAG_GEMS_FA3_TLE_FORCE_PATH"] = candidate
@@ -281,6 +295,10 @@ def _run_one(
         os.environ["FLAG_GEMS_FA3_TLE_ALLOW_RISKY_PAGED_SMALL"] = "1"
     else:
         os.environ.pop("FLAG_GEMS_FA3_TLE_ALLOW_RISKY_PAGED_SMALL", None)
+    if allow_risky_paged_d128:
+        os.environ["FLAG_GEMS_FA3_TLE_ALLOW_RISKY_PAGED_D128"] = "1"
+    else:
+        os.environ.pop("FLAG_GEMS_FA3_TLE_ALLOW_RISKY_PAGED_D128", None)
     os.environ.pop("FLAG_GEMS_FA3_TLE_DECODE_STRATEGY", None)
     os.environ.pop("FLAG_GEMS_FA3_TLE_SMALL_STRATEGY", None)
     os.environ.pop("FLAG_GEMS_FA3_TLE_WS_STRATEGY", None)
@@ -314,6 +332,82 @@ def _run_one(
         except Exception:
             pass
     return record
+
+
+def _sanitize_name(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value)
+
+
+def _run_one_isolated(
+    *,
+    args,
+    candidate: str,
+    case_name: str,
+    dtype_name: str,
+    seed: int,
+    out_dir: Path,
+) -> dict:
+    record_path = out_dir / (
+        f".record_{_sanitize_name(candidate)}_{_sanitize_name(case_name)}_"
+        f"{_sanitize_name(dtype_name)}.json"
+    )
+    if record_path.exists():
+        record_path.unlink()
+
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--single-run",
+        "--single-candidate",
+        candidate,
+        "--single-case",
+        case_name,
+        "--single-dtype",
+        dtype_name,
+        "--single-output",
+        str(record_path),
+        "--warmup",
+        str(args.warmup),
+        "--rep",
+        str(args.rep),
+        "--seed",
+        str(seed),
+    ]
+    if args.allow_risky_paged_small_kernel:
+        cmd.append("--allow-risky-paged-small-kernel")
+    if args.allow_risky_paged_d128_kernel:
+        cmd.append("--allow-risky-paged-d128-kernel")
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            cwd=str(Path(__file__).resolve().parents[1]),
+            timeout=args.timeout_s,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "candidate": candidate,
+            "case": case_name,
+            "dtype": f"torch.{_dtype_from_name_without_torch(dtype_name)}",
+            "status": "failed",
+            "latency_ms": None,
+            "error": f"timeout after {args.timeout_s}s",
+            "case_group": "timeout",
+        }
+
+    if record_path.exists():
+        return json.loads(record_path.read_text(encoding="utf-8"))
+
+    return {
+        "candidate": candidate,
+        "case": case_name,
+        "dtype": f"torch.{_dtype_from_name_without_torch(dtype_name)}",
+        "status": "failed",
+        "latency_ms": None,
+        "error": f"child exited with code {completed.returncode} before writing record",
+        "case_group": "child_error",
+    }
 
 
 def _selected_cases(
@@ -358,6 +452,17 @@ def main() -> int:
     parser.add_argument("--rep", type=int, default=30)
     parser.add_argument("--seed", type=int, default=2030)
     parser.add_argument(
+        "--timeout-s",
+        type=int,
+        default=900,
+        help="Per-case timeout used by the default isolated runner.",
+    )
+    parser.add_argument(
+        "--in-process",
+        action="store_true",
+        help="Run all cases in the current process. Faster, but unsafe for deadlocks.",
+    )
+    parser.add_argument(
         "--include-risky-paged-small",
         action="store_true",
         help="Include std#0..std#3 under ws_sync_small. This is known risky.",
@@ -367,20 +472,55 @@ def main() -> int:
         action="store_true",
         help="Actually let ws_sync_small launch paged small kernels.",
     )
+    parser.add_argument(
+        "--allow-risky-paged-d128-kernel",
+        action="store_true",
+        help="Allow paged decode candidate kernels on d128 paged cases.",
+    )
+    parser.add_argument("--single-run", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--single-candidate", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--single-case", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--single-dtype", default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--single-output", type=Path, default=None, help=argparse.SUPPRESS
+    )
     args = parser.parse_args()
+
+    if args.single_run:
+        if not (
+            args.single_candidate
+            and args.single_case
+            and args.single_dtype
+            and args.single_output
+        ):
+            raise RuntimeError("single-run requires candidate, case, dtype, and output")
+        _load_runtime()
+        if not is_fa3_supported():
+            raise RuntimeError("requires CUDA Hopper with TLE FA3 support")
+        record = _run_one(
+            candidate=args.single_candidate,
+            case_name=args.single_case,
+            dtype=_dtype_from_name(args.single_dtype),
+            warmup=args.warmup,
+            rep=args.rep,
+            seed=args.seed,
+            allow_risky_paged_small=args.allow_risky_paged_small_kernel,
+            allow_risky_paged_d128=args.allow_risky_paged_d128_kernel,
+        )
+        args.single_output.parent.mkdir(parents=True, exist_ok=True)
+        args.single_output.write_text(json.dumps(record, indent=2), encoding="utf-8")
+        return 0
 
     candidates = _parse_csv(args.candidates, CANDIDATES)
     all_cases = tuple(sorted(HOPPER_CASE_NAMES | set(STANDARD_CASES)))
     explicit_cases = () if not args.cases else _parse_csv(args.cases, all_cases)
 
-    _load_runtime()
-    if not is_fa3_supported():
-        raise RuntimeError("requires CUDA Hopper with TLE FA3 support")
-
-    dtype_names = ("fp16",) if args.smoke else ("fp16", "bf16")
-    if args.dtypes:
-        dtype_names = _parse_csv(args.dtypes, ("fp16", "bf16"))
-    dtypes = tuple(_dtype_from_name(name) for name in dtype_names)
+    dtype_names = _dtype_names(args)
+    if args.in_process:
+        _load_runtime()
+        if not is_fa3_supported():
+            raise RuntimeError("requires CUDA Hopper with TLE FA3 support")
+        dtypes = tuple(_dtype_from_name(name) for name in dtype_names)
 
     out_dir = args.out_dir or _default_out_dir(args.tag)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -397,25 +537,43 @@ def main() -> int:
                 flush=True,
             )
         for case_idx, case_name in enumerate(selected[candidate]):
-            for dtype in dtypes:
-                print(f"[{candidate}] {case_name} {dtype}", flush=True)
-                records.append(
-                    _run_one(
-                        candidate=candidate,
-                        case_name=case_name,
-                        dtype=dtype,
-                        warmup=args.warmup,
-                        rep=args.rep,
-                        seed=args.seed + case_idx,
-                        allow_risky_paged_small=args.allow_risky_paged_small_kernel,
+            for dtype_idx, dtype_name in enumerate(dtype_names):
+                print(f"[{candidate}] {case_name} {dtype_name}", flush=True)
+                seed = args.seed + case_idx * 17 + dtype_idx
+                if args.in_process:
+                    records.append(
+                        _run_one(
+                            candidate=candidate,
+                            case_name=case_name,
+                            dtype=dtypes[dtype_idx],
+                            warmup=args.warmup,
+                            rep=args.rep,
+                            seed=seed,
+                            allow_risky_paged_small=args.allow_risky_paged_small_kernel,
+                            allow_risky_paged_d128=args.allow_risky_paged_d128_kernel,
+                        )
                     )
-                )
+                else:
+                    records.append(
+                        _run_one_isolated(
+                            args=args,
+                            candidate=candidate,
+                            case_name=case_name,
+                            dtype_name=dtype_name,
+                            seed=seed,
+                            out_dir=out_dir,
+                        )
+                    )
         payload = {
             "tag": args.tag,
             "candidate": candidate,
             "mode": "smoke" if args.smoke else "full",
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "device": torch.cuda.get_device_name() if torch.cuda.is_available() else "",
+            "device": (
+                torch.cuda.get_device_name()
+                if args.in_process and torch.cuda.is_available()
+                else ""
+            ),
             "warmup": args.warmup,
             "rep": args.rep,
             "records": records,
