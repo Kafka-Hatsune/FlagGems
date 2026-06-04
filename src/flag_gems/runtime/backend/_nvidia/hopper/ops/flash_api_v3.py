@@ -16,7 +16,13 @@ import flag_gems
 from flag_gems.ops.flash_api import fwd_params
 from flag_gems.runtime import torch_device_fn
 
-from .flash_kernel_v3 import TLE_FA3_AVAILABLE, flash_varlen_fwd_v3_tle_kernel
+from .flash_kernel_v3 import (
+    TLE_FA3_AVAILABLE,
+    fa3_tle_force_family_id,
+    fa3_tle_mixed_long_plan,
+    fa3_tle_select_plan,
+    flash_varlen_fwd_v3_tle_kernel,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,25 +68,8 @@ def is_fa3_supported() -> bool:
         return False
 
 
-def _next_power_of_2(value: int) -> int:
-    if value <= 0:
-        raise RuntimeError(f"expected positive value, got {value}")
-    return 1 << (value - 1).bit_length()
-
-
 def _round_multiple(value: int, multiple: int) -> int:
     return (value + multiple - 1) // multiple * multiple
-
-
-def _tle_tile_config(head_size: int) -> tuple[int, int, int]:
-    if head_size <= 128:
-        return 128, 128, 2
-    # BLOCK_K rounds head_dim=192 up to 256. Keeping two K/V stages for
-    # head_dim > 128 over-allocates shared memory before the compiler can
-    # report a Python exception, so use a single K/V stage for these variants.
-    if head_size <= 192:
-        return 128, 64, 1
-    return 128, 64, 1
 
 
 def _tma_strides_are_aligned(tensor: torch.Tensor) -> bool:
@@ -153,8 +142,6 @@ def _require_tle_supported(
     else:
         if k.ndim != 3 or v.ndim != 3:
             raise RuntimeError("TLE FA3 dense mode expects k/v shape (total_k, hk, d).")
-        if not _tma_strides_are_aligned(k) or not _tma_strides_are_aligned(v):
-            raise RuntimeError("TLE FA3 dense K/V TMA strides must be 16-byte aligned.")
 
     if out is not None and out.dtype != q.dtype:
         raise RuntimeError("TLE FA3 requires output dtype to match q.")
@@ -321,8 +308,6 @@ def mha_varlan_fwd_v3(
             out_ = None
             out = torch.empty_like(q)
 
-        if not _tma_strides_are_aligned(q) or not _tma_strides_are_aligned(out):
-            raise RuntimeError("TLE FA3 Q/O TMA strides must be 16-byte aligned.")
         if seqlenq_ngroups_swapped:
             o_batch_stride = out.stride(0) * max_seqlen_q
 
@@ -396,27 +381,59 @@ def mha_varlan_fwd_v3(
         )
 
         _ensure_tma_allocator()
-        block_m, block_n, num_buffers_kv = _tle_tile_config(head_size)
-        num_buffers_q = 1
-        num_mma_groups = 2
-        num_mma_warps = 8
-        total_tiles = triton.cdiv(max_seqlen_q, block_m) * batch_size * num_heads
         num_sms = torch.cuda.get_device_properties(q_device).multi_processor_count
-        grid = (min(num_sms, total_tiles),)
-        logger.debug("kernel: flash_varlen_fwd_v3_tle")
-        flash_varlen_fwd_v3_tle_kernel[grid](
-            *tuple(getattr(params, k) for k in params.__slots__),
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
-            NUM_BUFFERS_Q=num_buffers_q,
-            NUM_BUFFERS_KV=num_buffers_kv,
-            NUM_MMA_WARPS=num_mma_warps,
-            NUM_MMA_GROUPS=num_mma_groups,
-            Q_STAGE_CAPACITY=_next_power_of_2(num_buffers_q * num_mma_groups),
-            KV_STAGE_CAPACITY=_next_power_of_2(num_buffers_kv),
-            num_warps=4,
-            tle_wgmma_pipeline_mode="user_promise",
+        args = tuple(getattr(params, k) for k in params.__slots__)
+        force_family_id = fa3_tle_force_family_id()
+        plan = fa3_tle_select_plan(
+            total_q=total_q,
+            batch_size=batch_size,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            is_paged=is_paged,
+            force_family_id=force_family_id,
         )
+
+        def _run_plan(run_plan):
+            if run_plan.family in ("long", "mixed_long"):
+                if (
+                    not _tma_strides_are_aligned(q)
+                    or not _tma_strides_are_aligned(out)
+                    or (not is_paged and not _tma_strides_are_aligned(k))
+                    or (not is_paged and not _tma_strides_are_aligned(v))
+                ):
+                    raise RuntimeError(
+                        "TLE FA3 long/TMA path requires 16-byte aligned Q/K/V/O strides."
+                    )
+
+            grid = lambda meta: (
+                min(
+                    num_sms,
+                    triton.cdiv(max_seqlen_q, meta["BLOCK_M"])
+                    * batch_size
+                    * num_heads,
+                ),
+            )
+            logger.debug(
+                "kernel: flash_varlen_fwd_v3_tle family=%s bucket=%s q_len=[%s,%s]",
+                run_plan.family,
+                run_plan.shape_bucket,
+                run_plan.min_q_len,
+                run_plan.max_q_len,
+            )
+            flash_varlen_fwd_v3_tle_kernel[grid](
+                *args,
+                SHAPE_BUCKET=run_plan.shape_bucket,
+                FORCE_FAMILY_ID=run_plan.force_family_id,
+                MIN_Q_LEN_TO_PROCESS=run_plan.min_q_len,
+                MAX_Q_LEN_TO_PROCESS=run_plan.max_q_len,
+                tle_wgmma_pipeline_mode="user_promise",
+            )
+
+        if plan.family == "mixed":
+            _run_plan(fa3_tle_mixed_long_plan(force_family_id))
+            _run_plan(plan)
+        else:
+            _run_plan(plan)
 
         if seqlenq_ngroups_swapped:
             out = out.reshape(

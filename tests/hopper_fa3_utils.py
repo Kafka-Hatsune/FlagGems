@@ -111,6 +111,8 @@ def benchmark_shapes() -> List[Shape]:
 
     decode = [
         Shape("decode_b16_kv1k_d128_gqa4", [(1, 1024)] * 16, 32, 8, 128, True),
+        Shape("decode_b8_kv1k_d192_gqa4", [(1, 1024)] * 8, 32, 8, 192, True),
+        Shape("decode_b8_kv1k_d256_gqa4", [(1, 1024)] * 8, 32, 8, 256, True),
         Shape(
             "decode_b16_mixed_d128_gqa4",
             [(1, 512), (1, 1024), (1, 2048), (1, 4096)] * 4,
@@ -156,6 +158,26 @@ def benchmark_shapes() -> List[Shape]:
             32,
             8,
             128,
+            True,
+            paged=True,
+            block_size=16,
+        ),
+        Shape(
+            "paged_decode_b8_bs16_d192_gqa4",
+            [(1, 1024 + 128 * i) for i in range(8)],
+            32,
+            8,
+            192,
+            True,
+            paged=True,
+            block_size=16,
+        ),
+        Shape(
+            "paged_decode_b8_bs16_d256_gqa4",
+            [(1, 1024 + 128 * i) for i in range(8)],
+            32,
+            8,
+            256,
             True,
             paged=True,
             block_size=16,

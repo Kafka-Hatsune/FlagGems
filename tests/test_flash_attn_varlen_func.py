@@ -7,6 +7,7 @@ import flag_gems
 
 from . import accuracy_utils as utils
 from .hopper_fa3_utils import (
+    Shape as HopperFA3Shape,
     accuracy_shapes as hopper_fa3_accuracy_shapes,
     build_reference as build_hopper_fa3_reference,
     dispatch_source as hopper_fa3_dispatch_source,
@@ -145,6 +146,59 @@ def test_flash_attn_varlen_func_hopper_fa3_accuracy(pytestconfig, shape, dtype):
     max_abs, mean_abs = hopper_fa3_max_mean_abs(out, ref)
     msg = (
         f"shape={shape.name}, dtype={dtype}, fa_version={fa_version}, ref={ref_kind}, "
+        f"max_abs={max_abs:.3e}, mean_abs={mean_abs:.3e}"
+    )
+    torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=rtol, msg=msg)
+
+
+@pytest.mark.hopper_fa3
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.parametrize(
+    "force_path,shape",
+    [
+        ("long", hopper_fa3_accuracy_shapes()[0]),
+        ("short", hopper_fa3_accuracy_shapes()[2]),
+        ("splitkv", hopper_fa3_accuracy_shapes()[3]),
+        (
+            "mixed",
+            HopperFA3Shape(
+                "force_mixed_dense_serve",
+                [(128, 128), (1, 256), (1, 320), (1, 384)],
+                8,
+                2,
+                128,
+                True,
+            ),
+        ),
+        (
+            "mixed",
+            HopperFA3Shape(
+                "force_mixed_paged_serve",
+                [(128, 128), (1, 256), (1, 320), (1, 384)],
+                8,
+                2,
+                128,
+                True,
+                paged=True,
+                block_size=16,
+            ),
+        ),
+    ],
+    ids=lambda item: item if isinstance(item, str) else item.name,
+)
+@torch.inference_mode()
+def test_flash_attn_varlen_func_hopper_fa3_force_paths(
+    monkeypatch, pytestconfig, force_path, shape
+):
+    _skip_unless_hopper_fa3(pytestconfig)
+    monkeypatch.setenv("FLAG_GEMS_FA3_TLE_FORCE_PATH", force_path)
+    tensors = make_hopper_fa3_varlen(shape, torch.float16, flag_gems.device, seed=2027)
+    ref, ref_kind = build_hopper_fa3_reference(tensors, shape, fa_version=3)
+    out = hopper_fa3_output_tensor(run_hopper_fa3(tensors, shape, fa_version=3))
+    atol, rtol = hopper_fa3_tolerances(torch.float16, tensors.max_seqlen_k, ref_kind)
+    max_abs, mean_abs = hopper_fa3_max_mean_abs(out, ref)
+    msg = (
+        f"force_path={force_path}, shape={shape.name}, ref={ref_kind}, "
         f"max_abs={max_abs:.3e}, mean_abs={mean_abs:.3e}"
     )
     torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=rtol, msg=msg)

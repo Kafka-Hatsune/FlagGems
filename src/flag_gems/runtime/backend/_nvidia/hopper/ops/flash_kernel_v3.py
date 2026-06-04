@@ -1,12 +1,13 @@
 """
 TLE-only Hopper FlashAttention forward kernel for varlen / paged attention.
 
-This module intentionally exposes a single FA3 kernel:
+This module intentionally exposes one autotuned FA3 TLE kernel family through
 ``flash_varlen_fwd_v3_tle_kernel``.  It uses FlagTree TLE Hopper features:
 
 * a producer async task stages Q/K/V into shared memory
-* two replicated MMA consumer tasks split BLOCK_M along M
-* TMA copies are used for dense Q/K/V and O
+* the long-sequence specialization uses two replicated MMA consumers split along M
+* the short/decode specialization uses one MMA consumer and direct SMEM staging
+* TMA copies are used by long dense Q/K/V/O configs
 * paged K/V is gathered by the producer into dense shared-memory tiles
 * WGMMA QK and PV are coordinated by explicit user ``wgmma_wait`` calls
 
@@ -17,6 +18,9 @@ Supported subset:
 * dense varlen and paged KV
 * causal, local window, ALiBi, and softcap score transforms
 """
+
+from dataclasses import dataclass
+import os
 
 import triton
 import triton.language as tl
@@ -30,6 +34,244 @@ try:
 except Exception:
     tle = None
     TLE_FA3_AVAILABLE = False
+
+
+_FA3_TLE_FAMILY_LONG = 0
+_FA3_TLE_FAMILY_SHORT = 1
+_FA3_TLE_FAMILY_SPLITKV = 2
+_FA3_TLE_FAMILY_MIXED = 3
+_FA3_TLE_FAMILY_AUTO = -1
+
+_FA3_TLE_BUCKET_LONG = 0
+_FA3_TLE_BUCKET_SHORT = 1
+_FA3_TLE_BUCKET_SPLITKV = 2
+_FA3_TLE_BUCKET_MIXED_LONG = 3
+_FA3_TLE_BUCKET_MIXED_SHORT = 4
+
+_FA3_TLE_FORCE_PATHS = {
+    "auto": _FA3_TLE_FAMILY_AUTO,
+    "long": _FA3_TLE_FAMILY_LONG,
+    "short": _FA3_TLE_FAMILY_SHORT,
+    "splitkv": _FA3_TLE_FAMILY_SPLITKV,
+    "mixed": _FA3_TLE_FAMILY_MIXED,
+}
+
+
+def _next_power_of_2_host(value: int) -> int:
+    return 1 << (value - 1).bit_length()
+
+
+@dataclass(frozen=True)
+class FA3TlePlan:
+    family: str
+    shape_bucket: int
+    force_family_id: int
+    min_q_len: int = 0
+    max_q_len: int = 2**31 - 1
+
+
+def fa3_tle_force_family_id() -> int:
+    value = os.getenv("FLAG_GEMS_FA3_TLE_FORCE_PATH", "auto").strip().lower()
+    if value not in _FA3_TLE_FORCE_PATHS:
+        allowed = ", ".join(sorted(_FA3_TLE_FORCE_PATHS))
+        raise RuntimeError(
+            f"invalid FLAG_GEMS_FA3_TLE_FORCE_PATH={value!r}; expected one of {allowed}"
+        )
+    return _FA3_TLE_FORCE_PATHS[value]
+
+
+def fa3_tle_select_plan(
+    *,
+    total_q: int,
+    batch_size: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    is_paged: bool,
+    force_family_id: int,
+) -> FA3TlePlan:
+    if force_family_id == _FA3_TLE_FAMILY_LONG:
+        return FA3TlePlan("long", _FA3_TLE_BUCKET_LONG, force_family_id)
+    if force_family_id == _FA3_TLE_FAMILY_SHORT:
+        return FA3TlePlan("short", _FA3_TLE_BUCKET_SHORT, force_family_id)
+    if force_family_id == _FA3_TLE_FAMILY_SPLITKV:
+        return FA3TlePlan("splitkv", _FA3_TLE_BUCKET_SPLITKV, force_family_id)
+    if force_family_id == _FA3_TLE_FAMILY_MIXED:
+        return FA3TlePlan(
+            "mixed",
+            _FA3_TLE_BUCKET_MIXED_SHORT,
+            force_family_id,
+            max_q_len=64,
+        )
+
+    avg_q = total_q / max(batch_size, 1)
+    if max_seqlen_q > 512 and avg_q <= 128:
+        return FA3TlePlan(
+            "mixed",
+            _FA3_TLE_BUCKET_MIXED_SHORT,
+            force_family_id,
+            max_q_len=64,
+        )
+    if avg_q <= 64 and max_seqlen_k >= 1024:
+        return FA3TlePlan("splitkv", _FA3_TLE_BUCKET_SPLITKV, force_family_id)
+    if max_seqlen_q <= 128 or avg_q <= 128:
+        return FA3TlePlan("short", _FA3_TLE_BUCKET_SHORT, force_family_id)
+    return FA3TlePlan("long", _FA3_TLE_BUCKET_LONG, force_family_id)
+
+
+def fa3_tle_mixed_long_plan(force_family_id: int) -> FA3TlePlan:
+    return FA3TlePlan(
+        "mixed_long",
+        _FA3_TLE_BUCKET_MIXED_LONG,
+        force_family_id,
+        min_q_len=65,
+    )
+
+
+def _fa3_tle_config(
+    *,
+    family_id,
+    block_m,
+    block_n,
+    num_buffers_kv,
+    num_mma_groups,
+    num_mma_warps,
+    use_tma_qo,
+    use_tma_kv,
+):
+    return triton.Config(
+        {
+            "FAMILY_ID": family_id,
+            "BLOCK_M": block_m,
+            "BLOCK_N": block_n,
+            "NUM_BUFFERS_Q": 1,
+            "NUM_BUFFERS_KV": num_buffers_kv,
+            "NUM_MMA_WARPS": num_mma_warps,
+            "NUM_MMA_GROUPS": num_mma_groups,
+            "Q_STAGE_CAPACITY": _next_power_of_2_host(num_mma_groups),
+            "KV_STAGE_CAPACITY": _next_power_of_2_host(num_buffers_kv),
+            "USE_TMA_QO": use_tma_qo,
+            "USE_TMA_KV": use_tma_kv,
+        },
+        num_warps=4,
+    )
+
+
+def _fa3_tle_configs():
+    configs = [
+        _fa3_tle_config(
+            family_id=_FA3_TLE_FAMILY_LONG,
+            block_m=128,
+            block_n=128,
+            num_buffers_kv=2,
+            num_mma_groups=2,
+            num_mma_warps=8,
+            use_tma_qo=True,
+            use_tma_kv=True,
+        ),
+        _fa3_tle_config(
+            family_id=_FA3_TLE_FAMILY_LONG,
+            block_m=128,
+            block_n=64,
+            num_buffers_kv=1,
+            num_mma_groups=2,
+            num_mma_warps=8,
+            use_tma_qo=True,
+            use_tma_kv=True,
+        ),
+    ]
+    for family_id in (_FA3_TLE_FAMILY_SHORT, _FA3_TLE_FAMILY_SPLITKV):
+        for block_m in (64, 128):
+            for block_n in (32, 64, 128):
+                configs.append(
+                    _fa3_tle_config(
+                        family_id=family_id,
+                        block_m=block_m,
+                        block_n=block_n,
+                        num_buffers_kv=1 if block_n >= 64 else 2,
+                        num_mma_groups=1,
+                        num_mma_warps=4,
+                        use_tma_qo=False,
+                        use_tma_kv=False,
+                    )
+                )
+    return configs
+
+
+def _fa3_tle_config_smem_bytes(cfg, head_dim: int) -> int:
+    block_k = _next_power_of_2_host(head_dim)
+    block_m = cfg.kwargs["BLOCK_M"]
+    block_n = cfg.kwargs["BLOCK_N"]
+    num_groups = cfg.kwargs["NUM_MMA_GROUPS"]
+    bm_split = block_m // num_groups
+    q_stage = cfg.kwargs["Q_STAGE_CAPACITY"]
+    kv_stage = cfg.kwargs["KV_STAGE_CAPACITY"]
+    elems = q_stage * bm_split * block_k
+    elems += 2 * kv_stage * block_n * block_k
+    return elems * 2
+
+
+def _prune_fa3_tle_configs(configs, nargs, **kwargs):
+    head_dim = nargs["d"]
+    is_paged = nargs["is_paged"]
+    shape_bucket = nargs["SHAPE_BUCKET"]
+    force_family_id = nargs["FORCE_FAMILY_ID"]
+
+    kept = []
+    for cfg in configs:
+        family_id = cfg.kwargs["FAMILY_ID"]
+        block_n = cfg.kwargs["BLOCK_N"]
+        block_m = cfg.kwargs["BLOCK_M"]
+        num_groups = cfg.kwargs["NUM_MMA_GROUPS"]
+
+        if force_family_id in (
+            _FA3_TLE_FAMILY_LONG,
+            _FA3_TLE_FAMILY_SHORT,
+            _FA3_TLE_FAMILY_SPLITKV,
+        ) and family_id != force_family_id:
+            continue
+        if force_family_id == _FA3_TLE_FAMILY_MIXED:
+            if shape_bucket == _FA3_TLE_BUCKET_MIXED_LONG:
+                if family_id != _FA3_TLE_FAMILY_LONG:
+                    continue
+            elif family_id not in (
+                _FA3_TLE_FAMILY_SHORT,
+                _FA3_TLE_FAMILY_SPLITKV,
+            ):
+                continue
+
+        if force_family_id == _FA3_TLE_FAMILY_AUTO:
+            if shape_bucket in (_FA3_TLE_BUCKET_LONG, _FA3_TLE_BUCKET_MIXED_LONG):
+                if family_id != _FA3_TLE_FAMILY_LONG:
+                    continue
+            elif shape_bucket == _FA3_TLE_BUCKET_SHORT:
+                if family_id != _FA3_TLE_FAMILY_SHORT:
+                    continue
+            else:
+                if family_id not in (
+                    _FA3_TLE_FAMILY_SHORT,
+                    _FA3_TLE_FAMILY_SPLITKV,
+                ):
+                    continue
+
+        if head_dim > 128 and block_n > 64:
+            continue
+        if head_dim >= 128 and family_id != _FA3_TLE_FAMILY_LONG and block_m > 64:
+            continue
+        if head_dim > 128 and cfg.kwargs["NUM_BUFFERS_KV"] > 1 and block_n >= 64:
+            continue
+        if head_dim > 192 and block_n > 64:
+            continue
+        if block_m % num_groups != 0:
+            continue
+        if is_paged and block_n > 128:
+            continue
+        if _fa3_tle_config_smem_bytes(cfg, head_dim) > 220 * 1024:
+            continue
+        kept.append(cfg)
+
+    if kept:
+        return kept
+    return [configs[0]]
 
 
 @triton.jit
@@ -221,7 +463,66 @@ def _copy_paged_kv_tile_to_smem(
             tl.store(smem_ptrs, vals)
 
 
+@triton.jit
+def _copy_dense_tile_to_smem(
+    src_base,
+    row_stride,
+    smem_tile,
+    row_offset,
+    row_count,
+    d: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    HEAD_DIM_PADDED: tl.constexpr,
+):
+    for row_base in tl.static_range(0, BLOCK_ROWS, 32):
+        rows = row_base + tl.arange(0, 32)
+        logical_rows = row_offset + rows
+        row_valid = logical_rows < row_count
+        for col_base in tl.static_range(0, HEAD_DIM_PADDED, 32):
+            cols = col_base + tl.arange(0, 32)
+            vals = tl.load(
+                src_base + logical_rows[:, None] * row_stride + cols[None, :],
+                mask=row_valid[:, None] & (cols[None, :] < d),
+                other=0.0,
+            )
+            smem_rows = tl.broadcast_to(rows[:, None], (32, 32))
+            smem_cols = tl.broadcast_to(cols[None, :], (32, 32))
+            smem_ptrs = tle.gpu.local_ptr(smem_tile, (smem_rows, smem_cols))
+            tl.store(smem_ptrs, vals)
+
+
+@triton.jit
+def _store_dense_tile_from_regs(
+    dst_base,
+    row_stride,
+    vals,
+    row_offset,
+    row_count,
+    d: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    HEAD_DIM_PADDED: tl.constexpr,
+):
+    rows = row_offset + tl.arange(0, BLOCK_ROWS)
+    cols = tl.arange(0, HEAD_DIM_PADDED)
+    ptrs = dst_base + rows[:, None] * row_stride + cols[None, :]
+    mask = (rows[:, None] < row_count) & (cols[None, :] < d)
+    tl.store(ptrs, vals, mask=mask)
+
+
 @libentry()
+@triton.autotune(
+    configs=_fa3_tle_configs(),
+    prune_configs_by={"early_config_prune": _prune_fa3_tle_configs},
+    key=[
+        "d",
+        "is_paged",
+        "is_causal",
+        "is_local",
+        "is_alibi",
+        "SHAPE_BUCKET",
+        "FORCE_FAMILY_ID",
+    ],
+)
 @triton.heuristics(
     values={
         "BLOCK_K": _heur_block_k,
@@ -310,6 +611,13 @@ def flash_varlen_fwd_v3_tle_kernel(
     NUM_MMA_GROUPS: tl.constexpr,
     Q_STAGE_CAPACITY: tl.constexpr,
     KV_STAGE_CAPACITY: tl.constexpr,
+    USE_TMA_QO: tl.constexpr,
+    USE_TMA_KV: tl.constexpr,
+    FAMILY_ID: tl.constexpr,
+    SHAPE_BUCKET: tl.constexpr,
+    FORCE_FAMILY_ID: tl.constexpr,
+    MIN_Q_LEN_TO_PROCESS: tl.constexpr,
+    MAX_Q_LEN_TO_PROCESS: tl.constexpr,
 ):
     BM_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
     HEAD_DIM_PADDED: tl.constexpr = BLOCK_K
@@ -344,6 +652,10 @@ def flash_varlen_fwd_v3_tle_kernel(
         num_barriers=Q_STAGE_CAPACITY,
         arrive_count=1,
         expect_bytes=BM_SPLIT * HEAD_DIM_PADDED * 2,
+    )
+    q_fulls_manual = tle.gpu.alloc_barriers(
+        num_barriers=Q_STAGE_CAPACITY,
+        arrive_count=1,
     )
     k_empties = tle.gpu.alloc_barriers(
         num_barriers=KV_STAGE_CAPACITY,
@@ -416,7 +728,10 @@ def flash_varlen_fwd_v3_tle_kernel(
                 else:
                     k_len = k_len_cache
 
-                valid_q_tile = m_block * BLOCK_M < q_len
+                process_q_tile = (q_len >= MIN_Q_LEN_TO_PROCESS) & (
+                    q_len <= MAX_Q_LEN_TO_PROCESS
+                )
+                valid_q_tile = (m_block * BLOCK_M < q_len) & process_q_tile
                 if valid_q_tile:
                     if is_local:
                         n_block_min = tl.maximum(
@@ -464,13 +779,14 @@ def flash_varlen_fwd_v3_tle_kernel(
                                 + kv_head * v_head_stride
                             )
 
-                        q_desc = tl.make_tensor_descriptor(
-                            base=q_base,
-                            shape=[q_len, d],
-                            strides=[q_row_stride, 1],
-                            block_shape=[BM_SPLIT, HEAD_DIM_PADDED],
-                        )
-                        if not is_paged:
+                        if USE_TMA_QO:
+                            q_desc = tl.make_tensor_descriptor(
+                                base=q_base,
+                                shape=[q_len, d],
+                                strides=[q_row_stride, 1],
+                                block_shape=[BM_SPLIT, HEAD_DIM_PADDED],
+                            )
+                        if (not is_paged) and USE_TMA_KV:
                             k_desc = tl.make_tensor_descriptor(
                                 base=k_base,
                                 shape=[k_len_cache, d],
@@ -491,13 +807,29 @@ def flash_varlen_fwd_v3_tle_kernel(
                         q1_idx = q_buf + NUM_BUFFERS_Q
 
                         tle.gpu.barrier_wait(q_empties[q0_idx], phaseIdx=q_phase_idx)
-                        tle.gpu.copy(
-                            q_desc,
-                            q_smem.slot(q0_idx),
-                            [BM_SPLIT, HEAD_DIM_PADDED],
-                            [m_block * BLOCK_M, 0],
-                            barrier=q_fulls[q0_idx],
-                        )
+                        if USE_TMA_QO:
+                            tle.gpu.copy(
+                                q_desc,
+                                q_smem.slot(q0_idx),
+                                [BM_SPLIT, HEAD_DIM_PADDED],
+                                [m_block * BLOCK_M, 0],
+                                barrier=q_fulls[q0_idx],
+                            )
+                        else:
+                            _copy_dense_tile_to_smem(
+                                q_base,
+                                q_row_stride,
+                                q_smem.slot(q0_idx),
+                                m_block * BLOCK_M,
+                                q_len,
+                                d,
+                                BM_SPLIT,
+                                HEAD_DIM_PADDED,
+                            )
+                            _fence_async_shared_cta()
+                            tle.gpu.barrier_arrive(
+                                q_fulls_manual[q0_idx], phaseIdx=q_phase_idx
+                            )
 
                         kv_buf, kv_phase_idx = _buf_phase_tle(
                             accum_cnt_kv, NUM_BUFFERS_KV
@@ -521,7 +853,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                             tle.gpu.barrier_arrive(
                                 k_fulls_manual[kv_buf], phaseIdx=kv_phase_idx
                             )
-                        else:
+                        elif USE_TMA_KV:
                             tle.gpu.copy(
                                 k_desc,
                                 k_smem.slot(kv_buf),
@@ -529,15 +861,49 @@ def flash_varlen_fwd_v3_tle_kernel(
                                 [kv_offset, 0],
                                 barrier=k_fulls[kv_buf],
                             )
+                        else:
+                            _copy_dense_tile_to_smem(
+                                k_base,
+                                k_row_stride,
+                                k_smem.slot(kv_buf),
+                                kv_offset,
+                                k_len,
+                                d,
+                                BLOCK_N,
+                                HEAD_DIM_PADDED,
+                            )
+                            _fence_async_shared_cta()
+                            tle.gpu.barrier_arrive(
+                                k_fulls_manual[kv_buf], phaseIdx=kv_phase_idx
+                            )
 
-                        tle.gpu.barrier_wait(q_empties[q1_idx], phaseIdx=q_phase_idx)
-                        tle.gpu.copy(
-                            q_desc,
-                            q_smem.slot(q1_idx),
-                            [BM_SPLIT, HEAD_DIM_PADDED],
-                            [m_block * BLOCK_M + BM_SPLIT, 0],
-                            barrier=q_fulls[q1_idx],
-                        )
+                        if NUM_MMA_GROUPS == 2:
+                            tle.gpu.barrier_wait(
+                                q_empties[q1_idx], phaseIdx=q_phase_idx
+                            )
+                            if USE_TMA_QO:
+                                tle.gpu.copy(
+                                    q_desc,
+                                    q_smem.slot(q1_idx),
+                                    [BM_SPLIT, HEAD_DIM_PADDED],
+                                    [m_block * BLOCK_M + BM_SPLIT, 0],
+                                    barrier=q_fulls[q1_idx],
+                                )
+                            else:
+                                _copy_dense_tile_to_smem(
+                                    q_base,
+                                    q_row_stride,
+                                    q_smem.slot(q1_idx),
+                                    m_block * BLOCK_M + BM_SPLIT,
+                                    q_len,
+                                    d,
+                                    BM_SPLIT,
+                                    HEAD_DIM_PADDED,
+                                )
+                                _fence_async_shared_cta()
+                                tle.gpu.barrier_arrive(
+                                    q_fulls_manual[q1_idx], phaseIdx=q_phase_idx
+                                )
 
                         tle.gpu.barrier_wait(v_empties[kv_buf], phaseIdx=kv_phase_idx)
                         if is_paged:
@@ -557,13 +923,28 @@ def flash_varlen_fwd_v3_tle_kernel(
                             tle.gpu.barrier_arrive(
                                 v_fulls_manual[kv_buf], phaseIdx=kv_phase_idx
                             )
-                        else:
+                        elif USE_TMA_KV:
                             tle.gpu.copy(
                                 v_desc,
                                 v_smem.slot(kv_buf),
                                 [BLOCK_N, HEAD_DIM_PADDED],
                                 [kv_offset, 0],
                                 barrier=v_fulls[kv_buf],
+                            )
+                        else:
+                            _copy_dense_tile_to_smem(
+                                v_base,
+                                v_row_stride,
+                                v_smem.slot(kv_buf),
+                                kv_offset,
+                                k_len,
+                                d,
+                                BLOCK_N,
+                                HEAD_DIM_PADDED,
+                            )
+                            _fence_async_shared_cta()
+                            tle.gpu.barrier_arrive(
+                                v_fulls_manual[kv_buf], phaseIdx=kv_phase_idx
                             )
                         accum_cnt_kv += 1
 
@@ -594,13 +975,28 @@ def flash_varlen_fwd_v3_tle_kernel(
                                 tle.gpu.barrier_arrive(
                                     k_fulls_manual[kv_buf], phaseIdx=kv_phase_idx
                                 )
-                            else:
+                            elif USE_TMA_KV:
                                 tle.gpu.copy(
                                     k_desc,
                                     k_smem.slot(kv_buf),
                                     [BLOCK_N, HEAD_DIM_PADDED],
                                     [kv_offset, 0],
                                     barrier=k_fulls[kv_buf],
+                                )
+                            else:
+                                _copy_dense_tile_to_smem(
+                                    k_base,
+                                    k_row_stride,
+                                    k_smem.slot(kv_buf),
+                                    kv_offset,
+                                    k_len,
+                                    d,
+                                    BLOCK_N,
+                                    HEAD_DIM_PADDED,
+                                )
+                                _fence_async_shared_cta()
+                                tle.gpu.barrier_arrive(
+                                    k_fulls_manual[kv_buf], phaseIdx=kv_phase_idx
                                 )
 
                             tle.gpu.barrier_wait(
@@ -623,13 +1019,28 @@ def flash_varlen_fwd_v3_tle_kernel(
                                 tle.gpu.barrier_arrive(
                                     v_fulls_manual[kv_buf], phaseIdx=kv_phase_idx
                                 )
-                            else:
+                            elif USE_TMA_KV:
                                 tle.gpu.copy(
                                     v_desc,
                                     v_smem.slot(kv_buf),
                                     [BLOCK_N, HEAD_DIM_PADDED],
                                     [kv_offset, 0],
                                     barrier=v_fulls[kv_buf],
+                                )
+                            else:
+                                _copy_dense_tile_to_smem(
+                                    v_base,
+                                    v_row_stride,
+                                    v_smem.slot(kv_buf),
+                                    kv_offset,
+                                    k_len,
+                                    d,
+                                    BLOCK_N,
+                                    HEAD_DIM_PADDED,
+                                )
+                                _fence_async_shared_cta()
+                                tle.gpu.barrier_arrive(
+                                    v_fulls_manual[kv_buf], phaseIdx=kv_phase_idx
                                 )
                             accum_cnt_kv += 1
                             n_block += 1
@@ -650,7 +1061,7 @@ def flash_varlen_fwd_v3_tle_kernel(
             num_pid_m = tl.cdiv(seqlen_q, BLOCK_M)
             total_tiles = num_pid_m * b * h
 
-            if cid == 1:
+            if NUM_MMA_GROUPS == 2 and cid == 1:
                 tle.gpu.barrier_arrive(ping_to_c0)
 
             tile_idx = prog_id
@@ -690,7 +1101,10 @@ def flash_varlen_fwd_v3_tle_kernel(
                 else:
                     alibi_slope = 0.0
 
-                valid_q_tile = m_block * BLOCK_M < q_len
+                process_q_tile = (q_len >= MIN_Q_LEN_TO_PROCESS) & (
+                    q_len <= MAX_Q_LEN_TO_PROCESS
+                )
+                valid_q_tile = (m_block * BLOCK_M < q_len) & process_q_tile
                 if valid_q_tile:
                     if is_local:
                         n_block_min = tl.maximum(
@@ -725,12 +1139,13 @@ def flash_varlen_fwd_v3_tle_kernel(
                         + tl.arange(0, BM_SPLIT)
                     )
                     o_base = o_ptr + o_offset + hid * o_head_stride
-                    o_desc = tl.make_tensor_descriptor(
-                        base=o_base,
-                        shape=[q_len, d],
-                        strides=[o_row_stride, 1],
-                        block_shape=[BM_SPLIT, HEAD_DIM_PADDED],
-                    )
+                    if USE_TMA_QO:
+                        o_desc = tl.make_tensor_descriptor(
+                            base=o_base,
+                            shape=[q_len, d],
+                            strides=[o_row_stride, 1],
+                            block_shape=[BM_SPLIT, HEAD_DIM_PADDED],
+                        )
 
                     if n_block_min < n_block_max:
                         rowmax = tl.full(
@@ -745,12 +1160,19 @@ def flash_varlen_fwd_v3_tle_kernel(
                             tile_count, NUM_BUFFERS_Q
                         )
                         q_idx = q_buf + cid * NUM_BUFFERS_Q
-                        tle.gpu.barrier_wait(q_fulls[q_idx], phaseIdx=q_phase_idx)
+                        if USE_TMA_QO:
+                            tle.gpu.barrier_wait(
+                                q_fulls[q_idx], phaseIdx=q_phase_idx
+                            )
+                        else:
+                            tle.gpu.barrier_wait(
+                                q_fulls_manual[q_idx], phaseIdx=q_phase_idx
+                            )
 
                         kv_buf, kv_phase_idx = _buf_phase_tle(
                             accum_cnt_kv, NUM_BUFFERS_KV
                         )
-                        if is_paged:
+                        if is_paged or (not USE_TMA_KV):
                             tle.gpu.barrier_wait(
                                 k_fulls_manual[kv_buf], phaseIdx=kv_phase_idx
                             )
@@ -759,20 +1181,22 @@ def flash_varlen_fwd_v3_tle_kernel(
                                 k_fulls[kv_buf], phaseIdx=kv_phase_idx
                             )
 
-                        if cid == 0:
-                            tle.gpu.barrier_wait(ping_to_c0)
-                        else:
-                            tle.gpu.barrier_wait(ping_to_c1)
+                        if NUM_MMA_GROUPS == 2:
+                            if cid == 0:
+                                tle.gpu.barrier_wait(ping_to_c0)
+                            else:
+                                tle.gpu.barrier_wait(ping_to_c1)
                         qk = tle.gpu.wgmma(
                             q_smem.slot(q_idx),
                             k_smem.slot(kv_buf),
                             out_dtype=tl.float32,
                             trans_b=True,
                         )
-                        if cid == 0:
-                            tle.gpu.barrier_arrive(ping_to_c1)
-                        else:
-                            tle.gpu.barrier_arrive(ping_to_c0)
+                        if NUM_MMA_GROUPS == 2:
+                            if cid == 0:
+                                tle.gpu.barrier_arrive(ping_to_c1)
+                            else:
+                                tle.gpu.barrier_arrive(ping_to_c0)
 
                         qk = tle.gpu.wgmma_wait(0, qk)
                         tle.gpu.barrier_arrive(
@@ -818,7 +1242,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                             kv_buf, kv_phase_idx = _buf_phase_tle(
                                 accum_cnt_kv, NUM_BUFFERS_KV
                             )
-                            if is_paged:
+                            if is_paged or (not USE_TMA_KV):
                                 tle.gpu.barrier_wait(
                                     k_fulls_manual[kv_buf], phaseIdx=kv_phase_idx
                                 )
@@ -827,25 +1251,27 @@ def flash_varlen_fwd_v3_tle_kernel(
                                     k_fulls[kv_buf], phaseIdx=kv_phase_idx
                                 )
 
-                            if cid == 0:
-                                tle.gpu.barrier_wait(ping_to_c0)
-                            else:
-                                tle.gpu.barrier_wait(ping_to_c1)
+                            if NUM_MMA_GROUPS == 2:
+                                if cid == 0:
+                                    tle.gpu.barrier_wait(ping_to_c0)
+                                else:
+                                    tle.gpu.barrier_wait(ping_to_c1)
                             qk = tle.gpu.wgmma(
                                 q_smem.slot(q_idx),
                                 k_smem.slot(kv_buf),
                                 out_dtype=tl.float32,
                                 trans_b=True,
                             )
-                            if cid == 0:
-                                tle.gpu.barrier_arrive(ping_to_c1)
-                            else:
-                                tle.gpu.barrier_arrive(ping_to_c0)
+                            if NUM_MMA_GROUPS == 2:
+                                if cid == 0:
+                                    tle.gpu.barrier_arrive(ping_to_c1)
+                                else:
+                                    tle.gpu.barrier_arrive(ping_to_c0)
 
                             v_buf, v_phase_idx = _buf_phase_tle(
                                 accum_cnt_kv - 1, NUM_BUFFERS_KV
                             )
-                            if is_paged:
+                            if is_paged or (not USE_TMA_KV):
                                 tle.gpu.barrier_wait(
                                     v_fulls_manual[v_buf], phaseIdx=v_phase_idx
                                 )
@@ -908,7 +1334,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                         v_buf, v_phase_idx = _buf_phase_tle(
                             accum_cnt_kv - 1, NUM_BUFFERS_KV
                         )
-                        if is_paged:
+                        if is_paged or (not USE_TMA_KV):
                             tle.gpu.barrier_wait(
                                 v_fulls_manual[v_buf], phaseIdx=v_phase_idx
                             )
@@ -941,11 +1367,27 @@ def flash_varlen_fwd_v3_tle_kernel(
                         )
                         lse = tl.full([BM_SPLIT], float("inf"), dtype=tl.float32)
 
-                    o_desc.store(
-                        [m_block * BLOCK_M + cid * BM_SPLIT, 0],
-                        acc.to(o_ptr.dtype.element_ty),
-                    )
+                    if USE_TMA_QO:
+                        o_desc.store(
+                            [m_block * BLOCK_M + cid * BM_SPLIT, 0],
+                            acc.to(o_ptr.dtype.element_ty),
+                        )
+                    else:
+                        _store_dense_tile_from_regs(
+                            o_base,
+                            o_row_stride,
+                            acc.to(o_ptr.dtype.element_ty),
+                            m_block * BLOCK_M + cid * BM_SPLIT,
+                            q_len,
+                            d,
+                            BM_SPLIT,
+                            HEAD_DIM_PADDED,
+                        )
                     lse_ptr = softmax_lse_ptr + hid * total_q + lse_offset + row_idx_q
                     tl.store(lse_ptr, lse, mask=row_idx_q < q_len)
 
                 tile_idx += num_progs
+
+
+flash_varlen_fwd_v3_tle_short_kernel = flash_varlen_fwd_v3_tle_kernel
+flash_varlen_fwd_v3_tle_splitkv_kernel = flash_varlen_fwd_v3_tle_kernel
