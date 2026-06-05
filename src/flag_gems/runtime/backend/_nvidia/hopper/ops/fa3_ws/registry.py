@@ -22,7 +22,7 @@ _VARIANTS: dict[str, WSVariant] = {
     "ws_simple_dense_decode": WSVariant(
         name="ws_simple_dense_decode",
         force_path="ws_simple",
-        kernel_module="persistent_pingpong",
+        kernel_module="fa_hopper_persistent_pingpong",
         persistent=True,
         sync_mode="pingpong",
         paged=False,
@@ -32,7 +32,7 @@ _VARIANTS: dict[str, WSVariant] = {
     "ws_simple_paged_decode": WSVariant(
         name="ws_simple_paged_decode",
         force_path="ws_simple",
-        kernel_module="persistent_pingpong",
+        kernel_module="fa_hopper_persistent_pingpong",
         persistent=True,
         sync_mode="pingpong",
         paged=True,
@@ -42,7 +42,7 @@ _VARIANTS: dict[str, WSVariant] = {
     "ws_simple_small_dense": WSVariant(
         name="ws_simple_small_dense",
         force_path="ws_simple",
-        kernel_module="persistent_pingpong",
+        kernel_module="fa_hopper_persistent_pingpong",
         persistent=True,
         sync_mode="pingpong",
         paged=False,
@@ -52,7 +52,7 @@ _VARIANTS: dict[str, WSVariant] = {
     "ws_short_dense_decode": WSVariant(
         name="ws_short_dense_decode",
         force_path="ws_short",
-        kernel_module="nonpersistent_tlx_style",
+        kernel_module="fa_hopper_nonpersistent_tlx_style",
         persistent=False,
         sync_mode="sync",
         paged=False,
@@ -62,7 +62,7 @@ _VARIANTS: dict[str, WSVariant] = {
     "ws_short_paged_decode": WSVariant(
         name="ws_short_paged_decode",
         force_path="ws_short",
-        kernel_module="nonpersistent_tlx_style",
+        kernel_module="fa_hopper_nonpersistent_tlx_style",
         persistent=False,
         sync_mode="sync",
         paged=True,
@@ -72,7 +72,7 @@ _VARIANTS: dict[str, WSVariant] = {
     "ws_short_small_dense": WSVariant(
         name="ws_short_small_dense",
         force_path="ws_short",
-        kernel_module="nonpersistent_tlx_style",
+        kernel_module="fa_hopper_nonpersistent_tlx_style",
         persistent=False,
         sync_mode="sync",
         paged=False,
@@ -82,7 +82,7 @@ _VARIANTS: dict[str, WSVariant] = {
     "ws_sync_decode": WSVariant(
         name="ws_sync_decode",
         force_path="ws_sync_decode",
-        kernel_module="nonpersistent_tlx_style",
+        kernel_module="fa_hopper_nonpersistent_tlx_style",
         persistent=False,
         sync_mode="sync",
         paged=False,
@@ -92,7 +92,7 @@ _VARIANTS: dict[str, WSVariant] = {
     "ws_sync_small": WSVariant(
         name="ws_sync_small",
         force_path="ws_sync_small",
-        kernel_module="nonpersistent_tlx_style",
+        kernel_module="fa_hopper_nonpersistent_tlx_style",
         persistent=False,
         sync_mode="sync",
         paged=False,
@@ -102,7 +102,7 @@ _VARIANTS: dict[str, WSVariant] = {
     "ws_sync_paged_decode": WSVariant(
         name="ws_sync_paged_decode",
         force_path="ws_sync_paged_decode",
-        kernel_module="nonpersistent_tlx_style",
+        kernel_module="fa_hopper_nonpersistent_tlx_style",
         persistent=False,
         sync_mode="sync",
         paged=True,
@@ -112,7 +112,7 @@ _VARIANTS: dict[str, WSVariant] = {
     "ws_pipe2_decode": WSVariant(
         name="ws_pipe2_decode",
         force_path="ws_pipe2_decode",
-        kernel_module="nonpersistent_tlx_style",
+        kernel_module="fa_hopper_nonpersistent_tlx_style",
         persistent=False,
         sync_mode="pipe2",
         paged=False,
@@ -122,7 +122,7 @@ _VARIANTS: dict[str, WSVariant] = {
     "ws_pipe2_paged_decode": WSVariant(
         name="ws_pipe2_paged_decode",
         force_path="ws_pipe2_paged_decode",
-        kernel_module="nonpersistent_tlx_style",
+        kernel_module="fa_hopper_nonpersistent_tlx_style",
         persistent=False,
         sync_mode="pipe2",
         paged=True,

@@ -1,8 +1,8 @@
-"""Experimental Hopper FA3 warp-specialized kernel suite.
+"""Hopper FA3 kernel suite.
 
-The modules in this package provide script-facing entry points for comparing
-FA3 warp-specialization variants.  They intentionally do not change the default
-``flash_attn_varlen_func`` dispatch path.
+The modules in this package provide the implementation backing the historical
+``ops.flash_kernel_v3`` import path, plus script-facing registry helpers for
+comparing warp-specialization variants.
 """
 
 from .registry import (
