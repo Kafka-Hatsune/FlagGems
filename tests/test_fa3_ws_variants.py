@@ -39,7 +39,7 @@ def _shape_for_variant(name: str) -> Shape:
             f"{name}_paged_decode",
             [(1, 128)],
             4,
-            1,
+            4,
             128,
             True,
             paged=True,

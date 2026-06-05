@@ -105,6 +105,66 @@ def _shape_key_for_variant(requested: str, spec: WSVariant) -> str | None:
     return requested
 
 
+def _shape_metadata(shape_key: str, spec: WSVariant) -> dict[str, Any]:
+    if shape_key == "decode":
+        if spec.persistent:
+            return {
+                "shape_name": "ws_persistent_dense_decode_b1_k512_d128_mha",
+                "head_dim": 128,
+                "max_seqlen_q": 1,
+                "max_seqlen_k": 512,
+            }
+        return {
+            "shape_name": "ws_dense_decode_b4_k1k_d128_gqa4",
+            "head_dim": 128,
+            "max_seqlen_q": 1,
+            "max_seqlen_k": 1024,
+        }
+    if shape_key == "paged_decode":
+        if spec.persistent:
+            return {
+                "shape_name": "ws_persistent_paged_decode_b1_k128_d128_mha",
+                "head_dim": 128,
+                "max_seqlen_q": 1,
+                "max_seqlen_k": 128,
+            }
+        return {
+            "shape_name": "ws_paged_decode_b1_k128_d128_mha",
+            "head_dim": 128,
+            "max_seqlen_q": 1,
+            "max_seqlen_k": 128,
+        }
+    if shape_key == "small":
+        return {
+            "shape_name": "ws_small_dense_mixed_d128_gqa4",
+            "head_dim": 128,
+            "max_seqlen_q": 64,
+            "max_seqlen_k": 128,
+        }
+    if shape_key == "bench_decode":
+        if spec.persistent:
+            return {
+                "shape_name": "ws_bench_persistent_decode_b8_k2k_d128_mha",
+                "head_dim": 128,
+                "max_seqlen_q": 1,
+                "max_seqlen_k": 2048,
+            }
+        return {
+            "shape_name": "ws_bench_decode_b16_k2k_d128_gqa4",
+            "head_dim": 128,
+            "max_seqlen_q": 1,
+            "max_seqlen_k": 2048,
+        }
+    if shape_key == "bench_paged_decode":
+        return {
+            "shape_name": "ws_bench_paged_decode_b8_kmix_d192_gqa4",
+            "head_dim": 192,
+            "max_seqlen_q": 1,
+            "max_seqlen_k": 1920,
+        }
+    return {}
+
+
 def _worker_env(base_env: dict[str, str], spec: WSVariant, dump_dir: Path | None) -> dict[str, str]:
     env = dict(base_env)
     env["FLAG_GEMS_FA3_TLE_FORCE_PATH"] = spec.force_path
@@ -254,6 +314,7 @@ def _run_parent(args: argparse.Namespace) -> int:
         if shape_key is None:
             rows.append({**base_row, "status": "skipped", "error": "shape incompatible with variant"})
             continue
+        base_row.update(_shape_metadata(shape_key, spec))
 
         dump_dir = None
         if args.dump_ir:
@@ -362,10 +423,10 @@ def _make_shape(shape_key: str, spec: WSVariant):
                 block_size=16,
             )
         return Shape(
-            "ws_paged_decode_b1_k128_d128_gqa4",
+            "ws_paged_decode_b1_k128_d128_mha",
             [(1, 128)],
             4,
-            1,
+            4,
             128,
             True,
             paged=True,
