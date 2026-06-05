@@ -52,14 +52,14 @@ EXPERIMENTS: dict[str, DecodeExperiment] = {
         family="seesaw",
         module="fa_hopper_decode_seesaw.py",
         paged=False,
-        description="Dense decode persistent 1P2C ping-pong WS candidate.",
+        description="Dense decode staged WS baseline for future seesaw work.",
     ),
     "decode_seesaw_paged": DecodeExperiment(
         name="decode_seesaw_paged",
         family="seesaw",
         module="fa_hopper_decode_seesaw.py",
         paged=True,
-        description="Paged decode persistent 1P2C ping-pong WS candidate.",
+        description="Paged decode staged WS baseline for future seesaw work.",
     ),
 }
 

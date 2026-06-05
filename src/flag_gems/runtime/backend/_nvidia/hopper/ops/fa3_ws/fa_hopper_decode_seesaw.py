@@ -1,10 +1,10 @@
-"""Decode-first 1P2C ping-pong WS FA3 TLE experimental entrypoint.
+"""Decode-first staged WS FA3 TLE experimental entrypoint.
 
-The first experimental seesaw candidate is wired to the existing persistent
-ping-pong 1-producer/2-consumer kernel.  It gives the decode benchmark suite a
-barriered WS candidate with producer-staged dense/paged K/V, named-barrier
-consumer alternation, and user-promised WGMMA waits, while keeping the
-production dispatcher untouched.
+This first candidate reserves the seesaw experiment slot while reusing the
+existing persistent WS kernel.  It gives the decode benchmark suite a barriered
+producer-staged dense/paged K/V candidate with user-promised WGMMA waits, while
+keeping the production dispatcher untouched.  A true KV/output-split seesaw
+kernel should live in this module once the baseline data justifies it.
 """
 
 from .fa_hopper_persistent_pingpong import (

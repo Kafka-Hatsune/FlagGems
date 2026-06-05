@@ -315,7 +315,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                                 barrier=q_fulls[q0_idx],
                             )
                         else:
-                            _copy_dense_tile_to_smem(
+                            _copy_dense_tile_to_smem_sync_safe(
                                 q_base,
                                 q_row_stride,
                                 q_smem.slot(q0_idx),
@@ -336,7 +336,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                         kv_offset = n_block_min * BLOCK_N
                         tle.gpu.barrier_wait(k_empties[kv_buf], phaseIdx=kv_phase_idx)
                         if is_paged:
-                            _copy_paged_kv_tile_to_smem(
+                            _copy_paged_kv_tile_to_smem_sync_safe(
                                 k_base,
                                 k_row_stride,
                                 page_table_ptr_b,
@@ -361,7 +361,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                                 barrier=k_fulls[kv_buf],
                             )
                         else:
-                            _copy_dense_tile_to_smem(
+                            _copy_dense_tile_to_smem_sync_safe(
                                 k_base,
                                 k_row_stride,
                                 k_smem.slot(kv_buf),
@@ -389,7 +389,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                                     barrier=q_fulls[q1_idx],
                                 )
                             else:
-                                _copy_dense_tile_to_smem(
+                                _copy_dense_tile_to_smem_sync_safe(
                                     q_base,
                                     q_row_stride,
                                     q_smem.slot(q1_idx),
@@ -406,7 +406,7 @@ def flash_varlen_fwd_v3_tle_kernel(
 
                         tle.gpu.barrier_wait(v_empties[kv_buf], phaseIdx=kv_phase_idx)
                         if is_paged:
-                            _copy_paged_kv_tile_to_smem(
+                            _copy_paged_kv_tile_to_smem_sync_safe(
                                 v_base,
                                 v_row_stride,
                                 page_table_ptr_b,
@@ -431,7 +431,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                                 barrier=v_fulls[kv_buf],
                             )
                         else:
-                            _copy_dense_tile_to_smem(
+                            _copy_dense_tile_to_smem_sync_safe(
                                 v_base,
                                 v_row_stride,
                                 v_smem.slot(kv_buf),
@@ -458,7 +458,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                                 k_empties[kv_buf], phaseIdx=kv_phase_idx
                             )
                             if is_paged:
-                                _copy_paged_kv_tile_to_smem(
+                                _copy_paged_kv_tile_to_smem_sync_safe(
                                     k_base,
                                     k_row_stride,
                                     page_table_ptr_b,
@@ -483,7 +483,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                                     barrier=k_fulls[kv_buf],
                                 )
                             else:
-                                _copy_dense_tile_to_smem(
+                                _copy_dense_tile_to_smem_sync_safe(
                                     k_base,
                                     k_row_stride,
                                     k_smem.slot(kv_buf),
@@ -502,7 +502,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                                 v_empties[kv_buf], phaseIdx=kv_phase_idx
                             )
                             if is_paged:
-                                _copy_paged_kv_tile_to_smem(
+                                _copy_paged_kv_tile_to_smem_sync_safe(
                                     v_base,
                                     v_row_stride,
                                     page_table_ptr_b,
@@ -527,7 +527,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                                     barrier=v_fulls[kv_buf],
                                 )
                             else:
-                                _copy_dense_tile_to_smem(
+                                _copy_dense_tile_to_smem_sync_safe(
                                     v_base,
                                     v_row_stride,
                                     v_smem.slot(kv_buf),
