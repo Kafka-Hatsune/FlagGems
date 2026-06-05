@@ -289,7 +289,7 @@ def flash_varlen_fwd_v3_tle_ws_short_kernel(
 
                         tle.gpu.barrier_wait(k_empty[kv_buf], phaseIdx=kv_phase_idx)
                         if is_paged:
-                            _copy_paged_kv_tile_to_smem_sync_safe(
+                            _copy_paged_kv_tile_to_smem(
                                 k_base,
                                 k_row_stride,
                                 page_table_ptr_b,
@@ -318,7 +318,7 @@ def flash_varlen_fwd_v3_tle_ws_short_kernel(
 
                         tle.gpu.barrier_wait(v_empty[kv_buf], phaseIdx=kv_phase_idx)
                         if is_paged:
-                            _copy_paged_kv_tile_to_smem_sync_safe(
+                            _copy_paged_kv_tile_to_smem(
                                 v_base,
                                 v_row_stride,
                                 page_table_ptr_b,
