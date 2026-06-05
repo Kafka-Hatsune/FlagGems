@@ -17,7 +17,7 @@ import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -37,6 +37,30 @@ SHAPE_CHOICES = (
     "paged_decode",
     "bench_decode",
     "bench_paged_decode",
+    "long_decode",
+    "long_paged_decode",
+    "long_decode_b1_k512_d128",
+    "long_decode_b4_k2k_d192",
+    "long_decode_b16_k4k_d128",
+    "long_decode_b64_k8k_d256",
+    "long_paged_decode_b1_k512_d128",
+    "long_paged_decode_b4_k2k_d192",
+    "long_paged_decode_b16_k4k_d128",
+    "long_paged_decode_b64_k8k_d256",
+)
+
+LONG_DENSE_SHAPES = (
+    "long_decode_b1_k512_d128",
+    "long_decode_b4_k2k_d192",
+    "long_decode_b16_k4k_d128",
+    "long_decode_b64_k8k_d256",
+)
+
+LONG_PAGED_SHAPES = (
+    "long_paged_decode_b1_k512_d128",
+    "long_paged_decode_b4_k2k_d192",
+    "long_paged_decode_b16_k4k_d128",
+    "long_paged_decode_b64_k8k_d256",
 )
 
 
@@ -86,6 +110,8 @@ class LaunchContext:
     o_batch_stride: int
     scale_softmax: float
     scale_softmax_log2: float
+    extra: dict[str, Any] = field(default_factory=dict)
+    combine_bench: Callable[[], Any] | None = None
 
 
 def _parse_args() -> argparse.Namespace:
@@ -113,14 +139,22 @@ def _round_multiple(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
 
 
-def _shape_key_for_variant(requested: str, exp) -> str | None:
+def _shape_keys_for_variant(requested: str, exp) -> tuple[str, ...]:
     if requested == "smoke":
-        return "paged_decode" if exp.paged else "dense_decode"
+        return ("paged_decode" if exp.paged else "dense_decode",)
     if requested in ("paged_decode", "bench_paged_decode"):
-        return requested if exp.paged else None
+        return (requested,) if exp.paged else ()
     if requested in ("dense_decode", "bench_decode"):
-        return requested if not exp.paged else None
-    return None
+        return (requested,) if not exp.paged else ()
+    if requested == "long_decode":
+        return () if exp.paged else LONG_DENSE_SHAPES
+    if requested == "long_paged_decode":
+        return LONG_PAGED_SHAPES if exp.paged else ()
+    if requested in LONG_DENSE_SHAPES:
+        return (requested,) if not exp.paged else ()
+    if requested in LONG_PAGED_SHAPES:
+        return (requested,) if exp.paged else ()
+    return ()
 
 
 def _worker_env(base_env: dict[str, str], exp, dump_dir: Path | None) -> dict[str, str]:
@@ -178,8 +212,8 @@ def _run_parent(args: argparse.Namespace) -> int:
     rows: list[dict[str, Any]] = []
     for name in REGISTRY.resolve_experiment_names(args.variant):
         exp = REGISTRY.get_experiment(name)
-        shape_key = _shape_key_for_variant(args.shape, exp)
-        if shape_key is None:
+        shape_keys = _shape_keys_for_variant(args.shape, exp)
+        if not shape_keys:
             rows.append(
                 {
                     "variant": exp.name,
@@ -193,58 +227,59 @@ def _run_parent(args: argparse.Namespace) -> int:
             )
             continue
 
-        dump_dir = None
-        if args.dump_ir:
-            dump_dir = Path(args.dump_ir) / exp.name / shape_key
-            dump_dir.mkdir(parents=True, exist_ok=True)
+        for shape_key in shape_keys:
+            dump_dir = None
+            if args.dump_ir:
+                dump_dir = Path(args.dump_ir) / exp.name / shape_key
+                dump_dir.mkdir(parents=True, exist_ok=True)
 
-        start = time.time()
-        try:
-            completed = subprocess.run(
-                _worker_command(args, exp, shape_key),
-                cwd=REPO_ROOT,
-                env=_worker_env(os.environ, exp, dump_dir),
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=args.timeout_sec,
-                check=False,
-            )
-            elapsed = time.time() - start
-            row = _parse_worker_result(completed.stdout)
-            if row is None:
+            start = time.time()
+            try:
+                completed = subprocess.run(
+                    _worker_command(args, exp, shape_key),
+                    cwd=REPO_ROOT,
+                    env=_worker_env(os.environ, exp, dump_dir),
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=args.timeout_sec,
+                    check=False,
+                )
+                elapsed = time.time() - start
+                row = _parse_worker_result(completed.stdout)
+                if row is None:
+                    row = {
+                        "variant": exp.name,
+                        "shape": shape_key,
+                        "status": "error",
+                        "error_type": "MissingResult",
+                        "error": "worker did not emit result JSON",
+                    }
+                if completed.returncode != 0 and row.get("status") == "ok":
+                    row["status"] = "error"
+                    row["error_type"] = "SubprocessReturnCode"
+                    row["error"] = str(completed.returncode)
+                if completed.stderr and args.verbose:
+                    row["stderr_tail"] = completed.stderr[-4000:]
+                row["elapsed_sec"] = f"{elapsed:.3f}"
+            except subprocess.TimeoutExpired as exc:
                 row = {
                     "variant": exp.name,
                     "shape": shape_key,
-                    "status": "error",
-                    "error_type": "MissingResult",
-                    "error": "worker did not emit result JSON",
+                    "status": "timeout",
+                    "error_type": "TimeoutExpired",
+                    "error": str(exc),
+                    "elapsed_sec": f"{args.timeout_sec:.3f}",
                 }
-            if completed.returncode != 0 and row.get("status") == "ok":
-                row["status"] = "error"
-                row["error_type"] = "SubprocessReturnCode"
-                row["error"] = str(completed.returncode)
-            if completed.stderr and args.verbose:
-                row["stderr_tail"] = completed.stderr[-4000:]
-            row["elapsed_sec"] = f"{elapsed:.3f}"
-        except subprocess.TimeoutExpired as exc:
-            row = {
-                "variant": exp.name,
-                "shape": shape_key,
-                "status": "timeout",
-                "error_type": "TimeoutExpired",
-                "error": str(exc),
-                "elapsed_sec": f"{args.timeout_sec:.3f}",
-            }
 
-        row.setdefault("family", exp.family)
-        row.setdefault("module", exp.module)
-        row.setdefault("paged", exp.paged)
-        ttgir, ptx = _find_first_ir_files(dump_dir)
-        row["ttgir_path"] = ttgir
-        row["ptx_path"] = ptx
-        rows.append(row)
-        print(row)
+            row.setdefault("family", exp.family)
+            row.setdefault("module", exp.module)
+            row.setdefault("paged", exp.paged)
+            ttgir, ptx = _find_first_ir_files(dump_dir)
+            row["ttgir_path"] = ttgir
+            row["ptx_path"] = ptx
+            rows.append(row)
+            print(row)
 
     _write_rows(rows, args.csv)
     return 0
@@ -293,6 +328,58 @@ def _make_shape(shape_key: str):
             32,
             8,
             192,
+            True,
+            paged=True,
+            block_size=16,
+        )
+    if shape_key == "long_decode_b1_k512_d128":
+        return Shape("fa3_exp_long_decode_b1_k512_d128_gqa4", [(1, 512)], 32, 8, 128, True)
+    if shape_key == "long_decode_b4_k2k_d192":
+        return Shape("fa3_exp_long_decode_b4_k2k_d192_gqa4", [(1, 2048)] * 4, 32, 8, 192, True)
+    if shape_key == "long_decode_b16_k4k_d128":
+        return Shape("fa3_exp_long_decode_b16_k4k_d128_gqa4", [(1, 4096)] * 16, 32, 8, 128, True)
+    if shape_key == "long_decode_b64_k8k_d256":
+        return Shape("fa3_exp_long_decode_b64_k8k_d256_gqa4", [(1, 8192)] * 64, 32, 8, 256, True)
+    if shape_key == "long_paged_decode_b1_k512_d128":
+        return Shape(
+            "fa3_exp_long_paged_decode_b1_k512_d128_gqa4",
+            [(1, 512)],
+            32,
+            8,
+            128,
+            True,
+            paged=True,
+            block_size=16,
+        )
+    if shape_key == "long_paged_decode_b4_k2k_d192":
+        return Shape(
+            "fa3_exp_long_paged_decode_b4_k2k_d192_gqa4",
+            [(1, 2048)] * 4,
+            32,
+            8,
+            192,
+            True,
+            paged=True,
+            block_size=16,
+        )
+    if shape_key == "long_paged_decode_b16_k4k_d128":
+        return Shape(
+            "fa3_exp_long_paged_decode_b16_k4k_d128_gqa4",
+            [(1, 4096)] * 16,
+            32,
+            8,
+            128,
+            True,
+            paged=True,
+            block_size=16,
+        )
+    if shape_key == "long_paged_decode_b64_k8k_d256":
+        return Shape(
+            "fa3_exp_long_paged_decode_b64_k8k_d256_gqa4",
+            [(1, 8192)] * 64,
+            32,
+            8,
+            256,
             True,
             paged=True,
             block_size=16,
@@ -481,6 +568,115 @@ def _decode_splits(max_seqlen_k: int, head_dim: int) -> int:
     return 2
 
 
+def _decode_experimental_splits(ctx: LaunchContext, *, split_policy: int) -> int:
+    num_sms = 0
+    try:
+        import torch
+
+        num_sms = torch.cuda.get_device_properties(ctx.out.device).multi_processor_count
+    except Exception:
+        num_sms = 0
+
+    if ctx.max_seqlen_k >= 8192:
+        by_k = 16
+    elif ctx.max_seqlen_k >= 4096:
+        by_k = 8
+    elif ctx.max_seqlen_k >= 2048:
+        by_k = 4
+    else:
+        by_k = 2
+
+    active_qh = max(1, ctx.batch_size * ctx.num_heads * ctx.max_seqlen_q)
+    by_occupancy = 1
+    if num_sms > 0:
+        by_occupancy = max(1, math.ceil(num_sms / active_qh))
+
+    splits = max(by_k, by_occupancy)
+    if split_policy == 1:
+        splits = max(splits, 4 if ctx.max_seqlen_k >= 2048 else 2)
+    if active_qh >= max(1, num_sms):
+        splits = min(splits, 2 if ctx.max_seqlen_k < 4096 else 4)
+    return max(2, min(16, splits))
+
+
+def _partial_bytes(ctx: LaunchContext, num_splits: int) -> int:
+    elems = num_splits * ctx.num_heads * ctx.total_q
+    return elems * ctx.head_dim * 4 + elems * 2 * 4
+
+
+def _run_experimental_split_decode(
+    torch,
+    triton,
+    ctx: LaunchContext,
+    split_kernel,
+    combine_kernel,
+    *,
+    split_policy: int,
+    split_policy_name: str,
+):
+    num_splits = _decode_experimental_splits(ctx, split_policy=split_policy)
+    partial_out = torch.empty(
+        (num_splits, ctx.num_heads, ctx.total_q, ctx.head_dim),
+        dtype=torch.float32,
+        device=ctx.out.device,
+    )
+    partial_m = torch.empty(
+        (num_splits, ctx.num_heads, ctx.total_q),
+        dtype=torch.float32,
+        device=ctx.out.device,
+    )
+    partial_l = torch.empty_like(partial_m)
+    split_grid = (ctx.max_seqlen_q, ctx.batch_size, ctx.num_heads * num_splits)
+    split_kernel[split_grid](
+        *ctx.args,
+        partial_out,
+        partial_m,
+        partial_l,
+        NUM_SPLITS=num_splits,
+        SPLIT_POLICY=split_policy,
+    )
+    combine_block_m = 8
+    combine_grid = (
+        triton.cdiv(ctx.max_seqlen_q, combine_block_m),
+        ctx.batch_size,
+        ctx.num_heads,
+    )
+    def _combine_once():
+        combine_kernel[combine_grid](
+            ctx.out,
+            ctx.lse,
+            partial_out,
+            partial_m,
+            partial_l,
+            ctx.o_row_stride,
+            ctx.o_head_stride,
+            ctx.o_batch_stride,
+            ctx.is_cu_seqlens_q,
+            ctx.cu_seqlens_q,
+            ctx.batch_size,
+            ctx.num_heads,
+            ctx.max_seqlen_q,
+            ctx.head_dim,
+            ctx.total_q,
+            ctx.scale_softmax,
+            ctx.scale_softmax_log2,
+            BLOCK_M=combine_block_m,
+            BLOCK_K=1 << (ctx.head_dim - 1).bit_length(),
+            NUM_SPLITS=num_splits,
+        )
+
+    _combine_once()
+    ctx.combine_bench = _combine_once
+    ctx.extra.update(
+        {
+            "num_splits": num_splits,
+            "split_policy": split_policy_name,
+            "partial_bytes": _partial_bytes(ctx, num_splits),
+        }
+    )
+    return ctx.finalize(ctx.out)
+
+
 def _run_experiment(torch, triton, exp, ctx: LaunchContext):
     if exp.family == "onepass":
         from flag_gems.runtime.backend._nvidia.hopper.ops.fa3_ws.fa_hopper_decode_onepass import (
@@ -507,6 +703,13 @@ def _run_experiment(torch, triton, exp, ctx: LaunchContext):
         )
 
         num_splits = _decode_splits(ctx.max_seqlen_k, ctx.head_dim)
+        ctx.extra.update(
+            {
+                "num_splits": num_splits,
+                "split_policy": "legacy_contiguous",
+                "partial_bytes": _partial_bytes(ctx, num_splits),
+            }
+        )
         partial_out = torch.empty(
             (num_splits, ctx.num_heads, ctx.total_q, ctx.head_dim),
             dtype=torch.float32,
@@ -532,55 +735,85 @@ def _run_experiment(torch, triton, exp, ctx: LaunchContext):
             ctx.batch_size,
             ctx.num_heads,
         )
-        flash_varlen_fwd_v3_tle_decode_splitkv_combine_kernel[combine_grid](
-            ctx.out,
-            ctx.lse,
-            partial_out,
-            partial_m,
-            partial_l,
-            ctx.o_row_stride,
-            ctx.o_head_stride,
-            ctx.o_batch_stride,
-            ctx.is_cu_seqlens_q,
-            ctx.cu_seqlens_q,
-            ctx.batch_size,
-            ctx.num_heads,
-            ctx.max_seqlen_q,
-            ctx.head_dim,
-            ctx.total_q,
-            ctx.scale_softmax,
-            ctx.scale_softmax_log2,
-            BLOCK_M=combine_block_m,
-            BLOCK_K=1 << (ctx.head_dim - 1).bit_length(),
-            NUM_SPLITS=num_splits,
-        )
+        def _combine_once():
+            flash_varlen_fwd_v3_tle_decode_splitkv_combine_kernel[combine_grid](
+                ctx.out,
+                ctx.lse,
+                partial_out,
+                partial_m,
+                partial_l,
+                ctx.o_row_stride,
+                ctx.o_head_stride,
+                ctx.o_batch_stride,
+                ctx.is_cu_seqlens_q,
+                ctx.cu_seqlens_q,
+                ctx.batch_size,
+                ctx.num_heads,
+                ctx.max_seqlen_q,
+                ctx.head_dim,
+                ctx.total_q,
+                ctx.scale_softmax,
+                ctx.scale_softmax_log2,
+                BLOCK_M=combine_block_m,
+                BLOCK_K=1 << (ctx.head_dim - 1).bit_length(),
+                NUM_SPLITS=num_splits,
+            )
+
+        _combine_once()
+        ctx.combine_bench = _combine_once
         return ctx.finalize(ctx.out)
+
+    if exp.family == "flashdecoding":
+        from flag_gems.runtime.backend._nvidia.hopper.ops.fa3_ws.fa_hopper_decode_flashdecoding import (
+            flash_varlen_fwd_v3_tle_decode_flashdecoding_combine_kernel,
+            flash_varlen_fwd_v3_tle_decode_flashdecoding_kernel,
+        )
+
+        return _run_experimental_split_decode(
+            torch,
+            triton,
+            ctx,
+            flash_varlen_fwd_v3_tle_decode_flashdecoding_kernel,
+            flash_varlen_fwd_v3_tle_decode_flashdecoding_combine_kernel,
+            split_policy=0,
+            split_policy_name="contiguous",
+        )
+
+    if exp.family == "paged_lb":
+        from flag_gems.runtime.backend._nvidia.hopper.ops.fa3_ws.fa_hopper_decode_paged_lb import (
+            flash_varlen_fwd_v3_tle_decode_paged_lb_combine_kernel,
+            flash_varlen_fwd_v3_tle_decode_paged_lb_kernel,
+        )
+
+        return _run_experimental_split_decode(
+            torch,
+            triton,
+            ctx,
+            flash_varlen_fwd_v3_tle_decode_paged_lb_kernel,
+            flash_varlen_fwd_v3_tle_decode_paged_lb_combine_kernel,
+            split_policy=1,
+            split_policy_name="round_robin_blocks",
+        )
 
     if exp.family == "seesaw":
         from flag_gems.runtime.backend._nvidia.hopper.ops.fa3_ws.fa_hopper_decode_seesaw import (
             flash_varlen_fwd_v3_tle_decode_seesaw_kernel,
         )
         from flag_gems.runtime.backend._nvidia.hopper.ops.fa3_ws.utils import (
-            _FA3_TLE_BUCKET_WS_DECODE,
-            _FA3_TLE_BUCKET_WS_PAGED_DECODE,
-            _FA3_TLE_FAMILY_WS_SIMPLE,
+            _FA3_TLE_BUCKET_WS_SHORT_DECODE,
+            _FA3_TLE_BUCKET_WS_SHORT_PAGED_DECODE,
         )
 
-        num_sms = torch.cuda.get_device_properties(ctx.out.device).multi_processor_count
         grid = lambda meta: (
-            min(
-                num_sms,
-                triton.cdiv(ctx.max_seqlen_q, meta["BLOCK_M"])
-                * ctx.batch_size
-                * ctx.num_heads,
-            ),
+            triton.cdiv(ctx.max_seqlen_q, meta["BLOCK_M"]),
+            ctx.batch_size,
+            ctx.num_heads,
         )
         flash_varlen_fwd_v3_tle_decode_seesaw_kernel[grid](
             *ctx.args,
-            SHAPE_BUCKET=_FA3_TLE_BUCKET_WS_PAGED_DECODE
+            WS_SHORT_SHAPE_BUCKET=_FA3_TLE_BUCKET_WS_SHORT_PAGED_DECODE
             if exp.paged
-            else _FA3_TLE_BUCKET_WS_DECODE,
-            FORCE_FAMILY_ID=_FA3_TLE_FAMILY_WS_SIMPLE,
+            else _FA3_TLE_BUCKET_WS_SHORT_DECODE,
             MIN_Q_LEN_TO_PROCESS=0,
             MAX_Q_LEN_TO_PROCESS=2**31 - 1,
             tle_wgmma_pipeline_mode="user_promise",
@@ -625,6 +858,11 @@ def _run_worker(args: argparse.Namespace) -> int:
             "ms": "",
             "p20_ms": "",
             "p80_ms": "",
+            "num_splits": "",
+            "split_policy": "",
+            "partial_bytes": "",
+            "combine_ms": "",
+            "total_ms": "",
         }
 
         if not is_fa3_supported():
@@ -640,12 +878,20 @@ def _run_worker(args: argparse.Namespace) -> int:
         _ensure_tma_allocator(torch, triton)
         tensors = make_varlen(shape, torch.float16, flag_gems.device, seed=args.seed)
 
+        last_extra: dict[str, Any] = {}
+        last_combine_bench: list[Callable[[], Any] | None] = [None]
+
         def _run_once():
             ctx = _prepare_launch(torch, tensors, shape)
-            return _run_experiment(torch, triton, exp, ctx)
+            result = _run_experiment(torch, triton, exp, ctx)
+            last_extra.clear()
+            last_extra.update(ctx.extra)
+            last_combine_bench[0] = ctx.combine_bench
+            return result
 
         out = _run_once()
         torch.cuda.synchronize()
+        row.update(last_extra)
 
         if args.check:
             ref, ref_kind = build_reference(tensors, shape, fa_version=3)
@@ -687,9 +933,22 @@ def _run_worker(args: argparse.Namespace) -> int:
                     "ms": f"{ms:.6f}",
                     "p20_ms": f"{p20:.6f}",
                     "p80_ms": f"{p80:.6f}",
+                    "total_ms": f"{ms:.6f}",
                     "tflops_approx": f"{flops / (ms * 1e-3) / 1e12:.3f}",
                 }
             )
+            if last_combine_bench[0] is not None:
+                combine_bench = triton.testing.do_bench(
+                    last_combine_bench[0],
+                    warmup=args.warmup,
+                    rep=args.rep,
+                    quantiles=(0.5, 0.2, 0.8),
+                )
+                if isinstance(combine_bench, (tuple, list)):
+                    combine_ms = float(combine_bench[0])
+                else:
+                    combine_ms = float(combine_bench)
+                row["combine_ms"] = f"{combine_ms:.6f}"
 
         row["status"] = "ok"
     except ModuleNotFoundError as exc:

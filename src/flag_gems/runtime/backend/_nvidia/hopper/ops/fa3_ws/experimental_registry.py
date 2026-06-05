@@ -47,19 +47,47 @@ EXPERIMENTS: dict[str, DecodeExperiment] = {
         paged=True,
         description="Paged decode split over KV blocks with combine.",
     ),
+    "decode_flashdecoding_dense": DecodeExperiment(
+        name="decode_flashdecoding_dense",
+        family="flashdecoding",
+        module="fa_hopper_decode_flashdecoding.py",
+        paged=False,
+        description="Dense Flash-Decoding-style contiguous split-KV decode.",
+    ),
+    "decode_flashdecoding_paged": DecodeExperiment(
+        name="decode_flashdecoding_paged",
+        family="flashdecoding",
+        module="fa_hopper_decode_flashdecoding.py",
+        paged=True,
+        description="Paged Flash-Decoding-style contiguous split-KV decode.",
+    ),
+    "decode_paged_lb_dense": DecodeExperiment(
+        name="decode_paged_lb_dense",
+        family="paged_lb",
+        module="fa_hopper_decode_paged_lb.py",
+        paged=False,
+        description="Dense load-balanced round-robin KV-block decode.",
+    ),
+    "decode_paged_lb_paged": DecodeExperiment(
+        name="decode_paged_lb_paged",
+        family="paged_lb",
+        module="fa_hopper_decode_paged_lb.py",
+        paged=True,
+        description="Paged load-balanced round-robin KV-block decode.",
+    ),
     "decode_seesaw_dense": DecodeExperiment(
         name="decode_seesaw_dense",
         family="seesaw",
         module="fa_hopper_decode_seesaw.py",
         paged=False,
-        description="Dense decode staged WS baseline for future seesaw work.",
+        description="Dense decode nonpersistent staged WS baseline for future seesaw work.",
     ),
     "decode_seesaw_paged": DecodeExperiment(
         name="decode_seesaw_paged",
         family="seesaw",
         module="fa_hopper_decode_seesaw.py",
         paged=True,
-        description="Paged decode staged WS baseline for future seesaw work.",
+        description="Paged decode nonpersistent staged WS baseline for future seesaw work.",
     ),
 }
 
@@ -69,6 +97,8 @@ ALIASES: dict[str, tuple[str, ...]] = {
     "paged": tuple(name for name, exp in EXPERIMENTS.items() if exp.paged),
     "onepass": ("decode_onepass_dense", "decode_onepass_paged"),
     "splitkv": ("decode_splitkv_dense", "decode_splitkv_paged"),
+    "flashdecoding": ("decode_flashdecoding_dense", "decode_flashdecoding_paged"),
+    "paged_lb": ("decode_paged_lb_dense", "decode_paged_lb_paged"),
     "seesaw": ("decode_seesaw_dense", "decode_seesaw_paged"),
 }
 

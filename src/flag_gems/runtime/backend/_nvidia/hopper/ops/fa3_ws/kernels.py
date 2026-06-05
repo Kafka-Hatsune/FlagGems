@@ -26,6 +26,14 @@ from .fa_hopper_decode_splitkv import (
     flash_varlen_fwd_v3_tle_decode_splitkv_combine_kernel,
     flash_varlen_fwd_v3_tle_decode_splitkv_kernel,
 )
+from .fa_hopper_decode_flashdecoding import (
+    flash_varlen_fwd_v3_tle_decode_flashdecoding_combine_kernel,
+    flash_varlen_fwd_v3_tle_decode_flashdecoding_kernel,
+)
+from .fa_hopper_decode_paged_lb import (
+    flash_varlen_fwd_v3_tle_decode_paged_lb_combine_kernel,
+    flash_varlen_fwd_v3_tle_decode_paged_lb_kernel,
+)
 from .fa_hopper_decode_seesaw import flash_varlen_fwd_v3_tle_decode_seesaw_kernel
 from .fa_hopper_splitkv import (
     flash_varlen_fwd_v3_tle_splitkv_combine_kernel,
@@ -49,6 +57,10 @@ __all__ = [
     "flash_varlen_fwd_v3_tle_decode_onepass_kernel",
     "flash_varlen_fwd_v3_tle_decode_splitkv_kernel",
     "flash_varlen_fwd_v3_tle_decode_splitkv_combine_kernel",
+    "flash_varlen_fwd_v3_tle_decode_flashdecoding_kernel",
+    "flash_varlen_fwd_v3_tle_decode_flashdecoding_combine_kernel",
+    "flash_varlen_fwd_v3_tle_decode_paged_lb_kernel",
+    "flash_varlen_fwd_v3_tle_decode_paged_lb_combine_kernel",
     "flash_varlen_fwd_v3_tle_decode_seesaw_kernel",
     "flash_varlen_fwd_v3_tle_splitkv_kernel",
     "flash_varlen_fwd_v3_tle_splitkv_combine_kernel",

@@ -62,25 +62,25 @@ def _shape_for_variant(name: str) -> Shape:
 def _install_variant_kernel(spec) -> None:
     from flag_gems.runtime.backend._nvidia.hopper.ops import flash_api_v3
 
-    if spec.kernel_module == "persistent_pingpong":
+    if spec.kernel_module == "fa_hopper_persistent_pingpong":
         from flag_gems.runtime.backend._nvidia.hopper.ops.fa3_ws import (
-            persistent_pingpong,
+            fa_hopper_persistent_pingpong,
         )
 
         flash_api_v3.flash_varlen_fwd_v3_tle_kernel = (
-            persistent_pingpong.flash_varlen_fwd_v3_tle_kernel
+            fa_hopper_persistent_pingpong.flash_varlen_fwd_v3_tle_kernel
         )
         flash_api_v3.flash_varlen_fwd_v3_tle_ws_simple_kernel = (
-            persistent_pingpong.flash_varlen_fwd_v3_tle_ws_simple_kernel
+            fa_hopper_persistent_pingpong.flash_varlen_fwd_v3_tle_ws_simple_kernel
         )
         return
-    if spec.kernel_module == "nonpersistent_tlx_style":
+    if spec.kernel_module == "fa_hopper_nonpersistent_tlx_style":
         from flag_gems.runtime.backend._nvidia.hopper.ops.fa3_ws import (
-            nonpersistent_tlx_style,
+            fa_hopper_nonpersistent_tlx_style,
         )
 
         flash_api_v3.flash_varlen_fwd_v3_tle_ws_short_kernel = (
-            nonpersistent_tlx_style.flash_varlen_fwd_v3_tle_ws_short_kernel
+            fa_hopper_nonpersistent_tlx_style.flash_varlen_fwd_v3_tle_ws_short_kernel
         )
         return
     raise AssertionError(f"unknown kernel module {spec.kernel_module}")
