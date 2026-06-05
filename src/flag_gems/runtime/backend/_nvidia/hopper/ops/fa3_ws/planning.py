@@ -22,6 +22,7 @@ class FA3TlePlan:
     direct_kind: str = ""
     pack_gqa: bool = False
     effective_batch_heads: int = 0
+    split_policy: int = 0
 
 
 def fa3_tle_force_family_id() -> int:
@@ -36,7 +37,7 @@ def fa3_tle_force_family_id() -> int:
 
 def fa3_tle_decode_strategy() -> str:
     value = os.getenv("FLAG_GEMS_FA3_TLE_DECODE_STRATEGY", "auto").strip().lower()
-    allowed = ("auto", "onepass", "splitkv", "short")
+    allowed = ("auto", "onepass", "splitkv", "flashdecoding", "short")
     if value not in allowed:
         raise RuntimeError(
             "invalid FLAG_GEMS_FA3_TLE_DECODE_STRATEGY="
@@ -159,6 +160,7 @@ def fa3_tle_select_plan(
     head_dim: int,
     is_paged: bool,
     force_family_id: int,
+    num_heads: int = 1,
     decode_strategy: str = "auto",
     small_strategy: str = "auto",
     ws_strategy: str = "auto",
@@ -262,12 +264,15 @@ def fa3_tle_select_plan(
             direct_kind="decode",
         )
     if force_family_id == _FA3_TLE_FAMILY_PAGED_DECODE:
-        return FA3TlePlan(
-            "direct",
-            _FA3_TLE_BUCKET_DIRECT_PAGED_DECODE,
-            force_family_id,
-            decode_strategy="onepass",
-            direct_kind="paged_decode",
+        return _fa3_tle_flashdecoding_plan(
+            force_family_id=force_family_id,
+            batch_size=batch_size,
+            num_heads=num_heads,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            head_dim=head_dim,
+            is_paged=True,
+            num_sms=num_sms,
         )
     if force_family_id == _FA3_TLE_FAMILY_SERVE:
         return FA3TlePlan(
@@ -308,6 +313,17 @@ def fa3_tle_select_plan(
                 force_family_id,
                 decode_strategy="short",
             )
+        if decode_strategy == "flashdecoding" and is_paged:
+            return _fa3_tle_flashdecoding_plan(
+                force_family_id=force_family_id,
+                batch_size=batch_size,
+                num_heads=num_heads,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                head_dim=head_dim,
+                is_paged=is_paged,
+                num_sms=num_sms,
+            )
         should_split = False
         if decode_strategy == "splitkv":
             should_split = max_seqlen_k >= 1024
@@ -320,6 +336,18 @@ def fa3_tle_select_plan(
                 force_family_id,
                 num_splits=_fa3_tle_decode_splits(max_seqlen_k, head_dim),
                 decode_strategy="splitkv",
+                pack_gqa=max_seqlen_q > 1,
+                effective_batch_heads=batch_size * max_seqlen_q,
+            )
+        if decode_strategy == "onepass":
+            return FA3TlePlan(
+                "direct",
+                _FA3_TLE_BUCKET_DIRECT_PAGED_DECODE
+                if is_paged
+                else _FA3_TLE_BUCKET_DIRECT_DECODE,
+                force_family_id,
+                decode_strategy="onepass",
+                direct_kind="paged_decode" if is_paged else "decode",
                 pack_gqa=max_seqlen_q > 1,
                 effective_batch_heads=batch_size * max_seqlen_q,
             )
@@ -354,14 +382,15 @@ def fa3_tle_select_plan(
                     effective_batch_heads=batch_size * max_seqlen_q,
                 )
         if is_paged:
-            return FA3TlePlan(
-                "direct",
-                _FA3_TLE_BUCKET_DIRECT_PAGED_DECODE,
-                force_family_id,
-                decode_strategy="onepass",
-                direct_kind="paged_decode",
-                pack_gqa=max_seqlen_q > 1,
-                effective_batch_heads=batch_size * max_seqlen_q,
+            return _fa3_tle_flashdecoding_plan(
+                force_family_id=force_family_id,
+                batch_size=batch_size,
+                num_heads=num_heads,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                head_dim=head_dim,
+                is_paged=is_paged,
+                num_sms=num_sms,
             )
         return FA3TlePlan(
             "direct",
@@ -437,6 +466,65 @@ def _fa3_tle_decode_splits(max_seqlen_k: int, head_dim: int) -> int:
     if max_seqlen_k >= 1024:
         return 2
     return 2
+
+
+def _fa3_tle_flashdecoding_splits(
+    *,
+    batch_size: int,
+    num_heads: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    num_sms: int,
+) -> int:
+    if max_seqlen_k >= 8192:
+        by_k = 16
+    elif max_seqlen_k >= 4096:
+        by_k = 8
+    elif max_seqlen_k >= 2048:
+        by_k = 4
+    else:
+        by_k = 2
+
+    active_qh = max(1, batch_size * max(num_heads, 1) * max(max_seqlen_q, 1))
+    by_occupancy = 1
+    if num_sms > 0:
+        by_occupancy = max(1, (num_sms + active_qh - 1) // active_qh)
+
+    splits = max(by_k, by_occupancy)
+    if active_qh >= max(1, num_sms):
+        splits = min(splits, 2 if max_seqlen_k < 4096 else 4)
+    return max(2, min(16, splits))
+
+
+def _fa3_tle_flashdecoding_plan(
+    *,
+    force_family_id: int,
+    batch_size: int,
+    num_heads: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    head_dim: int,
+    is_paged: bool,
+    num_sms: int,
+) -> FA3TlePlan:
+    del head_dim
+    return FA3TlePlan(
+        "flashdecoding",
+        _FA3_TLE_BUCKET_SPLITKV,
+        force_family_id,
+        num_splits=_fa3_tle_flashdecoding_splits(
+            batch_size=batch_size,
+            num_heads=num_heads,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            num_sms=num_sms,
+        ),
+        decode_strategy="flashdecoding",
+        direct_kind="paged_decode" if is_paged else "decode",
+        pack_gqa=max_seqlen_q > 1,
+        effective_batch_heads=batch_size * max_seqlen_q,
+        split_policy=0,
+    )
 
 
 def _fa3_tle_should_splitkv(

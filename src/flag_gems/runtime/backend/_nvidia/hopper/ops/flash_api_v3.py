@@ -25,6 +25,8 @@ from .flash_kernel_v3 import (
     fa3_tle_small_strategy,
     fa3_tle_ws_strategy,
     flash_varlen_fwd_v3_tle_direct_kernel,
+    flash_varlen_fwd_v3_tle_decode_flashdecoding_combine_kernel,
+    flash_varlen_fwd_v3_tle_decode_flashdecoding_kernel,
     flash_varlen_fwd_v3_tle_kernel,
     flash_varlen_fwd_v3_tle_short_kernel,
     flash_varlen_fwd_v3_tle_splitkv_combine_kernel,
@@ -412,6 +414,7 @@ def mha_varlan_fwd_v3(
             head_dim=head_size,
             is_paged=is_paged,
             force_family_id=force_family_id,
+            num_heads=num_heads,
             decode_strategy=decode_strategy,
             small_strategy=small_strategy,
             ws_strategy=ws_strategy,
@@ -441,6 +444,7 @@ def mha_varlan_fwd_v3(
                         head_dim=head_size,
                         is_paged=is_paged,
                         force_family_id=force_family_id,
+                        num_heads=num_heads,
                         decode_strategy=decode_strategy,
                         small_strategy="direct",
                         ws_strategy="legacy",
@@ -564,6 +568,58 @@ def mha_varlan_fwd_v3(
                     num_heads,
                 )
                 flash_varlen_fwd_v3_tle_splitkv_combine_kernel[combine_grid](
+                    out,
+                    lse,
+                    partial_out,
+                    partial_m,
+                    partial_l,
+                    out.stride(-3),
+                    out.stride(-2),
+                    o_batch_stride,
+                    cu_seqlens_q is not None,
+                    cu_seqlens_q,
+                    batch_size,
+                    num_heads,
+                    max_seqlen_q,
+                    head_size,
+                    total_q,
+                    adjusted_scale_softmax,
+                    adjusted_scale_softmax_log2e,
+                    BLOCK_M=combine_block_m,
+                    BLOCK_K=1 << (head_size - 1).bit_length(),
+                    NUM_SPLITS=num_splits,
+                )
+            elif run_plan.family == "flashdecoding":
+                num_splits = run_plan.num_splits
+                partial_out = torch.empty(
+                    (num_splits, num_heads, total_q, head_size),
+                    dtype=torch.float32,
+                    device=q_device,
+                )
+                partial_m = torch.empty(
+                    (num_splits, num_heads, total_q),
+                    dtype=torch.float32,
+                    device=q_device,
+                )
+                partial_l = torch.empty_like(partial_m)
+                split_grid = (max_seqlen_q, batch_size, num_heads * num_splits)
+                flash_varlen_fwd_v3_tle_decode_flashdecoding_kernel[split_grid](
+                    *args,
+                    partial_out,
+                    partial_m,
+                    partial_l,
+                    NUM_SPLITS=num_splits,
+                    SPLIT_POLICY=run_plan.split_policy,
+                )
+                combine_block_m = 8
+                combine_grid = (
+                    triton.cdiv(max_seqlen_q, combine_block_m),
+                    batch_size,
+                    num_heads,
+                )
+                flash_varlen_fwd_v3_tle_decode_flashdecoding_combine_kernel[
+                    combine_grid
+                ](
                     out,
                     lse,
                     partial_out,

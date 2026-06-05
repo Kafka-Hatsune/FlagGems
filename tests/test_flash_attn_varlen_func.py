@@ -276,6 +276,7 @@ def test_flash_attn_varlen_func_hopper_fa3_force_paths(
         ("onepass", hopper_fa3_accuracy_shapes()[2]),
         ("short", hopper_fa3_accuracy_shapes()[2]),
         ("splitkv", hopper_fa3_accuracy_shapes()[3]),
+        ("flashdecoding", hopper_fa3_accuracy_shapes()[3]),
     ],
     ids=lambda item: item if isinstance(item, str) else item.name,
 )
