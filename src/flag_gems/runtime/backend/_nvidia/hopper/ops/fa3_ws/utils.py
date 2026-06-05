@@ -599,6 +599,56 @@ def _paged_blockwise_cache_indices(
     return cache_idx
 
 
+@triton.jit
+def _decode_apply_alibi(
+    scores,
+    col_idx,
+    row_idx,
+    q_len,
+    k_len,
+    IS_CAUSAL: tl.constexpr,
+    IS_ALIBI: tl.constexpr,
+    alibi_slope,
+):
+    if IS_ALIBI:
+        if IS_CAUSAL:
+            scores += alibi_slope * (-k_len + 1 + col_idx).to(tl.float32)
+        else:
+            scores += -alibi_slope * tl.abs(col_idx - k_len + q_len - row_idx).to(
+                tl.float32
+            )
+    return scores
+
+
+@triton.jit
+def _decode_apply_mask(
+    scores,
+    col_idx,
+    row_idx,
+    q_len,
+    k_len,
+    window_size_left,
+    window_size_right,
+    IS_BORDER: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    IS_LOCAL: tl.constexpr,
+):
+    if IS_BORDER:
+        scores = tl.where(col_idx < k_len, scores, float("-inf"))
+    if IS_CAUSAL or IS_LOCAL:
+        col_lb = tl.maximum(0, row_idx + k_len - q_len - window_size_left)
+        col_rb = tl.minimum(k_len - 1, row_idx + k_len - q_len + window_size_right)
+        if IS_CAUSAL:
+            scores = tl.where(col_idx <= col_rb, scores, float("-inf"))
+        if IS_LOCAL:
+            scores = tl.where(
+                (col_idx >= col_lb) & (col_idx <= col_rb),
+                scores,
+                float("-inf"),
+            )
+    return scores
+
+
 def _heur_block_k(args):
     return triton.next_power_of_2(args["d"])
 

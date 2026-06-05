@@ -74,6 +74,7 @@ def _load_registry_module():
         / "hopper"
         / "ops"
         / "fa3_ws"
+        / "bak"
         / "experimental_registry.py"
     )
     spec = importlib.util.spec_from_file_location(
@@ -696,7 +697,7 @@ def _run_experiment(torch, triton, exp, ctx: LaunchContext):
 
     paged_gather_mode = fa3_tle_paged_gather_mode()
     if exp.family == "onepass":
-        from flag_gems.runtime.backend._nvidia.hopper.ops.fa3_ws.fa_hopper_decode_onepass import (
+        from flag_gems.runtime.backend._nvidia.hopper.ops.fa3_ws.bak.fa_hopper_decode_onepass import (
             flash_varlen_fwd_v3_tle_decode_onepass_kernel,
         )
         from flag_gems.runtime.backend._nvidia.hopper.ops.fa3_ws.utils import (
@@ -715,7 +716,7 @@ def _run_experiment(torch, triton, exp, ctx: LaunchContext):
         return ctx.finalize(ctx.out)
 
     if exp.family == "splitkv":
-        from flag_gems.runtime.backend._nvidia.hopper.ops.fa3_ws.fa_hopper_decode_splitkv import (
+        from flag_gems.runtime.backend._nvidia.hopper.ops.fa3_ws.bak.fa_hopper_decode_splitkv import (
             flash_varlen_fwd_v3_tle_decode_splitkv_combine_kernel,
             flash_varlen_fwd_v3_tle_decode_splitkv_kernel,
         )
@@ -799,7 +800,7 @@ def _run_experiment(torch, triton, exp, ctx: LaunchContext):
         )
 
     if exp.family == "paged_lb":
-        from flag_gems.runtime.backend._nvidia.hopper.ops.fa3_ws.fa_hopper_decode_paged_lb import (
+        from flag_gems.runtime.backend._nvidia.hopper.ops.fa3_ws.bak.fa_hopper_decode_paged_lb import (
             flash_varlen_fwd_v3_tle_decode_paged_lb_combine_kernel,
             flash_varlen_fwd_v3_tle_decode_paged_lb_kernel,
         )
@@ -815,7 +816,7 @@ def _run_experiment(torch, triton, exp, ctx: LaunchContext):
         )
 
     if exp.family == "seesaw":
-        from flag_gems.runtime.backend._nvidia.hopper.ops.fa3_ws.fa_hopper_decode_seesaw import (
+        from flag_gems.runtime.backend._nvidia.hopper.ops.fa3_ws.bak.fa_hopper_decode_seesaw import (
             flash_varlen_fwd_v3_tle_decode_seesaw_kernel,
         )
         from flag_gems.runtime.backend._nvidia.hopper.ops.fa3_ws.utils import (

@@ -5,6 +5,7 @@ Loaded by BackendArchEvent.get_arch_ops() on sm_90+; replaces the generic
 flash_attn_varlen_func / flash_attn_varlen_opt_func in flag_gems globals.
 """
 import logging
+import os
 
 import torch
 
@@ -12,6 +13,7 @@ from flag_gems.config import use_c_extension
 from flag_gems.ops.flash_api import mha_varlan_fwd, mha_varlan_fwd_opt
 from flag_gems.runtime import torch_device_fn
 
+from .fa3_ws.best_known import ROUTE_FA2_FALLBACK, select_fa3_best_route
 from .flash_api_v3 import is_fa3_supported, mha_varlan_fwd_v3
 
 logger = logging.getLogger(__name__)
@@ -113,6 +115,25 @@ def flash_attn_varlen_func(
     max_seqlen_k = (
         max_seqlen_k.item() if hasattr(max_seqlen_k, "item") else max_seqlen_k
     )
+
+    if fa_version == 3:
+        force_path = os.getenv("FLAG_GEMS_FA3_TLE_FORCE_PATH", "auto").strip().lower()
+        best_route = select_fa3_best_route(
+            total_q=q.size(0),
+            batch_size=cu_seqlens_q.numel() - 1,
+            max_seqlen_q=int(max_seqlen_q),
+            max_seqlen_k=int(max_seqlen_k),
+            is_paged=block_table is not None,
+            force_family_id=-1 if force_path == "auto" else 0,
+        )
+        if os.getenv("FLAG_GEMS_FA3_TLE_LOG_PLAN") == "1":
+            print(
+                "FLAG_GEMS_FA3_TLE_PLAN "
+                f"entry_route={best_route.route} workload={best_route.workload} "
+                f"reason={best_route.reason}"
+            )
+        if best_route.route == ROUTE_FA2_FALLBACK:
+            fa_version = 2
 
     _launcher = mha_varlan_fwd_v3 if fa_version == 3 else mha_varlan_fwd
     # logger.info("HOPPER_OVERRIDE flash_attn_varlen_func entered (fa_version=%d)", fa_version)

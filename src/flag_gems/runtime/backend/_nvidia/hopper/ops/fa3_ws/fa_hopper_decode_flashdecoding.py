@@ -9,7 +9,7 @@ kernel produces the final output.  ``SPLIT_POLICY`` selects the KV ownership:
 """
 
 from .utils import *  # noqa: F401,F403
-from .fa_hopper_decode_onepass import _decode_apply_alibi, _decode_apply_mask
+from .utils import _decode_apply_alibi, _decode_apply_mask
 from .fa_hopper_splitkv import (
     flash_varlen_fwd_v3_tle_splitkv_combine_kernel as flash_varlen_fwd_v3_tle_decode_flashdecoding_combine_kernel,
 )
