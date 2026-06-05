@@ -14,7 +14,7 @@ import torch
 import triton
 
 import flag_gems
-from flag_gems.ops.flash_api import fwd_params
+from flag_gems.ops.flash_api import fwd_params, mha_varlan_fwd as _mha_varlan_fwd_fa2
 from flag_gems.runtime import torch_device_fn
 
 from .flash_kernel_v3 import (
@@ -36,6 +36,7 @@ from .flash_kernel_v3 import (
     flash_varlen_fwd_v3_tle_splitkv_kernel,
     flash_varlen_fwd_v3_tle_ws_short_kernel,
     flash_varlen_fwd_v3_tle_ws_simple_kernel,
+    select_fa3_best_route,
 )
 
 logger = logging.getLogger(__name__)
@@ -254,6 +255,46 @@ def mha_varlan_fwd_v3(
         window_size_right = -1
     is_local = window_size_left >= 0
 
+    force_family_id = fa3_tle_force_family_id()
+    best_route = select_fa3_best_route(
+        total_q=total_q,
+        batch_size=batch_size,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        is_paged=is_paged,
+        force_family_id=force_family_id,
+    )
+    if os.getenv("FLAG_GEMS_FA3_TLE_LOG_PLAN") == "1":
+        print(
+            "FLAG_GEMS_FA3_TLE_PLAN "
+            f"route={best_route.route} workload={best_route.workload} "
+            f"reason={best_route.reason}"
+        )
+    if best_route.route == "fa2_fallback":
+        return _mha_varlan_fwd_fa2(
+            q,
+            k,
+            v,
+            out,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_k,
+            leftpad_k,
+            page_table if is_paged else None,
+            alibi_slopes,
+            max_seqlen_q,
+            max_seqlen_k,
+            p_dropout,
+            softmax_scale,
+            zero_tensors,
+            is_causal,
+            window_size_left,
+            window_size_right,
+            softcap,
+            return_softmax,
+            gen,
+        )
+
     seqlenq_ngroups_swapped = (
         max_seqlen_q == 1
         and alibi_slopes is None
@@ -405,7 +446,6 @@ def mha_varlan_fwd_v3(
         _ensure_tma_allocator()
         num_sms = torch.cuda.get_device_properties(q_device).multi_processor_count
         args = tuple(getattr(params, k) for k in params.__slots__)
-        force_family_id = fa3_tle_force_family_id()
         decode_strategy = fa3_tle_decode_strategy()
         small_strategy = fa3_tle_small_strategy()
         ws_strategy = fa3_tle_ws_strategy()

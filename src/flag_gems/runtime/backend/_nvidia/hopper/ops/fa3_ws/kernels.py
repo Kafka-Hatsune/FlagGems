@@ -22,6 +22,15 @@ from .fa_hopper_persistent_pingpong import (
     flash_varlen_fwd_v3_tle_kernel,
     flash_varlen_fwd_v3_tle_ws_simple_kernel,
 )
+from .best_known import (
+    FA3BestRoute,
+    ROUTE_CURRENT_FA3,
+    ROUTE_FA2_FALLBACK,
+    ROUTE_RESTORED_FA3,
+    classify_fa3_workload,
+    fa3_tle_best_route_mode,
+    select_fa3_best_route,
+)
 from .fa_hopper_nonpersistent_tlx_style import flash_varlen_fwd_v3_tle_ws_short_kernel
 from .fa_hopper_short import flash_varlen_fwd_v3_tle_short_kernel
 from .fa_hopper_direct import flash_varlen_fwd_v3_tle_direct_kernel
@@ -55,6 +64,13 @@ __all__ = [
     "fa3_tle_paged_gather_name",
     "fa3_tle_select_plan",
     "fa3_tle_mixed_long_plan",
+    "FA3BestRoute",
+    "ROUTE_CURRENT_FA3",
+    "ROUTE_RESTORED_FA3",
+    "ROUTE_FA2_FALLBACK",
+    "classify_fa3_workload",
+    "fa3_tle_best_route_mode",
+    "select_fa3_best_route",
     "flash_varlen_fwd_v3_tle_kernel",
     "flash_varlen_fwd_v3_tle_ws_simple_kernel",
     "flash_varlen_fwd_v3_tle_ws_short_kernel",
