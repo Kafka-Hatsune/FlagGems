@@ -116,7 +116,7 @@ class LaunchContext:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--variant", action="append", default=None)
+    parser.add_argument("--variant", action="append", nargs="+", default=None)
     parser.add_argument("--shape", default="smoke", choices=SHAPE_CHOICES)
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--perf", action="store_true")
@@ -133,6 +133,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--_worker-variant", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--_worker-shape", default=None, help=argparse.SUPPRESS)
     return parser.parse_args()
+
+
+def _variant_selection(selection: list[list[str]] | None) -> list[str] | None:
+    if selection is None:
+        return None
+    return [name for group in selection for name in group]
 
 
 def _round_multiple(value: int, multiple: int) -> int:
@@ -210,7 +216,7 @@ def _find_first_ir_files(dump_dir: Path | None) -> tuple[str, str]:
 
 def _run_parent(args: argparse.Namespace) -> int:
     rows: list[dict[str, Any]] = []
-    for name in REGISTRY.resolve_experiment_names(args.variant):
+    for name in REGISTRY.resolve_experiment_names(_variant_selection(args.variant)):
         exp = REGISTRY.get_experiment(name)
         shape_keys = _shape_keys_for_variant(args.shape, exp)
         if not shape_keys:
