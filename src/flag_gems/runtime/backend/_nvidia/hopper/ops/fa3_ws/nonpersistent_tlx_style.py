@@ -120,7 +120,7 @@ def flash_varlen_fwd_v3_tle_ws_short_kernel(
 ):
     HEAD_DIM_PADDED: tl.constexpr = BLOCK_K
     INPUT_DTYPE: tl.constexpr = q_ptr.dtype.element_ty
-    PRODUCER_THREADS: tl.constexpr = 4 * 32
+    MANUAL_COPY_ARRIVALS: tl.constexpr = 1
 
     q_smem = tle.gpu.alloc(
         [1, BLOCK_M, HEAD_DIM_PADDED],
@@ -164,7 +164,7 @@ def flash_varlen_fwd_v3_tle_ws_short_kernel(
     )
     k_full_manual = tle.gpu.alloc_barriers(
         num_barriers=KV_STAGE_CAPACITY,
-        arrive_count=PRODUCER_THREADS,
+        arrive_count=MANUAL_COPY_ARRIVALS,
     )
     v_empty = tle.gpu.alloc_barriers(
         num_barriers=KV_STAGE_CAPACITY,
@@ -178,7 +178,7 @@ def flash_varlen_fwd_v3_tle_ws_short_kernel(
     )
     v_full_manual = tle.gpu.alloc_barriers(
         num_barriers=KV_STAGE_CAPACITY,
-        arrive_count=PRODUCER_THREADS,
+        arrive_count=MANUAL_COPY_ARRIVALS,
     )
 
     with tle.gpu.async_tasks():
@@ -304,7 +304,7 @@ def flash_varlen_fwd_v3_tle_ws_short_kernel(
                             _fence_async_shared_cta()
                             tle.gpu.barrier_arrive(
                                 k_full_manual[kv_buf],
-                                arrive_count=PRODUCER_THREADS,
+                                arrive_count=MANUAL_COPY_ARRIVALS,
                                 phaseIdx=kv_phase_idx,
                             )
                         else:
@@ -333,7 +333,7 @@ def flash_varlen_fwd_v3_tle_ws_short_kernel(
                             _fence_async_shared_cta()
                             tle.gpu.barrier_arrive(
                                 v_full_manual[kv_buf],
-                                arrive_count=PRODUCER_THREADS,
+                                arrive_count=MANUAL_COPY_ARRIVALS,
                                 phaseIdx=kv_phase_idx,
                             )
                         else:

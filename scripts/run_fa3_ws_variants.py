@@ -339,14 +339,34 @@ def _make_shape(shape_key: str, spec: WSVariant):
     from tests.hopper_fa3_utils import Shape
 
     if shape_key == "decode":
+        if spec.persistent:
+            return Shape(
+                "ws_persistent_dense_decode_b1_k512_d128_mha",
+                [(1, 512)],
+                4,
+                4,
+                128,
+                True,
+            )
         return Shape("ws_dense_decode_b4_k1k_d128_gqa4", [(1, 1024)] * 4, 8, 2, 128, True)
     if shape_key == "paged_decode":
+        if spec.persistent:
+            return Shape(
+                "ws_persistent_paged_decode_b1_k128_d128_mha",
+                [(1, 128)],
+                4,
+                4,
+                128,
+                True,
+                paged=True,
+                block_size=16,
+            )
         return Shape(
-            "ws_paged_decode_b4_k1k_d192_gqa4",
-            [(1, 1024)] * 4,
-            8,
-            2,
-            192,
+            "ws_paged_decode_b1_k128_d128_gqa4",
+            [(1, 128)],
+            4,
+            1,
+            128,
             True,
             paged=True,
             block_size=16,
@@ -361,6 +381,15 @@ def _make_shape(shape_key: str, spec: WSVariant):
             True,
         )
     if shape_key == "bench_decode":
+        if spec.persistent:
+            return Shape(
+                "ws_bench_persistent_decode_b8_k2k_d128_mha",
+                [(1, 2048)] * 8,
+                32,
+                32,
+                128,
+                True,
+            )
         return Shape("ws_bench_decode_b16_k2k_d128_gqa4", [(1, 2048)] * 16, 32, 8, 128, True)
     if shape_key == "bench_paged_decode":
         return Shape(
