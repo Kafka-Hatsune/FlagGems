@@ -144,7 +144,7 @@ def flash_varlen_fwd_v3_tle_splitkv_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
-    PAGED_GATHER_MODE: tl.constexpr = _FA3_TLE_PAGED_GATHER_AUTO,
+    PAGED_GATHER_MODE: tl.constexpr = 2,
 ):
     m_block = tl.program_id(0)
     bid = tl.program_id(1)

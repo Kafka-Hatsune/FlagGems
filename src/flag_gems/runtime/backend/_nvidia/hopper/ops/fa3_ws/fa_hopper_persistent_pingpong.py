@@ -117,7 +117,7 @@ def flash_varlen_fwd_v3_tle_kernel(
     FORCE_FAMILY_ID: tl.constexpr,
     MIN_Q_LEN_TO_PROCESS: tl.constexpr,
     MAX_Q_LEN_TO_PROCESS: tl.constexpr,
-    PAGED_GATHER_MODE: tl.constexpr = _FA3_TLE_PAGED_GATHER_AUTO,
+    PAGED_GATHER_MODE: tl.constexpr = 2,
 ):
     BM_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
     HEAD_DIM_PADDED: tl.constexpr = BLOCK_K

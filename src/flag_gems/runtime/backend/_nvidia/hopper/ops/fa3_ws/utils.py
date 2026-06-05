@@ -556,10 +556,7 @@ def _paged_blockwise_cache_indices(
     BOUNDARY_CHECK: tl.constexpr = True,
 ):
     logical_idx = n_start + offsets
-    if (
-        PAGED_GATHER_MODE == _FA3_TLE_PAGED_GATHER_LEGACY
-        or (block_size != 16 and block_size != 32)
-    ):
+    if PAGED_GATHER_MODE == 0 or (block_size != 16 and block_size != 32):
         return _virtual_to_cache(
             logical_idx,
             max_virtual_index,
@@ -646,7 +643,7 @@ def _copy_paged_kv_tile_to_smem(
     block_size: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM_PADDED: tl.constexpr,
-    PAGED_GATHER_MODE: tl.constexpr = _FA3_TLE_PAGED_GATHER_AUTO,
+    PAGED_GATHER_MODE: tl.constexpr = 2,
 ):
     for row_base in tl.static_range(0, BLOCK_N, 32):
         row_offsets = tl.arange(0, 32)
@@ -695,7 +692,7 @@ def _copy_paged_kv_tile_to_smem_sync_safe(
     block_size: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM_PADDED: tl.constexpr,
-    PAGED_GATHER_MODE: tl.constexpr = _FA3_TLE_PAGED_GATHER_AUTO,
+    PAGED_GATHER_MODE: tl.constexpr = 2,
 ):
     for row_base in tl.static_range(0, BLOCK_N, 32):
         row_offsets = tl.arange(0, 32)

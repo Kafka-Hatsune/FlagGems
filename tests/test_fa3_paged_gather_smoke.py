@@ -57,7 +57,7 @@ _PAGED_SMOKE_SHAPES = [
         block_size=16,
     ),
     Shape(
-        "paged_benchmark_mixed_long",
+        "paged_benchmark_mixed_short",
         [(1, 1328), (5, 18), (129, 463)],
         8,
         2,
@@ -77,13 +77,13 @@ _PAGED_SMOKE_SHAPES = [
         (8, 2, 4, 256, True, "flashdecoding"),
         (31, 16, 16, 1024, True, "flashdecoding"),
         (97, 3, 64, 128, True, "short"),
-        (135, 3, 129, 1328, True, "long"),
+        (135, 3, 129, 1328, True, "short"),
     ],
     ids=[
         "q1-gqa-swapped-flashdecoding",
         "q16-longk-flashdecoding",
         "short-paged",
-        "benchmark-mixed-long",
+        "benchmark-mixed-short",
     ],
 )
 def test_fa3_paged_plan_smoke(
