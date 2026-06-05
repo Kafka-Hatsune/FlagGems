@@ -21,6 +21,12 @@ from .fa_hopper_persistent_pingpong import (
 from .fa_hopper_nonpersistent_tlx_style import flash_varlen_fwd_v3_tle_ws_short_kernel
 from .fa_hopper_short import flash_varlen_fwd_v3_tle_short_kernel
 from .fa_hopper_direct import flash_varlen_fwd_v3_tle_direct_kernel
+from .fa_hopper_decode_onepass import flash_varlen_fwd_v3_tle_decode_onepass_kernel
+from .fa_hopper_decode_splitkv import (
+    flash_varlen_fwd_v3_tle_decode_splitkv_combine_kernel,
+    flash_varlen_fwd_v3_tle_decode_splitkv_kernel,
+)
+from .fa_hopper_decode_seesaw import flash_varlen_fwd_v3_tle_decode_seesaw_kernel
 from .fa_hopper_splitkv import (
     flash_varlen_fwd_v3_tle_splitkv_combine_kernel,
     flash_varlen_fwd_v3_tle_splitkv_kernel,
@@ -40,6 +46,10 @@ __all__ = [
     "flash_varlen_fwd_v3_tle_ws_short_kernel",
     "flash_varlen_fwd_v3_tle_short_kernel",
     "flash_varlen_fwd_v3_tle_direct_kernel",
+    "flash_varlen_fwd_v3_tle_decode_onepass_kernel",
+    "flash_varlen_fwd_v3_tle_decode_splitkv_kernel",
+    "flash_varlen_fwd_v3_tle_decode_splitkv_combine_kernel",
+    "flash_varlen_fwd_v3_tle_decode_seesaw_kernel",
     "flash_varlen_fwd_v3_tle_splitkv_kernel",
     "flash_varlen_fwd_v3_tle_splitkv_combine_kernel",
 ]

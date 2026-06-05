@@ -1,0 +1,332 @@
+"""Single-query decode FA3 TLE experimental one-pass kernel family.
+
+This path is intentionally separate from ``fa_hopper_direct.py``.  The direct
+kernel uses a matrix tile with ``BLOCK_M >= 16``; for decode after optional GQA
+packing the effective query length is usually 1-4, so most M rows are wasted.
+This kernel maps one program to one query row and one head, keeping the online
+softmax in registers and avoiding the 16-row M tile.
+"""
+
+from .utils import *  # noqa: F401,F403
+
+
+def _fa3_decode_configs():
+    configs = []
+    for block_n in (64, 128, 256):
+        for num_warps in (4, 8):
+            if block_n == 64 and num_warps == 8:
+                continue
+            configs.append(
+                triton.Config(
+                    {"BLOCK_N": block_n},
+                    num_stages=3,
+                    num_warps=num_warps,
+                )
+            )
+    return configs
+
+
+def _prune_fa3_decode_configs(configs, nargs, **kwargs):
+    head_dim = kwargs.get("d", nargs.get("d"))
+    is_paged = kwargs.get("is_paged", nargs.get("is_paged"))
+    seqlen_k = kwargs.get("seqlen_k", nargs.get("seqlen_k", 0))
+
+    kept = []
+    for cfg in configs:
+        block_n = cfg.kwargs["BLOCK_N"]
+        if is_paged and block_n > 128:
+            continue
+        if head_dim >= 192 and block_n > 128:
+            continue
+        if seqlen_k <= 256 and block_n > 128:
+            continue
+        kept.append(cfg)
+    return kept or [configs[0]]
+
+
+@triton.jit
+def _decode_apply_alibi(
+    scores,
+    col_idx,
+    row_idx,
+    q_len,
+    k_len,
+    IS_CAUSAL: tl.constexpr,
+    IS_ALIBI: tl.constexpr,
+    alibi_slope,
+):
+    if IS_ALIBI:
+        if IS_CAUSAL:
+            scores += alibi_slope * (-k_len + 1 + col_idx).to(tl.float32)
+        else:
+            scores += -alibi_slope * tl.abs(col_idx - k_len + q_len - row_idx).to(
+                tl.float32
+            )
+    return scores
+
+
+@triton.jit
+def _decode_apply_mask(
+    scores,
+    col_idx,
+    row_idx,
+    q_len,
+    k_len,
+    window_size_left,
+    window_size_right,
+    IS_BORDER: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    IS_LOCAL: tl.constexpr,
+):
+    if IS_BORDER:
+        scores = tl.where(col_idx < k_len, scores, float("-inf"))
+    if IS_CAUSAL or IS_LOCAL:
+        col_lb = tl.maximum(0, row_idx + k_len - q_len - window_size_left)
+        col_rb = tl.minimum(k_len - 1, row_idx + k_len - q_len + window_size_right)
+        if IS_CAUSAL:
+            scores = tl.where(col_idx <= col_rb, scores, float("-inf"))
+        if IS_LOCAL:
+            scores = tl.where(
+                (col_idx >= col_lb) & (col_idx <= col_rb),
+                scores,
+                float("-inf"),
+            )
+    return scores
+
+
+@libentry()
+@triton.autotune(
+    configs=_fa3_decode_configs(),
+    prune_configs_by={"early_config_prune": _prune_fa3_decode_configs},
+    key=[
+        "d",
+        "is_paged",
+        "is_causal",
+        "is_local",
+        "is_alibi",
+        "seqlen_q",
+        "seqlen_k",
+        "total_q",
+        "DECODE_SHAPE_BUCKET",
+    ],
+)
+@triton.heuristics(
+    values={
+        "BLOCK_K": _heur_block_k,
+    }
+)
+@triton.jit(
+    do_not_specialize=[
+        "q_batch_stride",
+        "k_batch_stride",
+        "v_batch_stride",
+        "o_batch_stride",
+        "b",
+        "bk",
+        "seqlen_q",
+        "seqlen_k",
+        "seqlen_q_rounded",
+        "seqlen_k_rounded",
+        "total_q",
+    ]
+)
+def flash_varlen_fwd_v3_tle_decode_onepass_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    o_ptr,
+    p_ptr,
+    softmax_lse_ptr,
+    q_row_stride,
+    k_row_stride,
+    v_row_stride,
+    q_head_stride,
+    k_head_stride,
+    v_head_stride,
+    o_row_stride,
+    o_head_stride,
+    q_batch_stride,
+    k_batch_stride,
+    v_batch_stride,
+    o_batch_stride,
+    is_cu_seqlens_q: tl.constexpr,
+    cu_seqlens_q_ptr,
+    is_cu_seqlens_k: tl.constexpr,
+    cu_seqlens_k_ptr,
+    is_seqused_k: tl.constexpr,
+    seqused_k_ptr,
+    b,
+    bk,
+    h: tl.constexpr,
+    hk: tl.constexpr,
+    h_hk_ratio: tl.constexpr,
+    seqlen_q,
+    seqlen_k,
+    seqlen_q_rounded,
+    seqlen_k_rounded,
+    d: tl.constexpr,
+    d_rounded: tl.constexpr,
+    is_softcap: tl.constexpr,
+    softcap: tl.constexpr,
+    scale_softmax: tl.constexpr,
+    scale_softmax_log2: tl.constexpr,
+    is_dropout: tl.constexpr,
+    p_dropout: tl.constexpr,
+    rp_dropout: tl.constexpr,
+    p_dropout_in_uint8_t: tl.constexpr,
+    philox_args,
+    return_softmax: tl.constexpr,
+    is_causal: tl.constexpr,
+    is_local: tl.constexpr,
+    window_size_left: tl.constexpr,
+    window_size_right: tl.constexpr,
+    seqlenq_ngroups_swapped: tl.constexpr,
+    is_paged: tl.constexpr,
+    is_alibi: tl.constexpr,
+    alibi_slopes_ptr,
+    alibi_slopes_batch_stride: tl.constexpr,
+    total_q,
+    page_table_ptr,
+    page_table_batch_stride: tl.constexpr,
+    block_size: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    DECODE_SHAPE_BUCKET: tl.constexpr,
+):
+    q_row = tl.program_id(0)
+    bid = tl.program_id(1)
+    hid = tl.program_id(2)
+    HEAD_DIM_PADDED: tl.constexpr = BLOCK_K
+
+    if is_cu_seqlens_q:
+        q_eos = tl.load(cu_seqlens_q_ptr + bid + 1).to(tl.int32)
+        q_bos = tl.load(cu_seqlens_q_ptr + bid).to(tl.int32)
+        q_len = q_eos - q_bos
+        q_offset = q_bos * q_row_stride
+        o_offset = q_bos * o_row_stride
+        lse_offset = q_bos
+    else:
+        q_len = seqlen_q
+        q_offset = bid * q_batch_stride
+        o_offset = bid * o_batch_stride
+        lse_offset = bid * seqlen_q
+
+    if is_cu_seqlens_k:
+        k_eos = tl.load(cu_seqlens_k_ptr + bid + 1).to(tl.int32)
+        k_bos = tl.load(cu_seqlens_k_ptr + bid).to(tl.int32)
+        k_len_cache = k_eos - k_bos
+    else:
+        k_len_cache = seqlen_k
+        k_bos = 0
+
+    if is_seqused_k:
+        k_len = tl.load(seqused_k_ptr + bid).to(tl.int32)
+    else:
+        k_len = k_len_cache
+
+    if q_row < q_len:
+        d_idx = tl.arange(0, HEAD_DIM_PADDED)
+        n_idx = tl.arange(0, BLOCK_N)
+        q_base = q_ptr + q_offset + hid * q_head_stride
+        o_base = o_ptr + o_offset + hid * o_head_stride
+        kv_head = hid // h_hk_ratio
+        if is_paged:
+            page_table_ptr_b = page_table_ptr + bid * page_table_batch_stride
+            k_base = k_ptr + kv_head * k_head_stride
+            v_base = v_ptr + kv_head * v_head_stride
+        else:
+            k_base = k_ptr + k_bos * k_row_stride + kv_head * k_head_stride
+            v_base = v_ptr + k_bos * v_row_stride + kv_head * v_head_stride
+
+        q_vec = tl.load(
+            q_base + q_row * q_row_stride + d_idx,
+            mask=d_idx < d,
+            other=0.0,
+        ).to(tl.float32)
+
+        if is_alibi:
+            alibi_slope = tl.load(
+                alibi_slopes_ptr + bid * alibi_slopes_batch_stride + hid
+            )
+            alibi_slope = alibi_slope / scale_softmax
+        else:
+            alibi_slope = 0.0
+
+        m_i = tl.full((), float("-inf"), dtype=tl.float32)
+        l_i = tl.full((), 0.0, dtype=tl.float32)
+        acc = tl.zeros([HEAD_DIM_PADDED], dtype=tl.float32)
+
+        for n_start in tl.range(0, k_len, BLOCK_N, num_stages=3):
+            col_idx = n_start + n_idx
+            if is_paged:
+                cache_idx = _virtual_to_cache(
+                    col_idx,
+                    k_len,
+                    page_table_ptr_b,
+                    block_size,
+                    BOUNDARY_CHECK=True,
+                )
+            else:
+                cache_idx = col_idx
+
+            k_tile = tl.load(
+                k_base + cache_idx[:, None] * k_row_stride + d_idx[None, :],
+                mask=(col_idx[:, None] < k_len) & (d_idx[None, :] < d),
+                other=0.0,
+            ).to(tl.float32)
+            scores = tl.sum(k_tile * q_vec[None, :], 1)
+            scores = _apply_softcap_v3(scores, softcap, is_softcap)
+            scores = _decode_apply_alibi(
+                scores,
+                col_idx,
+                q_row,
+                q_len,
+                k_len,
+                IS_CAUSAL=is_causal,
+                IS_ALIBI=is_alibi,
+                alibi_slope=alibi_slope,
+            )
+            scores = _decode_apply_mask(
+                scores,
+                col_idx,
+                q_row,
+                q_len,
+                k_len,
+                window_size_left,
+                window_size_right,
+                IS_BORDER=True,
+                IS_CAUSAL=is_causal,
+                IS_LOCAL=is_local,
+            )
+
+            m_new = tl.maximum(m_i, tl.max(scores, 0))
+            m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+            alpha = tl.math.exp2((m_i - m_safe) * scale_softmax_log2)
+            p_scores = tl.math.exp2(
+                scores * scale_softmax_log2 - m_safe * scale_softmax_log2
+            )
+            l_new = l_i * alpha + tl.sum(p_scores, 0)
+
+            v_tile = tl.load(
+                v_base + cache_idx[:, None] * v_row_stride + d_idx[None, :],
+                mask=(col_idx[:, None] < k_len) & (d_idx[None, :] < d),
+                other=0.0,
+            ).to(tl.float32)
+            acc = acc * alpha + tl.sum(p_scores[:, None] * v_tile, 0)
+            m_i = m_new
+            l_i = l_new
+
+        invalid = (l_i == 0.0) | (l_i != l_i)
+        inv_l = tl.where(invalid, 1.0, 1.0 / l_i)
+        out_vec = acc * inv_l
+        lse = tl.where(invalid, float("inf"), m_i * scale_softmax + tl.log(l_i))
+
+        tl.store(
+            o_base + q_row * o_row_stride + d_idx,
+            out_vec.to(o_ptr.dtype.element_ty),
+            mask=d_idx < d,
+        )
+        tl.store(softmax_lse_ptr + hid * total_q + lse_offset + q_row, lse)
+
+
+__all__ = ["flash_varlen_fwd_v3_tle_decode_onepass_kernel"]
