@@ -144,6 +144,7 @@ def flash_varlen_fwd_v3_tle_splitkv_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
+    PAGED_GATHER_MODE: tl.constexpr = _FA3_TLE_PAGED_GATHER_AUTO,
 ):
     m_block = tl.program_id(0)
     bid = tl.program_id(1)
@@ -258,11 +259,14 @@ def flash_varlen_fwd_v3_tle_splitkv_kernel(
             ):
                 col_idx = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
                 if is_paged:
-                    cache_idx = _virtual_to_cache(
-                        col_idx,
+                    cache_idx = _paged_blockwise_cache_indices(
+                        n_block * BLOCK_N,
+                        tl.arange(0, BLOCK_N),
                         k_len,
                         page_table_ptr_b,
                         block_size,
+                        BLOCK_N,
+                        PAGED_GATHER_MODE,
                         BOUNDARY_CHECK=True,
                     )
                     d_idx = tl.arange(0, HEAD_DIM_PADDED)

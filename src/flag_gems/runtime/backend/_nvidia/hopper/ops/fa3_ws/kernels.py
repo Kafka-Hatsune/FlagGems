@@ -4,7 +4,11 @@ The implementation is split by kernel family in this package.  This module keeps
 one stable import surface for ``flash_kernel_v3.py`` and ``flash_api_v3.py``.
 """
 
-from .utils import TLE_FA3_AVAILABLE
+from .utils import (
+    TLE_FA3_AVAILABLE,
+    fa3_tle_paged_gather_mode,
+    fa3_tle_paged_gather_name,
+)
 from .planning import (
     FA3TlePlan,
     fa3_tle_decode_strategy,
@@ -47,6 +51,8 @@ __all__ = [
     "fa3_tle_decode_strategy",
     "fa3_tle_small_strategy",
     "fa3_tle_ws_strategy",
+    "fa3_tle_paged_gather_mode",
+    "fa3_tle_paged_gather_name",
     "fa3_tle_select_plan",
     "fa3_tle_mixed_long_plan",
     "flash_varlen_fwd_v3_tle_kernel",

@@ -8,6 +8,7 @@ with a clear RuntimeError; the older non-TLE FA3 kernel is intentionally absent.
 """
 
 import logging
+import os
 
 import torch
 import triton
@@ -21,6 +22,8 @@ from .flash_kernel_v3 import (
     fa3_tle_decode_strategy,
     fa3_tle_force_family_id,
     fa3_tle_mixed_long_plan,
+    fa3_tle_paged_gather_mode,
+    fa3_tle_paged_gather_name,
     fa3_tle_select_plan,
     fa3_tle_small_strategy,
     fa3_tle_ws_strategy,
@@ -406,6 +409,7 @@ def mha_varlan_fwd_v3(
         decode_strategy = fa3_tle_decode_strategy()
         small_strategy = fa3_tle_small_strategy()
         ws_strategy = fa3_tle_ws_strategy()
+        paged_gather_mode = fa3_tle_paged_gather_mode()
         plan = fa3_tle_select_plan(
             total_q=total_q,
             batch_size=batch_size,
@@ -477,6 +481,14 @@ def mha_varlan_fwd_v3(
                 run_plan.min_q_len,
                 run_plan.max_q_len,
             )
+            if os.getenv("FLAG_GEMS_FA3_TLE_LOG_PLAN") == "1":
+                print(
+                    "FLAG_GEMS_FA3_TLE_PLAN "
+                    f"family={run_plan.family} bucket={run_plan.shape_bucket} "
+                    f"kind={run_plan.direct_kind} strategy={run_plan.decode_strategy} "
+                    f"splits={run_plan.num_splits} paged_gather="
+                    f"{fa3_tle_paged_gather_name(paged_gather_mode)}"
+                )
             if run_plan.family == "direct":
                 grid = lambda meta: (
                     triton.cdiv(max_seqlen_q, meta["BLOCK_M"]),
@@ -488,6 +500,7 @@ def mha_varlan_fwd_v3(
                     DIRECT_SHAPE_BUCKET=run_plan.shape_bucket,
                     MIN_Q_LEN_TO_PROCESS=run_plan.min_q_len,
                     MAX_Q_LEN_TO_PROCESS=run_plan.max_q_len,
+                    PAGED_GATHER_MODE=paged_gather_mode,
                 )
             elif run_plan.family == "ws_short":
                 grid = lambda meta: (
@@ -500,6 +513,7 @@ def mha_varlan_fwd_v3(
                     WS_SHORT_SHAPE_BUCKET=run_plan.shape_bucket,
                     MIN_Q_LEN_TO_PROCESS=run_plan.min_q_len,
                     MAX_Q_LEN_TO_PROCESS=run_plan.max_q_len,
+                    PAGED_GATHER_MODE=paged_gather_mode,
                     tle_wgmma_pipeline_mode="user_promise",
                 )
             elif run_plan.family == "ws_simple":
@@ -517,6 +531,7 @@ def mha_varlan_fwd_v3(
                     FORCE_FAMILY_ID=run_plan.force_family_id,
                     MIN_Q_LEN_TO_PROCESS=run_plan.min_q_len,
                     MAX_Q_LEN_TO_PROCESS=run_plan.max_q_len,
+                    PAGED_GATHER_MODE=paged_gather_mode,
                     tle_wgmma_pipeline_mode="user_promise",
                 )
             elif run_plan.family in (
@@ -535,6 +550,7 @@ def mha_varlan_fwd_v3(
                     SHORT_SHAPE_BUCKET=run_plan.shape_bucket,
                     MIN_Q_LEN_TO_PROCESS=run_plan.min_q_len,
                     MAX_Q_LEN_TO_PROCESS=run_plan.max_q_len,
+                    PAGED_GATHER_MODE=paged_gather_mode,
                 )
             elif run_plan.family == "splitkv":
                 num_splits = run_plan.num_splits
@@ -560,6 +576,7 @@ def mha_varlan_fwd_v3(
                     partial_m,
                     partial_l,
                     NUM_SPLITS=num_splits,
+                    PAGED_GATHER_MODE=paged_gather_mode,
                 )
                 combine_block_m = 32
                 combine_grid = (
@@ -610,6 +627,7 @@ def mha_varlan_fwd_v3(
                     partial_l,
                     NUM_SPLITS=num_splits,
                     SPLIT_POLICY=run_plan.split_policy,
+                    PAGED_GATHER_MODE=paged_gather_mode,
                 )
                 combine_block_m = 8
                 combine_grid = (
@@ -656,6 +674,7 @@ def mha_varlan_fwd_v3(
                     FORCE_FAMILY_ID=run_plan.force_family_id,
                     MIN_Q_LEN_TO_PROCESS=run_plan.min_q_len,
                     MAX_Q_LEN_TO_PROCESS=run_plan.max_q_len,
+                    PAGED_GATHER_MODE=paged_gather_mode,
                     tle_wgmma_pipeline_mode="user_promise",
                 )
 

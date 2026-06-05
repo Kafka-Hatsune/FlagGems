@@ -620,6 +620,11 @@ def _run_experimental_split_decode(
     split_policy: int,
     split_policy_name: str,
 ):
+    from flag_gems.runtime.backend._nvidia.hopper.ops.fa3_ws.utils import (
+        fa3_tle_paged_gather_mode,
+    )
+
+    paged_gather_mode = fa3_tle_paged_gather_mode()
     num_splits = _decode_experimental_splits(ctx, split_policy=split_policy)
     partial_out = torch.empty(
         (num_splits, ctx.num_heads, ctx.total_q, ctx.head_dim),
@@ -640,6 +645,7 @@ def _run_experimental_split_decode(
         partial_l,
         NUM_SPLITS=num_splits,
         SPLIT_POLICY=split_policy,
+        PAGED_GATHER_MODE=paged_gather_mode,
     )
     combine_block_m = 8
     combine_grid = (
@@ -684,6 +690,11 @@ def _run_experimental_split_decode(
 
 
 def _run_experiment(torch, triton, exp, ctx: LaunchContext):
+    from flag_gems.runtime.backend._nvidia.hopper.ops.fa3_ws.utils import (
+        fa3_tle_paged_gather_mode,
+    )
+
+    paged_gather_mode = fa3_tle_paged_gather_mode()
     if exp.family == "onepass":
         from flag_gems.runtime.backend._nvidia.hopper.ops.fa3_ws.fa_hopper_decode_onepass import (
             flash_varlen_fwd_v3_tle_decode_onepass_kernel,
@@ -699,6 +710,7 @@ def _run_experiment(torch, triton, exp, ctx: LaunchContext):
             DECODE_SHAPE_BUCKET=_FA3_TLE_BUCKET_PAGED_DECODE
             if exp.paged
             else _FA3_TLE_BUCKET_DECODE,
+            PAGED_GATHER_MODE=paged_gather_mode,
         )
         return ctx.finalize(ctx.out)
 
@@ -734,6 +746,7 @@ def _run_experiment(torch, triton, exp, ctx: LaunchContext):
             partial_m,
             partial_l,
             NUM_SPLITS=num_splits,
+            PAGED_GATHER_MODE=paged_gather_mode,
         )
         combine_block_m = 8
         combine_grid = (

@@ -117,6 +117,7 @@ def flash_varlen_fwd_v3_tle_ws_short_kernel(
     WS_SHORT_SHAPE_BUCKET: tl.constexpr,
     MIN_Q_LEN_TO_PROCESS: tl.constexpr,
     MAX_Q_LEN_TO_PROCESS: tl.constexpr,
+    PAGED_GATHER_MODE: tl.constexpr = _FA3_TLE_PAGED_GATHER_AUTO,
 ):
     HEAD_DIM_PADDED: tl.constexpr = BLOCK_K
     INPUT_DTYPE: tl.constexpr = q_ptr.dtype.element_ty
@@ -300,6 +301,7 @@ def flash_varlen_fwd_v3_tle_ws_short_kernel(
                                 block_size,
                                 BLOCK_N,
                                 HEAD_DIM_PADDED,
+                                PAGED_GATHER_MODE,
                             )
                             _fence_async_shared_cta()
                             tle.gpu.barrier_arrive(
@@ -329,6 +331,7 @@ def flash_varlen_fwd_v3_tle_ws_short_kernel(
                                 block_size,
                                 BLOCK_N,
                                 HEAD_DIM_PADDED,
+                                PAGED_GATHER_MODE,
                             )
                             _fence_async_shared_cta()
                             tle.gpu.barrier_arrive(

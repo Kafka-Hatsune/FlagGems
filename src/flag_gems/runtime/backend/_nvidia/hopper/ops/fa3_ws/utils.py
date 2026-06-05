@@ -5,6 +5,8 @@ WS variants can live as standalone kernel modules while preserving the proven
 TLE helper implementations.
 """
 
+import os
+
 import triton
 import triton.language as tl
 
@@ -34,6 +36,34 @@ _FA3_TLE_FAMILY_WS_SYNC_SMALL = 13
 _FA3_TLE_FAMILY_WS_SYNC_PAGED_DECODE = 14
 _FA3_TLE_FAMILY_WS_PIPE2_PAGED_DECODE = 15
 _FA3_TLE_FAMILY_AUTO = -1
+
+_FA3_TLE_PAGED_GATHER_LEGACY = 0
+_FA3_TLE_PAGED_GATHER_BLOCKWISE = 1
+_FA3_TLE_PAGED_GATHER_AUTO = 2
+_FA3_TLE_PAGED_GATHER_NAMES = {
+    _FA3_TLE_PAGED_GATHER_LEGACY: "legacy",
+    _FA3_TLE_PAGED_GATHER_BLOCKWISE: "blockwise",
+    _FA3_TLE_PAGED_GATHER_AUTO: "auto",
+}
+
+
+def fa3_tle_paged_gather_mode() -> int:
+    value = os.getenv("FLAG_GEMS_FA3_TLE_PAGED_GATHER", "auto").strip().lower()
+    allowed = {
+        "legacy": _FA3_TLE_PAGED_GATHER_LEGACY,
+        "blockwise": _FA3_TLE_PAGED_GATHER_BLOCKWISE,
+        "auto": _FA3_TLE_PAGED_GATHER_AUTO,
+    }
+    if value not in allowed:
+        raise RuntimeError(
+            "invalid FLAG_GEMS_FA3_TLE_PAGED_GATHER="
+            f"{value!r}; expected one of {', '.join(sorted(allowed))}"
+        )
+    return allowed[value]
+
+
+def fa3_tle_paged_gather_name(mode: int) -> str:
+    return _FA3_TLE_PAGED_GATHER_NAMES.get(mode, f"unknown({mode})")
 
 _FA3_TLE_BUCKET_LONG = 0
 _FA3_TLE_BUCKET_SHORT = 1
@@ -514,6 +544,64 @@ def _virtual_to_cache(
     return page_block_index * block_size + page_offset
 
 
+@triton.jit
+def _paged_blockwise_cache_indices(
+    n_start,
+    offsets,
+    max_virtual_index,
+    page_table_ptr,
+    block_size: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    PAGED_GATHER_MODE: tl.constexpr,
+    BOUNDARY_CHECK: tl.constexpr = True,
+):
+    logical_idx = n_start + offsets
+    if (
+        PAGED_GATHER_MODE == _FA3_TLE_PAGED_GATHER_LEGACY
+        or (block_size != 16 and block_size != 32)
+    ):
+        return _virtual_to_cache(
+            logical_idx,
+            max_virtual_index,
+            page_table_ptr,
+            block_size,
+            BOUNDARY_CHECK=BOUNDARY_CHECK,
+        )
+
+    cache_idx = logical_idx.to(tl.int32)
+    if block_size == 16:
+        for page_base in tl.static_range(0, BLOCK_N, 16):
+            first_idx = n_start + page_base
+            page_idx = first_idx // 16
+            if BOUNDARY_CHECK:
+                page_block = tl.load(
+                    page_table_ptr + page_idx,
+                    mask=first_idx < max_virtual_index,
+                    other=0,
+                ).to(tl.int32)
+            else:
+                page_block = tl.load(page_table_ptr + page_idx).to(tl.int32)
+            in_page = (offsets >= page_base) & (offsets < page_base + 16)
+            candidate = page_block * 16 + (logical_idx % 16)
+            cache_idx = tl.where(in_page, candidate, cache_idx)
+    else:
+        for page_base in tl.static_range(0, BLOCK_N, 32):
+            first_idx = n_start + page_base
+            page_idx = first_idx // 32
+            if BOUNDARY_CHECK:
+                page_block = tl.load(
+                    page_table_ptr + page_idx,
+                    mask=first_idx < max_virtual_index,
+                    other=0,
+                ).to(tl.int32)
+            else:
+                page_block = tl.load(page_table_ptr + page_idx).to(tl.int32)
+            in_page = (offsets >= page_base) & (offsets < page_base + 32)
+            candidate = page_block * 32 + (logical_idx % 32)
+            cache_idx = tl.where(in_page, candidate, cache_idx)
+    return cache_idx
+
+
 def _heur_block_k(args):
     return triton.next_power_of_2(args["d"])
 
@@ -558,28 +646,23 @@ def _copy_paged_kv_tile_to_smem(
     block_size: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM_PADDED: tl.constexpr,
+    PAGED_GATHER_MODE: tl.constexpr = _FA3_TLE_PAGED_GATHER_AUTO,
 ):
     for row_base in tl.static_range(0, BLOCK_N, 32):
-        rows = row_base + tl.arange(0, 32)
+        row_offsets = tl.arange(0, 32)
+        rows = row_base + row_offsets
         logical_idx = n_offset + rows
         row_valid = logical_idx < k_len
-        if block_size % 32 == 0:
-            first_idx = n_offset + row_base
-            page_idx = first_idx // block_size
-            page_block = tl.load(
-                page_table_ptr_b + page_idx,
-                mask=first_idx < k_len,
-                other=0,
-            ).to(tl.int32)
-            cache_idx = page_block * block_size + (logical_idx % block_size)
-        else:
-            cache_idx = _virtual_to_cache(
-                logical_idx,
-                k_len,
-                page_table_ptr_b,
-                block_size,
-                BOUNDARY_CHECK=True,
-            )
+        cache_idx = _paged_blockwise_cache_indices(
+            n_offset + row_base,
+            row_offsets,
+            k_len,
+            page_table_ptr_b,
+            block_size,
+            32,
+            PAGED_GATHER_MODE,
+            BOUNDARY_CHECK=True,
+        )
 
         for col_base in tl.static_range(0, HEAD_DIM_PADDED, 32):
             cols = col_base + tl.arange(0, 32)
@@ -612,28 +695,23 @@ def _copy_paged_kv_tile_to_smem_sync_safe(
     block_size: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM_PADDED: tl.constexpr,
+    PAGED_GATHER_MODE: tl.constexpr = _FA3_TLE_PAGED_GATHER_AUTO,
 ):
     for row_base in tl.static_range(0, BLOCK_N, 32):
-        rows = row_base + tl.arange(0, 32)
+        row_offsets = tl.arange(0, 32)
+        rows = row_base + row_offsets
         logical_idx = n_offset + rows
         row_valid = logical_idx < k_len
-        if block_size % 32 == 0:
-            first_idx = n_offset + row_base
-            page_idx = first_idx // block_size
-            page_block = tl.load(
-                page_table_ptr_b + page_idx,
-                mask=first_idx < k_len,
-                other=0,
-            ).to(tl.int32)
-            cache_idx = page_block * block_size + (logical_idx % block_size)
-        else:
-            cache_idx = _virtual_to_cache(
-                logical_idx,
-                k_len,
-                page_table_ptr_b,
-                block_size,
-                BOUNDARY_CHECK=True,
-            )
+        cache_idx = _paged_blockwise_cache_indices(
+            n_offset + row_base,
+            row_offsets,
+            k_len,
+            page_table_ptr_b,
+            block_size,
+            32,
+            PAGED_GATHER_MODE,
+            BOUNDARY_CHECK=True,
+        )
 
         for col_base in tl.static_range(0, HEAD_DIM_PADDED, 32):
             cols = col_base + tl.arange(0, 32)

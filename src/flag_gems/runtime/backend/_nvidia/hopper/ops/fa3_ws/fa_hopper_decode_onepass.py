@@ -192,6 +192,7 @@ def flash_varlen_fwd_v3_tle_decode_onepass_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     DECODE_SHAPE_BUCKET: tl.constexpr,
+    PAGED_GATHER_MODE: tl.constexpr = _FA3_TLE_PAGED_GATHER_AUTO,
 ):
     q_row = tl.program_id(0)
     bid = tl.program_id(1)
@@ -259,11 +260,14 @@ def flash_varlen_fwd_v3_tle_decode_onepass_kernel(
         for n_start in tl.range(0, k_len, BLOCK_N, num_stages=3):
             col_idx = n_start + n_idx
             if is_paged:
-                cache_idx = _virtual_to_cache(
-                    col_idx,
+                cache_idx = _paged_blockwise_cache_indices(
+                    n_start,
+                    n_idx,
                     k_len,
                     page_table_ptr_b,
                     block_size,
+                    BLOCK_N,
+                    PAGED_GATHER_MODE,
                     BOUNDARY_CHECK=True,
                 )
             else:

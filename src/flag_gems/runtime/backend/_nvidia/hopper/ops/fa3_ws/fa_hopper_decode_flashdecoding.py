@@ -78,16 +78,20 @@ def _decode_flashdecoding_visit_block(
     acc,
     BLOCK_N: tl.constexpr,
     HEAD_DIM_PADDED: tl.constexpr,
+    PAGED_GATHER_MODE: tl.constexpr,
 ):
     d_idx = tl.arange(0, HEAD_DIM_PADDED)
     n_idx = tl.arange(0, BLOCK_N)
     col_idx = n_block * BLOCK_N + n_idx
     if is_paged:
-        cache_idx = _virtual_to_cache(
-            col_idx,
+        cache_idx = _paged_blockwise_cache_indices(
+            n_block * BLOCK_N,
+            n_idx,
             k_len,
             page_table_ptr_b,
             block_size,
+            BLOCK_N,
+            PAGED_GATHER_MODE,
             BOUNDARY_CHECK=True,
         )
     else:
@@ -245,6 +249,7 @@ def flash_varlen_fwd_v3_tle_decode_flashdecoding_kernel(
     BLOCK_K: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     SPLIT_POLICY: tl.constexpr,
+    PAGED_GATHER_MODE: tl.constexpr = _FA3_TLE_PAGED_GATHER_AUTO,
 ):
     q_row = tl.program_id(0)
     bid = tl.program_id(1)
@@ -349,6 +354,7 @@ def flash_varlen_fwd_v3_tle_decode_flashdecoding_kernel(
                         acc,
                         BLOCK_N,
                         HEAD_DIM_PADDED,
+                        PAGED_GATHER_MODE,
                     )
         else:
             if split_id < n_blocks:
@@ -386,6 +392,7 @@ def flash_varlen_fwd_v3_tle_decode_flashdecoding_kernel(
                         acc,
                         BLOCK_N,
                         HEAD_DIM_PADDED,
+                        PAGED_GATHER_MODE,
                     )
 
         partial_row = lse_offset + q_row

@@ -117,6 +117,7 @@ def flash_varlen_fwd_v3_tle_kernel(
     FORCE_FAMILY_ID: tl.constexpr,
     MIN_Q_LEN_TO_PROCESS: tl.constexpr,
     MAX_Q_LEN_TO_PROCESS: tl.constexpr,
+    PAGED_GATHER_MODE: tl.constexpr = _FA3_TLE_PAGED_GATHER_AUTO,
 ):
     BM_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
     HEAD_DIM_PADDED: tl.constexpr = BLOCK_K
@@ -347,6 +348,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                                 block_size,
                                 BLOCK_N,
                                 HEAD_DIM_PADDED,
+                                PAGED_GATHER_MODE,
                             )
                             _fence_async_shared_cta()
                             tle.gpu.barrier_arrive(
@@ -417,6 +419,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                                 block_size,
                                 BLOCK_N,
                                 HEAD_DIM_PADDED,
+                                PAGED_GATHER_MODE,
                             )
                             _fence_async_shared_cta()
                             tle.gpu.barrier_arrive(
@@ -469,6 +472,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                                     block_size,
                                     BLOCK_N,
                                     HEAD_DIM_PADDED,
+                                    PAGED_GATHER_MODE,
                                 )
                                 _fence_async_shared_cta()
                                 tle.gpu.barrier_arrive(
@@ -513,6 +517,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                                     block_size,
                                     BLOCK_N,
                                     HEAD_DIM_PADDED,
+                                    PAGED_GATHER_MODE,
                                 )
                                 _fence_async_shared_cta()
                                 tle.gpu.barrier_arrive(
