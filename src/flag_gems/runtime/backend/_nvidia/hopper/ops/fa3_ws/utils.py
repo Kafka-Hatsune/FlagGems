@@ -598,6 +598,8 @@ def _copy_paged_kv_tile_to_smem(
             tl.store(smem_ptrs, vals)
 
 
+# Debug-only variant. Do not use it in default WS paged paths: the extra
+# arithmetic on loaded values has triggered runtime hangs in nonpersistent WS.
 @triton.jit
 def _copy_paged_kv_tile_to_smem_sync_safe(
     src_base,
