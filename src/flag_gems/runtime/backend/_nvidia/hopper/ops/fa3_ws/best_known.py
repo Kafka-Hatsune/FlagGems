@@ -26,7 +26,7 @@ class FA3BestRoute:
 
 
 def fa3_tle_best_route_mode() -> str:
-    value = os.getenv("FLAG_GEMS_FA3_TLE_BEST_ROUTE", "auto").strip().lower()
+    value = os.getenv("FLAG_GEMS_FA3_TLE_BEST_ROUTE", "fa3_only").strip().lower()
     if value not in _BEST_ROUTE_MODES:
         raise RuntimeError(
             "invalid FLAG_GEMS_FA3_TLE_BEST_ROUTE="

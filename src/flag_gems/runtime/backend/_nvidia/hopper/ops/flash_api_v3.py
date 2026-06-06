@@ -14,29 +14,28 @@ import torch
 import triton
 
 import flag_gems
-from flag_gems.ops.flash_api import fwd_params, mha_varlan_fwd as _mha_varlan_fwd_fa2
+from flag_gems.ops.flash_api import fwd_params
 from flag_gems.runtime import torch_device_fn
 
 from .flash_kernel_v3 import (
     TLE_FA3_AVAILABLE,
-    fa3_tle_decode_strategy,
-    fa3_tle_force_family_id,
-    fa3_tle_mixed_long_plan,
     fa3_tle_paged_gather_mode,
     fa3_tle_paged_gather_name,
-    fa3_tle_select_plan,
-    fa3_tle_small_strategy,
-    fa3_tle_ws_strategy,
     flash_varlen_fwd_v3_tle_direct_kernel,
     flash_varlen_fwd_v3_tle_decode_flashdecoding_combine_kernel,
     flash_varlen_fwd_v3_tle_decode_flashdecoding_kernel,
     flash_varlen_fwd_v3_tle_kernel,
     flash_varlen_fwd_v3_tle_short_kernel,
-    flash_varlen_fwd_v3_tle_splitkv_combine_kernel,
-    flash_varlen_fwd_v3_tle_splitkv_kernel,
-    flash_varlen_fwd_v3_tle_ws_short_kernel,
-    flash_varlen_fwd_v3_tle_ws_simple_kernel,
-    select_fa3_best_route,
+    fa3_tle_metadata_dispatch,
+)
+from .fa3_ws.utils import (
+    _FA3_TLE_BUCKET_DIRECT_DECODE,
+    _FA3_TLE_BUCKET_DIRECT_PAGED_DECODE,
+    _FA3_TLE_BUCKET_LONG,
+    _FA3_TLE_BUCKET_PAGED_MEDIUM,
+    _FA3_TLE_BUCKET_PAGED_SMALL,
+    _FA3_TLE_BUCKET_SHORT,
+    _FA3_TLE_FAMILY_AUTO,
 )
 
 logger = logging.getLogger(__name__)
@@ -195,6 +194,8 @@ def mha_varlan_fwd_v3(
     softcap,
     return_softmax,
     gen,
+    scheduler_metadata=None,
+    num_splits=0,
 ):
     _check_device(q)
     _check_device(k)
@@ -202,6 +203,9 @@ def mha_varlan_fwd_v3(
     q_device = q.device
     max_seqlen_q = int(max_seqlen_q)
     max_seqlen_k = int(max_seqlen_k)
+    num_splits = int(num_splits or 0)
+    if num_splits < 0:
+        raise RuntimeError("TLE FA3 requires num_splits >= 0.")
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
 
@@ -242,6 +246,11 @@ def mha_varlan_fwd_v3(
         raise RuntimeError("cu_seqlens_k must have shape (batch_size + 1,).")
     if seqused_k is not None and seqused_k.size() != (batch_size,):
         raise RuntimeError("seqused_k must have shape (batch_size,).")
+    if scheduler_metadata is not None:
+        if scheduler_metadata.dtype != torch.int32 or not scheduler_metadata.is_contiguous():
+            raise RuntimeError("scheduler_metadata must be contiguous int32 when provided.")
+        if scheduler_metadata.device != q_device:
+            raise RuntimeError("scheduler_metadata must be on the same device as q.")
     if num_heads % num_heads_k != 0:
         raise RuntimeError("TLE FA3 requires num_heads % num_heads_k == 0.")
 
@@ -255,45 +264,7 @@ def mha_varlan_fwd_v3(
         window_size_right = -1
     is_local = window_size_left >= 0
 
-    force_family_id = fa3_tle_force_family_id()
-    best_route = select_fa3_best_route(
-        total_q=total_q,
-        batch_size=batch_size,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        is_paged=is_paged,
-        force_family_id=force_family_id,
-    )
-    if os.getenv("FLAG_GEMS_FA3_TLE_LOG_PLAN") == "1":
-        print(
-            "FLAG_GEMS_FA3_TLE_PLAN "
-            f"route={best_route.route} workload={best_route.workload} "
-            f"reason={best_route.reason}"
-        )
-    if best_route.route == "fa2_fallback":
-        return _mha_varlan_fwd_fa2(
-            q,
-            k,
-            v,
-            out,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            seqused_k,
-            leftpad_k,
-            page_table if is_paged else None,
-            alibi_slopes,
-            max_seqlen_q,
-            max_seqlen_k,
-            p_dropout,
-            softmax_scale,
-            zero_tensors,
-            is_causal,
-            window_size_left,
-            window_size_right,
-            softcap,
-            return_softmax,
-            gen,
-        )
+    metadata_max_query_len = max_seqlen_q
 
     seqlenq_ngroups_swapped = (
         max_seqlen_q == 1
@@ -446,283 +417,153 @@ def mha_varlan_fwd_v3(
         _ensure_tma_allocator()
         num_sms = torch.cuda.get_device_properties(q_device).multi_processor_count
         args = tuple(getattr(params, k) for k in params.__slots__)
-        decode_strategy = fa3_tle_decode_strategy()
-        small_strategy = fa3_tle_small_strategy()
-        ws_strategy = fa3_tle_ws_strategy()
         paged_gather_mode = fa3_tle_paged_gather_mode()
-        plan = fa3_tle_select_plan(
-            total_q=total_q,
-            batch_size=batch_size,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            head_dim=head_size,
+        dispatch = fa3_tle_metadata_dispatch(
+            max_query_len=metadata_max_query_len,
             is_paged=is_paged,
-            force_family_id=force_family_id,
-            num_heads=num_heads,
-            decode_strategy=decode_strategy,
-            small_strategy=small_strategy,
-            ws_strategy=ws_strategy,
-            num_sms=num_sms,
+            has_cache_kv=seqused_k is not None,
+            num_splits=num_splits,
+            has_scheduler_metadata=scheduler_metadata is not None,
         )
 
-        def _run_plan(run_plan):
-            uses_tma = run_plan.family in (
-                "long",
-                "mixed_long",
-                "short",
-                "ws_short",
-                "splitkv",
-                "mixed",
-                "serve",
-                "paged_serve",
-            )
-            if run_plan.family == "ws_short" and not _ws_short_tma_strides_are_aligned(
-                q, k, v, out, is_paged
+        def _require_tma_aligned():
+            if (
+                not _tma_strides_are_aligned(q)
+                or not _tma_strides_are_aligned(out)
+                or (not is_paged and not _tma_strides_are_aligned(k))
+                or (not is_paged and not _tma_strides_are_aligned(v))
             ):
-                if run_plan.force_family_id == -1:
-                    fallback_plan = fa3_tle_select_plan(
-                        total_q=total_q,
-                        batch_size=batch_size,
-                        max_seqlen_q=max_seqlen_q,
-                        max_seqlen_k=max_seqlen_k,
-                        head_dim=head_size,
-                        is_paged=is_paged,
-                        force_family_id=force_family_id,
-                        num_heads=num_heads,
-                        decode_strategy=decode_strategy,
-                        small_strategy="direct",
-                        ws_strategy="legacy",
-                        num_sms=num_sms,
-                    )
-                    return _run_plan(fallback_plan)
                 raise RuntimeError(
-                    "TLE FA3 ws_short requires 16-byte aligned Q/O strides "
-                    "and dense K/V strides."
+                    "TLE FA3 TMA-backed path requires 16-byte aligned Q/K/V/O strides."
                 )
-            if uses_tma:
-                if (
-                    not _tma_strides_are_aligned(q)
-                    or not _tma_strides_are_aligned(out)
-                    or (not is_paged and not _tma_strides_are_aligned(k))
-                    or (not is_paged and not _tma_strides_are_aligned(v))
-                ):
-                    raise RuntimeError(
-                        "TLE FA3 TMA-backed path requires 16-byte aligned Q/K/V/O strides."
-                    )
 
+        def _log_dispatch(kernel_name: str, splits: int = 1):
             logger.debug(
-                "kernel: flash_varlen_fwd_v3_tle family=%s bucket=%s kind=%s "
-                "strategy=%s splits=%s q_len=[%s,%s]",
-                run_plan.family,
-                run_plan.shape_bucket,
-                run_plan.direct_kind,
-                run_plan.decode_strategy,
-                run_plan.num_splits,
-                run_plan.min_q_len,
-                run_plan.max_q_len,
+                "kernel: flash_varlen_fwd_v3_tle kernel=%s layout=%s mode=%s splits=%s",
+                kernel_name,
+                dispatch.layout,
+                dispatch.mode,
+                splits,
             )
             if os.getenv("FLAG_GEMS_FA3_TLE_LOG_PLAN") == "1":
                 print(
                     "FLAG_GEMS_FA3_TLE_PLAN "
-                    f"family={run_plan.family} bucket={run_plan.shape_bucket} "
-                    f"kind={run_plan.direct_kind} strategy={run_plan.decode_strategy} "
-                    f"splits={run_plan.num_splits} paged_gather="
+                    f"layout={dispatch.layout} mode={dispatch.mode} "
+                    f"kernel={kernel_name} splits={splits} scheduler_metadata="
+                    f"{dispatch.has_scheduler_metadata} paged_gather="
                     f"{fa3_tle_paged_gather_name(paged_gather_mode)}"
                 )
-            if run_plan.family == "direct":
-                grid = lambda meta: (
-                    triton.cdiv(max_seqlen_q, meta["BLOCK_M"]),
-                    batch_size,
-                    num_heads,
-                )
-                flash_varlen_fwd_v3_tle_direct_kernel[grid](
-                    *args,
-                    DIRECT_SHAPE_BUCKET=run_plan.shape_bucket,
-                    MIN_Q_LEN_TO_PROCESS=run_plan.min_q_len,
-                    MAX_Q_LEN_TO_PROCESS=run_plan.max_q_len,
-                    PAGED_GATHER_MODE=paged_gather_mode,
-                )
-            elif run_plan.family == "ws_short":
-                grid = lambda meta: (
-                    triton.cdiv(max_seqlen_q, meta["BLOCK_M"]),
-                    batch_size,
-                    num_heads,
-                )
-                flash_varlen_fwd_v3_tle_ws_short_kernel[grid](
-                    *args,
-                    WS_SHORT_SHAPE_BUCKET=run_plan.shape_bucket,
-                    MIN_Q_LEN_TO_PROCESS=run_plan.min_q_len,
-                    MAX_Q_LEN_TO_PROCESS=run_plan.max_q_len,
-                    PAGED_GATHER_MODE=paged_gather_mode,
-                    tle_wgmma_pipeline_mode="user_promise",
-                )
-            elif run_plan.family == "ws_simple":
-                grid = lambda meta: (
-                    min(
-                        num_sms,
-                        triton.cdiv(max_seqlen_q, meta["BLOCK_M"])
-                        * batch_size
-                        * num_heads,
-                    ),
-                )
-                flash_varlen_fwd_v3_tle_ws_simple_kernel[grid](
-                    *args,
-                    SHAPE_BUCKET=run_plan.shape_bucket,
-                    FORCE_FAMILY_ID=run_plan.force_family_id,
-                    MIN_Q_LEN_TO_PROCESS=run_plan.min_q_len,
-                    MAX_Q_LEN_TO_PROCESS=run_plan.max_q_len,
-                    PAGED_GATHER_MODE=paged_gather_mode,
-                    tle_wgmma_pipeline_mode="user_promise",
-                )
-            elif run_plan.family in (
-                "short",
-                "mixed",
-                "serve",
-                "paged_serve",
-            ):
-                grid = lambda meta: (
-                    triton.cdiv(max_seqlen_q, meta["BLOCK_M"]),
-                    batch_size,
-                    num_heads,
-                )
-                flash_varlen_fwd_v3_tle_short_kernel[grid](
-                    *args,
-                    SHORT_SHAPE_BUCKET=run_plan.shape_bucket,
-                    MIN_Q_LEN_TO_PROCESS=run_plan.min_q_len,
-                    MAX_Q_LEN_TO_PROCESS=run_plan.max_q_len,
-                    PAGED_GATHER_MODE=paged_gather_mode,
-                )
-            elif run_plan.family == "splitkv":
-                num_splits = run_plan.num_splits
-                partial_out = torch.empty(
-                    (num_splits, num_heads, total_q, head_size),
-                    dtype=torch.float32,
-                    device=q_device,
-                )
-                partial_m = torch.empty(
-                    (num_splits, num_heads, total_q),
-                    dtype=torch.float32,
-                    device=q_device,
-                )
-                partial_l = torch.empty_like(partial_m)
-                split_grid = lambda meta: (
-                    triton.cdiv(max_seqlen_q, meta["BLOCK_M"]),
-                    batch_size,
-                    num_heads * num_splits,
-                )
-                flash_varlen_fwd_v3_tle_splitkv_kernel[split_grid](
-                    *args,
-                    partial_out,
-                    partial_m,
-                    partial_l,
-                    NUM_SPLITS=num_splits,
-                    PAGED_GATHER_MODE=paged_gather_mode,
-                )
-                combine_block_m = 32
-                combine_grid = (
-                    triton.cdiv(max_seqlen_q, combine_block_m),
-                    batch_size,
-                    num_heads,
-                )
-                flash_varlen_fwd_v3_tle_splitkv_combine_kernel[combine_grid](
-                    out,
-                    lse,
-                    partial_out,
-                    partial_m,
-                    partial_l,
-                    out.stride(-3),
-                    out.stride(-2),
-                    o_batch_stride,
-                    cu_seqlens_q is not None,
-                    cu_seqlens_q,
-                    batch_size,
-                    num_heads,
-                    max_seqlen_q,
-                    head_size,
-                    total_q,
-                    adjusted_scale_softmax,
-                    adjusted_scale_softmax_log2e,
-                    BLOCK_M=combine_block_m,
-                    BLOCK_K=1 << (head_size - 1).bit_length(),
-                    NUM_SPLITS=num_splits,
-                )
-            elif run_plan.family == "flashdecoding":
-                num_splits = run_plan.num_splits
-                partial_out = torch.empty(
-                    (num_splits, num_heads, total_q, head_size),
-                    dtype=torch.float32,
-                    device=q_device,
-                )
-                partial_m = torch.empty(
-                    (num_splits, num_heads, total_q),
-                    dtype=torch.float32,
-                    device=q_device,
-                )
-                partial_l = torch.empty_like(partial_m)
-                split_grid = (max_seqlen_q, batch_size, num_heads * num_splits)
-                flash_varlen_fwd_v3_tle_decode_flashdecoding_kernel[split_grid](
-                    *args,
-                    partial_out,
-                    partial_m,
-                    partial_l,
-                    NUM_SPLITS=num_splits,
-                    SPLIT_POLICY=run_plan.split_policy,
-                    PAGED_GATHER_MODE=paged_gather_mode,
-                )
-                combine_block_m = 8
-                combine_grid = (
-                    triton.cdiv(max_seqlen_q, combine_block_m),
-                    batch_size,
-                    num_heads,
-                )
-                flash_varlen_fwd_v3_tle_decode_flashdecoding_combine_kernel[
-                    combine_grid
-                ](
-                    out,
-                    lse,
-                    partial_out,
-                    partial_m,
-                    partial_l,
-                    out.stride(-3),
-                    out.stride(-2),
-                    o_batch_stride,
-                    cu_seqlens_q is not None,
-                    cu_seqlens_q,
-                    batch_size,
-                    num_heads,
-                    max_seqlen_q,
-                    head_size,
-                    total_q,
-                    adjusted_scale_softmax,
-                    adjusted_scale_softmax_log2e,
-                    BLOCK_M=combine_block_m,
-                    BLOCK_K=1 << (head_size - 1).bit_length(),
-                    NUM_SPLITS=num_splits,
+
+        if dispatch.split_kv and dispatch.has_cache_kv:
+            _log_dispatch("flashdecoding", num_splits)
+            partial_out = torch.empty(
+                (num_splits, num_heads, total_q, head_size),
+                dtype=torch.float32,
+                device=q_device,
+            )
+            partial_m = torch.empty(
+                (num_splits, num_heads, total_q),
+                dtype=torch.float32,
+                device=q_device,
+            )
+            partial_l = torch.empty_like(partial_m)
+            split_grid = (max_seqlen_q, batch_size, num_heads * num_splits)
+            flash_varlen_fwd_v3_tle_decode_flashdecoding_kernel[split_grid](
+                *args,
+                partial_out,
+                partial_m,
+                partial_l,
+                NUM_SPLITS=num_splits,
+                SPLIT_POLICY=0,
+                PAGED_GATHER_MODE=paged_gather_mode,
+            )
+            combine_block_m = 8
+            combine_grid = (
+                triton.cdiv(max_seqlen_q, combine_block_m),
+                batch_size,
+                num_heads,
+            )
+            flash_varlen_fwd_v3_tle_decode_flashdecoding_combine_kernel[combine_grid](
+                out,
+                lse,
+                partial_out,
+                partial_m,
+                partial_l,
+                out.stride(-3),
+                out.stride(-2),
+                o_batch_stride,
+                cu_seqlens_q is not None,
+                cu_seqlens_q,
+                batch_size,
+                num_heads,
+                max_seqlen_q,
+                head_size,
+                total_q,
+                adjusted_scale_softmax,
+                adjusted_scale_softmax_log2e,
+                BLOCK_M=combine_block_m,
+                BLOCK_K=1 << (head_size - 1).bit_length(),
+                NUM_SPLITS=num_splits,
+            )
+        elif dispatch.has_cache_kv:
+            _log_dispatch("direct")
+            grid = lambda meta: (
+                triton.cdiv(max_seqlen_q, meta["BLOCK_M"]),
+                batch_size,
+                num_heads,
+            )
+            flash_varlen_fwd_v3_tle_direct_kernel[grid](
+                *args,
+                DIRECT_SHAPE_BUCKET=_FA3_TLE_BUCKET_DIRECT_PAGED_DECODE
+                if is_paged
+                else _FA3_TLE_BUCKET_DIRECT_DECODE,
+                MIN_Q_LEN_TO_PROCESS=0,
+                MAX_Q_LEN_TO_PROCESS=2**31 - 1,
+                PAGED_GATHER_MODE=paged_gather_mode,
+            )
+        elif max_seqlen_q <= 128 or total_q / max(batch_size, 1) <= 64:
+            _require_tma_aligned()
+            _log_dispatch("short")
+            if is_paged and max_seqlen_q <= 512 and max_seqlen_k <= 1024:
+                short_bucket = (
+                    _FA3_TLE_BUCKET_PAGED_SMALL
+                    if max_seqlen_q <= 128
+                    else _FA3_TLE_BUCKET_PAGED_MEDIUM
                 )
             else:
-                grid = lambda meta: (
-                    min(
-                        num_sms,
-                        triton.cdiv(max_seqlen_q, meta["BLOCK_M"])
-                        * batch_size
-                        * num_heads,
-                    ),
-                )
-                flash_varlen_fwd_v3_tle_kernel[grid](
-                    *args,
-                    SHAPE_BUCKET=run_plan.shape_bucket,
-                    FORCE_FAMILY_ID=run_plan.force_family_id,
-                    MIN_Q_LEN_TO_PROCESS=run_plan.min_q_len,
-                    MAX_Q_LEN_TO_PROCESS=run_plan.max_q_len,
-                    PAGED_GATHER_MODE=paged_gather_mode,
-                    tle_wgmma_pipeline_mode="user_promise",
-                )
-
-        if plan.family in ("mixed", "serve", "paged_serve"):
-            _run_plan(fa3_tle_mixed_long_plan(force_family_id))
-            _run_plan(plan)
+                short_bucket = _FA3_TLE_BUCKET_SHORT
+            grid = lambda meta: (
+                triton.cdiv(max_seqlen_q, meta["BLOCK_M"]),
+                batch_size,
+                num_heads,
+            )
+            flash_varlen_fwd_v3_tle_short_kernel[grid](
+                *args,
+                SHORT_SHAPE_BUCKET=short_bucket,
+                MIN_Q_LEN_TO_PROCESS=0,
+                MAX_Q_LEN_TO_PROCESS=2**31 - 1,
+                PAGED_GATHER_MODE=paged_gather_mode,
+            )
         else:
-            _run_plan(plan)
+            _require_tma_aligned()
+            _log_dispatch("long")
+            grid = lambda meta: (
+                min(
+                    num_sms,
+                    triton.cdiv(max_seqlen_q, meta["BLOCK_M"])
+                    * batch_size
+                    * num_heads,
+                ),
+            )
+            flash_varlen_fwd_v3_tle_kernel[grid](
+                *args,
+                SHAPE_BUCKET=_FA3_TLE_BUCKET_LONG,
+                FORCE_FAMILY_ID=_FA3_TLE_FAMILY_AUTO,
+                MIN_Q_LEN_TO_PROCESS=0,
+                MAX_Q_LEN_TO_PROCESS=2**31 - 1,
+                PAGED_GATHER_MODE=paged_gather_mode,
+                tle_wgmma_pipeline_mode="user_promise",
+            )
 
         if seqlenq_ngroups_swapped:
             out = out.reshape(
