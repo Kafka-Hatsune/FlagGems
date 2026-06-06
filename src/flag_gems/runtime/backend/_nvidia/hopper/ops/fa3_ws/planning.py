@@ -13,6 +13,7 @@ class FA3MetadataDispatch:
     split_kv: bool
     requested_num_splits: int
     has_scheduler_metadata: bool
+    metadata_source: str = "none"
 
     @property
     def layout(self) -> str:
@@ -26,22 +27,27 @@ def fa3_tle_metadata_dispatch(
     has_cache_kv: bool,
     num_splits: int,
     has_scheduler_metadata: bool = False,
+    metadata_source: str = "none",
 ) -> FA3MetadataDispatch:
-    if max_query_len <= 1 and has_cache_kv:
-        mode = "normal_decode"
-    elif max_query_len > 1 and has_cache_kv:
-        mode = "multi_token_decode"
-    else:
-        mode = "prefill"
-
     requested_num_splits = max(0, int(num_splits or 0))
+    split_kv = has_cache_kv and requested_num_splits > 1
+    if not has_cache_kv:
+        mode = "prefill"
+    elif split_kv:
+        mode = "splitkv_decode"
+    elif max_query_len <= 1:
+        mode = "direct_decode"
+    else:
+        mode = "multi_token_decode"
+
     return FA3MetadataDispatch(
         is_paged=is_paged,
         has_cache_kv=has_cache_kv,
         mode=mode,
-        split_kv=requested_num_splits > 1,
+        split_kv=split_kv,
         requested_num_splits=requested_num_splits,
         has_scheduler_metadata=has_scheduler_metadata,
+        metadata_source=metadata_source,
     )
 
 

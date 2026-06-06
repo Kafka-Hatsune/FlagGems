@@ -265,6 +265,8 @@ def mha_varlan_fwd_v3(
     is_local = window_size_left >= 0
 
     metadata_max_query_len = max_seqlen_q
+    metadata_num_heads = num_heads
+    metadata_cu_seqlens_q = cu_seqlens_q
 
     seqlenq_ngroups_swapped = (
         max_seqlen_q == 1
@@ -328,6 +330,47 @@ def mha_varlan_fwd_v3(
         adjusted_softcap = 0.0
         adjusted_scale_softmax = softmax_scale
         adjusted_scale_softmax_log2e = softmax_scale * 1.4426950408889634
+
+    def _metadata_max_num_splits(metadata) -> int:
+        if metadata is None or metadata.numel() <= 1:
+            return 1
+        dynamic = metadata[1 : 1 + batch_size]
+        if dynamic.numel() == 0:
+            return 1
+        return max(1, int(dynamic.max().item()))
+
+    scheduler_metadata_source = "none"
+    effective_num_splits = max(0, int(num_splits or 0))
+    if seqused_k is not None:
+        if scheduler_metadata is not None:
+            scheduler_metadata_source = "explicit_metadata"
+            if effective_num_splits <= 0:
+                effective_num_splits = _metadata_max_num_splits(scheduler_metadata)
+        elif effective_num_splits <= 0:
+            scheduler_metadata = flag_gems.get_scheduler_metadata(
+                batch_size=batch_size,
+                max_seqlen_q=metadata_max_query_len,
+                max_seqlen_k=max_seqlen_k,
+                num_heads=metadata_num_heads,
+                num_heads_k=num_heads_k,
+                headdim=head_size,
+                headdim_v=head_size,
+                qkv_dtype=q.dtype,
+                seqused_k=seqused_k,
+                cu_seqlens_q=metadata_cu_seqlens_q,
+                cu_seqlens_k=None,
+                page_size=block_size if is_paged else None,
+                is_causal=is_causal,
+                window_size_left=window_size_left,
+                window_size_right=window_size_right,
+                has_softcap=is_softcap,
+                num_splits=0,
+            )
+            scheduler_metadata_source = "auto_metadata"
+            effective_num_splits = _metadata_max_num_splits(scheduler_metadata)
+        else:
+            scheduler_metadata_source = "explicit_num_splits"
+    effective_num_splits = max(1, effective_num_splits)
 
     head_size_rounded = _round_multiple(head_size, 32) if head_size <= 192 else 256
     seqlen_q_rounded = _round_multiple(max_seqlen_q, 128)
@@ -422,8 +465,9 @@ def mha_varlan_fwd_v3(
             max_query_len=metadata_max_query_len,
             is_paged=is_paged,
             has_cache_kv=seqused_k is not None,
-            num_splits=num_splits,
+            num_splits=effective_num_splits,
             has_scheduler_metadata=scheduler_metadata is not None,
+            metadata_source=scheduler_metadata_source,
         )
 
         def _require_tma_aligned():
@@ -450,31 +494,34 @@ def mha_varlan_fwd_v3(
                     "FLAG_GEMS_FA3_TLE_PLAN "
                     f"layout={dispatch.layout} mode={dispatch.mode} "
                     f"kernel={kernel_name} splits={splits} scheduler_metadata="
-                    f"{dispatch.has_scheduler_metadata} paged_gather="
+                    f"{dispatch.has_scheduler_metadata} metadata_source="
+                    f"{dispatch.metadata_source} paged_gather="
                     f"{fa3_tle_paged_gather_name(paged_gather_mode)}"
                 )
 
         if dispatch.split_kv and dispatch.has_cache_kv:
-            _log_dispatch("flashdecoding", num_splits)
+            _log_dispatch("flashdecoding", effective_num_splits)
             partial_out = torch.empty(
-                (num_splits, num_heads, total_q, head_size),
+                (effective_num_splits, num_heads, total_q, head_size),
                 dtype=torch.float32,
                 device=q_device,
             )
             partial_m = torch.empty(
-                (num_splits, num_heads, total_q),
+                (effective_num_splits, num_heads, total_q),
                 dtype=torch.float32,
                 device=q_device,
             )
             partial_l = torch.empty_like(partial_m)
-            split_grid = (max_seqlen_q, batch_size, num_heads * num_splits)
+            split_grid = (max_seqlen_q, batch_size, num_heads * effective_num_splits)
             flash_varlen_fwd_v3_tle_decode_flashdecoding_kernel[split_grid](
                 *args,
                 partial_out,
                 partial_m,
                 partial_l,
-                NUM_SPLITS=num_splits,
+                scheduler_metadata if scheduler_metadata is not None else page_table,
+                NUM_SPLITS=effective_num_splits,
                 SPLIT_POLICY=0,
+                HAS_SCHEDULER_METADATA=scheduler_metadata is not None,
                 PAGED_GATHER_MODE=paged_gather_mode,
             )
             combine_block_m = 8
@@ -503,7 +550,7 @@ def mha_varlan_fwd_v3(
                 adjusted_scale_softmax_log2e,
                 BLOCK_M=combine_block_m,
                 BLOCK_K=1 << (head_size - 1).bit_length(),
-                NUM_SPLITS=num_splits,
+                NUM_SPLITS=effective_num_splits,
             )
         elif dispatch.has_cache_kv:
             _log_dispatch("direct")

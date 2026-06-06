@@ -245,10 +245,12 @@ def flash_varlen_fwd_v3_tle_decode_flashdecoding_kernel(
     partial_out_ptr,
     partial_m_ptr,
     partial_l_ptr,
+    scheduler_metadata_ptr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     SPLIT_POLICY: tl.constexpr,
+    HAS_SCHEDULER_METADATA: tl.constexpr,
     PAGED_GATHER_MODE: tl.constexpr = 2,
 ):
     q_row = tl.program_id(0)
@@ -281,6 +283,11 @@ def flash_varlen_fwd_v3_tle_decode_flashdecoding_kernel(
         k_len = tl.load(seqused_k_ptr + bid).to(tl.int32)
     else:
         k_len = k_len_cache
+
+    split_count = NUM_SPLITS
+    if HAS_SCHEDULER_METADATA:
+        split_count = tl.load(scheduler_metadata_ptr + 1 + bid).to(tl.int32)
+        split_count = tl.minimum(tl.maximum(split_count, 1), NUM_SPLITS)
 
     if q_row < q_len:
         d_idx = tl.arange(0, HEAD_DIM_PADDED)
@@ -315,11 +322,11 @@ def flash_varlen_fwd_v3_tle_decode_flashdecoding_kernel(
         acc = tl.zeros([HEAD_DIM_PADDED], dtype=tl.float32)
 
         if SPLIT_POLICY == 0:
-            blocks_per_split = tl.cdiv(n_blocks, NUM_SPLITS)
+            blocks_per_split = tl.cdiv(n_blocks, split_count)
             split_block_start = split_id * blocks_per_split
             split_block_end = tl.minimum(n_blocks, split_block_start + blocks_per_split)
 
-            if split_block_start < split_block_end:
+            if split_id < split_count and split_block_start < split_block_end:
                 for n_block in tl.range(
                     split_block_start,
                     split_block_end,
@@ -357,7 +364,7 @@ def flash_varlen_fwd_v3_tle_decode_flashdecoding_kernel(
                         PAGED_GATHER_MODE,
                     )
         else:
-            if split_id < n_blocks:
+            if split_id < split_count and split_id < n_blocks:
                 for n_block in tl.range(
                     split_id,
                     n_blocks,
