@@ -121,7 +121,7 @@ def flash_varlen_fwd_v3_tle_kernel(
 ):
     BM_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
     HEAD_DIM_PADDED: tl.constexpr = BLOCK_K
-    INPUT_DTYPE: tl.constexpr = q_ptr.dtype.element_ty
+    INPUT_DTYPE = q_ptr.dtype.element_ty
     THREADS_IN_MMA_GROUPS: tl.constexpr = NUM_MMA_WARPS * 32
 
     q_smem = tle.gpu.alloc(
