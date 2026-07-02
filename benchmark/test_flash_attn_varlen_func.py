@@ -34,12 +34,14 @@ def _vllm_benchmark_enabled(pytestconfig) -> bool:
     return bool(pytestconfig.getoption("flash_attn_varlen_enable_vllm"))
 
 
-def _skip_unless_vllm_benchmark_enabled(pytestconfig) -> None:
-    if not _vllm_benchmark_enabled(pytestconfig):
-        pytest.skip(
-            "vLLM flash-attention benchmark is disabled; pass "
-            "--flash-attn-varlen-enable-vllm to run it."
-        )
+def _selected_case(pytestconfig) -> str:
+    return pytestconfig.getoption("flash_attn_varlen_case")
+
+
+def _skip_unless_case_enabled(pytestconfig, case_name: str) -> None:
+    selected_case = _selected_case(pytestconfig)
+    if selected_case not in ("all", case_name):
+        pytest.skip(f"{case_name} is disabled by --flash-attn-varlen-case.")
 
 
 def _skip_unless_vllm_baseline_available() -> None:
@@ -52,29 +54,10 @@ def _skip_unless_vllm_baseline_available() -> None:
         pytest.skip("Torch version prior to 2.7 is not compatible with VLLM.")
 
 
-def _is_fa3_supported() -> bool:
-    try:
-        from flag_gems.runtime.backend._nvidia.hopper.ops.flash_api_v3 import (
-            is_fa3_supported,
-        )
-
-        return is_fa3_supported()
-    except Exception:
-        if flag_gems.device != "cuda" or not torch.cuda.is_available():
-            return False
-        return torch.cuda.get_device_capability()[0] >= 9
-
-
 def _skip_unless_selected_fa_supported(pytestconfig) -> None:
     fa_version = _selected_fa_version(pytestconfig)
     if fa_version == 3 and not is_hopper_fa3_supported():
         pytest.skip("FA3 requires CUDA Hopper with Triton FA3 support.")
-
-
-def _skip_unless_selected_hopper_fa3(pytestconfig) -> None:
-    if _selected_fa_version(pytestconfig) != 3:
-        pytest.skip("Hopper FA3 benchmark only runs with fa_version=3.")
-    _skip_unless_selected_fa_supported(pytestconfig)
 
 
 def _assert_flash_attn_varlen_uses_hopper_backend() -> None:
@@ -306,6 +289,23 @@ class FlashAttnVarlenBenchmark(base.Benchmark):
 def _hopper_fa3_gems_wrapper(
     tensors: HopperFA3Tensors, shape: HopperFA3Shape, fa_version: int
 ):
+    if fa_version == 2:
+        kwargs = {
+            "max_seqlen_q": tensors.max_seqlen_q,
+            "cu_seqlens_q": tensors.cu_seqlens_q,
+            "max_seqlen_k": tensors.max_seqlen_k,
+            "softmax_scale": shape.head_dim**-0.5,
+            "causal": shape.causal,
+            "fa_version": fa_version,
+        }
+        if shape.paged:
+            kwargs["seqused_k"] = tensors.seqused_k
+            kwargs["block_table"] = tensors.block_table
+        else:
+            kwargs["cu_seqlens_k"] = tensors.cu_seqlens_k
+        return flag_gems.ops.flash_attn_varlen_func(
+            tensors.q, tensors.k, tensors.v, **kwargs
+        )
     return run_hopper_fa3(tensors, shape, fa_version=fa_version)
 
 
@@ -321,6 +321,7 @@ class HopperFA3Benchmark(base.Benchmark):
         "name, seq_lens, num_query_heads, num_kv_heads, head_dim, causal, paged"
     )
     fa_version = 3
+    use_vllm_baseline = False
 
     def set_shapes(self, shape_file_path=None):
         self.shapes = hopper_fa3_benchmark_shapes()
@@ -330,7 +331,11 @@ class HopperFA3Benchmark(base.Benchmark):
         supported_shapes = []
         skipped_reasons = []
         for shape in self.shapes:
-            skip_reason = _hopper_benchmark_shape_skip_reason(shape)
+            skip_reason = (
+                _hopper_benchmark_shape_skip_reason(shape)
+                if self.use_vllm_baseline
+                else None
+            )
             if skip_reason:
                 skipped_reasons.append(f"{shape.name}: {skip_reason}")
                 continue
@@ -439,14 +444,14 @@ def flash_attn_varlen_legacy(*args, **kwargs):
 @pytest.mark.skipif(vendor_name == "cambricon", reason="#2886: TypeError")
 @pytest.mark.flash_attn_varlen_func
 def test_flash_attn_varlen_func(monkeypatch, pytestconfig):
+    _skip_unless_case_enabled(pytestconfig, "qwenCase")
     monkeypatch.setenv("VLLM_CONFIGURE_LOGGING", "0")
     fa_version = _selected_fa_version(pytestconfig)
-    if fa_version == 3 and not _is_fa3_supported():
-        pytest.skip("FA3 requires CUDA Hopper with Triton FA3 support.")
+    _skip_unless_selected_fa_supported(pytestconfig)
     if fa_version == 3:
         _assert_flash_attn_varlen_uses_hopper_backend()
 
-    use_vllm_baseline = fa_version != 3 or _vllm_benchmark_enabled(pytestconfig)
+    use_vllm_baseline = _vllm_benchmark_enabled(pytestconfig)
 
     if not use_vllm_baseline:
         flash_attn_varlen_func = flag_gems.flash_attn_varlen_func
@@ -481,17 +486,26 @@ def test_flash_attn_varlen_func(monkeypatch, pytestconfig):
 @pytest.mark.hopper_fa3
 @pytest.mark.flash_attn_varlen_func
 def test_flash_attn_varlen_func_hopper_fa3(pytestconfig):
-    _skip_unless_vllm_benchmark_enabled(pytestconfig)
-    _skip_unless_selected_hopper_fa3(pytestconfig)
-    if not HAS_VLLM_FA:
+    _skip_unless_case_enabled(pytestconfig, "prefillDecodePageCase")
+    _skip_unless_selected_fa_supported(pytestconfig)
+    use_vllm_baseline = _vllm_benchmark_enabled(pytestconfig)
+    if use_vllm_baseline and not HAS_VLLM_FA:
         pytest.skip("requires vLLM flash-attention as the benchmark baseline")
-    _assert_flash_attn_varlen_uses_hopper_backend()
     fa_version = _selected_fa_version(pytestconfig)
+    if fa_version == 3:
+        _assert_flash_attn_varlen_uses_hopper_backend()
     bench = HopperFA3Benchmark(
         op_name="hopper_fa3",
-        torch_op=_hopper_fa3_vllm_wrapper,
+        torch_op=(
+            _hopper_fa3_vllm_wrapper
+            if use_vllm_baseline
+            else _hopper_fa3_gems_wrapper
+        ),
         gems_op=_hopper_fa3_gems_wrapper,
         dtypes=[torch.float16, torch.bfloat16],
         fa_version=fa_version,
+        use_vllm_baseline=use_vllm_baseline,
     )
+    if not use_vllm_baseline:
+        bench.metrics = ["latency", "tflops"]
     bench.run()

@@ -154,6 +154,22 @@ def pytest_addoption(parser):
 
     try:
         parser.addoption(
+            "--flash-attn-varlen-case",
+            action="store",
+            default="all",
+            choices=["all", "qwenCase", "prefillDecodePageCase"],
+            help=(
+                "Select flash_attn_varlen_func benchmark cases. 'all' runs both "
+                "qwenCase and prefillDecodePageCase."
+            ),
+        )
+    except ValueError:
+        # Mixed test+benchmark pytest runs may already register this option in
+        # tests/conftest.py. Reuse the existing option in that case.
+        pass
+
+    try:
+        parser.addoption(
             "--hopper-mm-version",
             action="store",
             default="original",
