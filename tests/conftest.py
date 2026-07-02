@@ -70,6 +70,22 @@ def pytest_addoption(parser):
 
     try:
         parser.addoption(
+            "--flash-attn-varlen-enable-vllm",
+            action="store_true",
+            default=False,
+            help=(
+                "Enable vLLM flash-attention baseline benchmarks for "
+                "flash_attn_varlen_func. FA3 benchmarks run FlagGems-only by "
+                "default."
+            ),
+        )
+    except ValueError:
+        # Mixed test+benchmark pytest runs may already register this option in
+        # benchmark/conftest.py. Reuse the existing option in that case.
+        pass
+
+    try:
+        parser.addoption(
             "--hopper-mm-version",
             action="store",
             default="original",
