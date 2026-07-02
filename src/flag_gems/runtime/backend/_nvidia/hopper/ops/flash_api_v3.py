@@ -65,6 +65,32 @@ def _ensure_tma_allocator():
     _TMA_ALLOCATOR_REGISTERED = True
 
 
+def _auto_splitkv_from_metadata() -> bool:
+    return os.getenv("FLAG_GEMS_FA3_TLE_AUTO_SPLITKV") == "1"
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"invalid {name}={value!r}; expected an integer") from exc
+
+
+def _paged_prefill_route() -> str:
+    value = os.getenv("FLAG_GEMS_FA3_TLE_PAGED_PREFILL_ROUTE", "auto")
+    value = value.strip().lower()
+    allowed = {"auto", "direct", "long"}
+    if value not in allowed:
+        raise RuntimeError(
+            "invalid FLAG_GEMS_FA3_TLE_PAGED_PREFILL_ROUTE="
+            f"{value!r}; expected one of {', '.join(sorted(allowed))}"
+        )
+    return value
+
+
 def is_fa3_supported() -> bool:
     if not TLE_FA3_AVAILABLE:
         return False
@@ -341,11 +367,15 @@ def mha_varlan_fwd_v3(
 
     scheduler_metadata_source = "none"
     effective_num_splits = max(0, int(num_splits or 0))
+    auto_splitkv = _auto_splitkv_from_metadata()
     if seqused_k is not None:
         if scheduler_metadata is not None:
             scheduler_metadata_source = "explicit_metadata"
             if effective_num_splits <= 0:
-                effective_num_splits = _metadata_max_num_splits(scheduler_metadata)
+                metadata_num_splits = _metadata_max_num_splits(scheduler_metadata)
+                effective_num_splits = metadata_num_splits if auto_splitkv else 1
+                if not auto_splitkv:
+                    scheduler_metadata_source = "explicit_metadata_no_auto_split"
         elif effective_num_splits <= 0:
             scheduler_metadata = flag_gems.get_scheduler_metadata(
                 batch_size=batch_size,
@@ -366,8 +396,13 @@ def mha_varlan_fwd_v3(
                 has_softcap=is_softcap,
                 num_splits=0,
             )
-            scheduler_metadata_source = "auto_metadata"
-            effective_num_splits = _metadata_max_num_splits(scheduler_metadata)
+            metadata_num_splits = _metadata_max_num_splits(scheduler_metadata)
+            effective_num_splits = metadata_num_splits if auto_splitkv else 1
+            scheduler_metadata_source = (
+                "auto_metadata_split"
+                if auto_splitkv
+                else "auto_metadata_no_auto_split"
+            )
         else:
             scheduler_metadata_source = "explicit_num_splits"
     effective_num_splits = max(1, effective_num_splits)
@@ -469,6 +504,25 @@ def mha_varlan_fwd_v3(
             has_scheduler_metadata=scheduler_metadata is not None,
             metadata_source=scheduler_metadata_source,
         )
+        avg_query_len = total_q / max(batch_size, 1)
+        paged_prefill_route = _paged_prefill_route()
+        paged_prefill_candidate = (
+            dispatch.has_cache_kv
+            and is_paged
+            and not dispatch.split_kv
+            and metadata_max_query_len
+            >= _env_int("FLAG_GEMS_FA3_TLE_PAGED_PREFILL_MIN_Q", 1024)
+            and avg_query_len
+            >= _env_int("FLAG_GEMS_FA3_TLE_PAGED_PREFILL_MIN_AVG_Q", 128)
+        )
+        if paged_prefill_route == "direct":
+            paged_prefill_long = False
+        elif paged_prefill_route == "long":
+            paged_prefill_long = (
+                dispatch.has_cache_kv and is_paged and not dispatch.split_kv
+            )
+        else:
+            paged_prefill_long = paged_prefill_candidate
 
         def _require_tma_aligned():
             if (
@@ -552,7 +606,7 @@ def mha_varlan_fwd_v3(
                 BLOCK_K=1 << (head_size - 1).bit_length(),
                 NUM_SPLITS=effective_num_splits,
             )
-        elif dispatch.has_cache_kv:
+        elif dispatch.has_cache_kv and not paged_prefill_long:
             _log_dispatch("direct")
             grid = lambda meta: (
                 triton.cdiv(max_seqlen_q, meta["BLOCK_M"]),
@@ -593,7 +647,7 @@ def mha_varlan_fwd_v3(
             )
         else:
             _require_tma_aligned()
-            _log_dispatch("long")
+            _log_dispatch("long_paged_prefill" if paged_prefill_long else "long")
             grid = lambda meta: (
                 min(
                     num_sms,
@@ -609,7 +663,6 @@ def mha_varlan_fwd_v3(
                 MIN_Q_LEN_TO_PROCESS=0,
                 MAX_Q_LEN_TO_PROCESS=2**31 - 1,
                 PAGED_GATHER_MODE=paged_gather_mode,
-                tle_wgmma_pipeline_mode="user_promise",
             )
 
         if seqlenq_ngroups_swapped:

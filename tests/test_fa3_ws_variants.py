@@ -99,7 +99,6 @@ def test_fa3_ws_variant_smoke(monkeypatch, pytestconfig, variant_name):
     spec = get_variant(variant_name)
     _install_variant_kernel(spec)
     monkeypatch.setenv("FLAG_GEMS_FA3_TLE_FORCE_PATH", spec.force_path)
-    monkeypatch.setenv("TLE_WGMMA_PIPELINE_MODE", "user_promise")
     if spec.paged:
         monkeypatch.setenv("FLAG_GEMS_FA3_TLE_ALLOW_RISKY_PAGED_D128", "1")
         monkeypatch.setenv("FLAG_GEMS_FA3_TLE_ALLOW_RISKY_PAGED_SMALL", "1")
