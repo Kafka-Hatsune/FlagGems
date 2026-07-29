@@ -66,7 +66,8 @@ H100 的百分比直接当成 H800 结果。
 | `a4bdfb464` | compact KV stage/chunk 的精确 shared-memory alias 建模 | Membar 分析基础 |
 | `9f2abcc95` | 将精确 paged-pointer broadcast 降为 warp shuffle | 已测性能优化 |
 | `90815bacf` | WGMMA 已完成后的精确 release rendezvous 抑制 | 静态有效，运行时收益待复验 |
-| `67e44dfb4` | 将 full-carrier `active_n` 规范化为普通 WGMMA | 正值 config 与原 codegen 的兼容层 |
+| `ccb24424d` | 将 full-carrier active extent 规范化为普通 WGMMA | 正值 config 与原 codegen 的兼容层 |
+| `6d833c5dc` | 删除独立 TLE TTNG Op，以标准 `WarpGroupDotOp` 和私有属性承载 partial extent | 复用原生 WGMMA pass 生态 |
 
 ### FlagGems
 
@@ -85,7 +86,9 @@ FlagTree 746704102 ─> c814ab090 ─> 299095b61 ─> a4bdfb464 ─┐
 FlagTree 9f2abcc95 ────────────────────────────────────────┘
 
 FlagTree a4bdfb464 + completed-WGMMA analysis ─> 90815bacf
-FlagTree 746704102 ──> FlagTree 67e44dfb4 ──> positive full-N config
+FlagTree 746704102 ──> FlagTree ccb24424d ──> FlagTree 6d833c5dc
+                                                │
+                                                └─> standard WGMMA pass ecology
 
 FlagGems fd041383 ──> FlagGems f59f5485
 FlagGems dec24aa0 ──> benchmark / pre-tune coverage
@@ -95,7 +98,9 @@ FlagGems dec24aa0 ──> benchmark / pre-tune coverage
 `active_k=80`，因此不能脱离 `746704102`、`c814ab090`、
 `299095b61` 和 `a4bdfb464` 这组基础能力单独运行。
 `6d4cb101` 在此基础上把 QK 的 active extent 变为 config constexpr，
-并依赖 `746704102` 提供的通用 `active_n` verifier/lowering。
+并依赖 `746704102` 提供的通用 `active_n` verifier/lowering；在当前
+FlagTree HEAD 上，`6d833c5dc` 进一步把该 lowering 的 TTNG carrier 统一为
+标准 `WarpGroupDotOp`。
 
 ## 从输入 shape 到 kernel 的调用链
 
@@ -397,12 +402,23 @@ qk = tle.gpu.wgmma(
 
 FlagTree 的 TLE lowering 将
 `active_n == physical N carrier` 规范化为普通
-`ttng.warp_group_dot`；只有 `active_n < physical N carrier` 才生成
-`ttng.tle_warp_group_dot`。这把“config 中总是正值”和“full-N 必须保持旧
-codegen”分离开：FlagGems 不需要数字哨兵或四处重复 constexpr 分支，
-ordinary/decode 仍得到原来的同步分析和 PTX，compact N80 才进入 active-N
-lowering。编译器回归测试还覆盖 M128 full-N，避免统一接口被 active-N
-专用的 M64 约束误伤。
+`ttng.warp_group_dot` 且不附加属性；partial carrier 也使用同一个标准
+Op，只额外附加 `tle.wgmma_active_n` 或 `tle.wgmma_active_k` 私有属性。
+因此 TTNG 层不再定义 `ttng.tle_warp_group_dot`。这把“config 中总是正值”
+和“full-N 必须保持旧 codegen”分离开：FlagGems 不需要数字哨兵或四处重复
+constexpr 分支，ordinary/decode 仍得到原来的同步分析和 PTX；compact N80
+则由 NVIDIA-TLE WGMMA lowering 读取属性，生成 partial native opcode。
+编译器回归测试还覆盖 M128 full-N，避免统一接口被 active-N 专用的 M64
+约束误伤。
+
+标准 Op 方案的关键不在于简单改名，而是让 active extent 自动继承
+`WarpGroupDotOp` 已有的 memory effects、layout anchor、Membar、
+canonicalization、commit/wait pipeline 和 LLVM conversion pattern。唯一
+需要额外阻止的原生变换是 register/shared WGMMA 的 K-split：对于
+`active_k=80`，物理 A carrier 是 K128，但只能发出 5 个 K16 repetition；
+若按物理 K128 拆成 8 个标准 dot，就会重新计算被裁掉的 48 行。因此
+`splitRSDot` 遇到 `tle.wgmma_active_k` 时保持整体。active-N 不改变 K
+repetition，可以正常参与标准 K-split。
 
 ### 为什么暂不开放 ordinary N96
 
@@ -443,11 +459,22 @@ bitwise stable，compact 与 legacy N64 的最大绝对误差为
 `0.00096774101`，decode 为 `0.00004330277`。去掉哨兵后的 decode pruner
 仍不保留 compact config，ordinary config 分别携带 N64 或 N128。
 
-最终 compiler canonicalization 的检查比延迟 gate 更严格：B1/B5 ordinary
-kernel 的 TTGIR 都只有 11 个 `ttng.warp_group_dot`、没有
-`ttng.tle_warp_group_dot`；去掉 debug line 信息后，full-N 正值版与原
-overload 版的 PTX SHA-256 逐一相同。compact kernel 则仍包含 TLE active
-Op 和 `m64n80k16`，说明 canonicalization 没有吞掉真正的 partial-N。
+最终 compiler canonicalization 的检查比延迟 gate 更严格：ordinary
+kernel 的 TTGIR 只有标准 `ttng.warp_group_dot`，且没有 active extent
+属性；其 TTGIR、LLVM IR、PTX 和 cubin 在标准 Op 重构前后逐字节相同。
+compact kernel 也不再包含独立 TLE Op，而是 34 个标准
+`ttng.warp_group_dot`，其中 6 个携带 `tle.wgmma_active_n=80`、6 个携带
+`tle.wgmma_active_k=80`。最终 PTX 仍有 96 条 `m64n80k16`，PV 仍只发出
+5 个 K16 repetition，说明完整 pass pipeline 没有丢失 partial extent。
+
+标准 pipeline 还为循环内 active op 正常插入
+`ttng.warp_group_dot_commit`。所选 compact kernel 的
+`fence.proxy.async`、WGMMA fence/mma/commit/wait、mbarrier 和
+`membar.cta` 指令数量重构前后不变；PTX diff 只消除了 4 个位于
+`wgmma.wait_group 1` 与 release `mbarrier.arrive` 之间的冗余
+`bar.sync 128`。五组实际 GPU 正确性均通过，三次重复 bitwise stable；
+短时 ABBA 中 B1 不回退、B5 基本中性，三个 decode kernel 的 cubin 与
+重构前完全相同。
 
 修改前后还使用相同 H100、相同 shape 和三轮 ABBA 快速 gate 做了 focused
 对照：
