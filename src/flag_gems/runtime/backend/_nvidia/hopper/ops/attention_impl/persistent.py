@@ -53,12 +53,90 @@ from .validation import tle
 _prune_persistent_configs = PersistentSchedulingHeuristics.prune_autotune_configs
 _heur_block_k = CommonSchedulingHeuristics.block_k
 
+_PERSISTENT_AUTOTUNE_KEYS = (
+    "b",
+    "h",
+    "hk",
+    "d",
+    "block_size",
+    "is_paged",
+    "is_seqused_k",
+    "is_causal",
+    "is_local",
+    "window_size_left",
+    "window_size_right",
+    "is_alibi",
+    "is_softcap",
+    "is_s_aux",
+    "h_hk_ratio",
+    "seqlen_q",
+    "seqlen_k",
+    "total_q",
+    "PAGED_GATHER_MODE",
+    "PAGED_KV_NON_TMA",
+    "PACK_GQA",
+    "RAGGED_SCHEDULER",
+    "HEADS_IN_L2",
+    "DYNAMIC_SCHEDULER",
+    "SPLIT_KV",
+    "MAX_SPLITS",
+    "EXPLICIT_SPLIT_K_CHUNK",
+    "STORE_LSE",
+    "PAGED_PREFILL_PROFILE",
+    "DENSE_KV_TMA_PROFILE",
+    "AUTOTUNE_POLICY_VERSION",
+)
+_PERSISTENT_AUTOTUNE_STRATEGY = tuple(
+    "align32" if key in {"seqlen_q", "seqlen_k", "total_q"} else "default"
+    for key in _PERSISTENT_AUTOTUNE_KEYS
+)
+
+_PERSISTENT_OPTIONAL_META_DEFAULTS = {
+    "COMPACT_KV80": False,
+    "RESCALE_O_BEFORE_PV": False,
+    "EARLY_CAST_P": False,
+}
+
+
+def _normalize_persistent_config_schema(configs):
+    """Give every config the same SQL-persisted optional-meta schema.
+
+    The YAML loader omits false-valued optional metadata while compact
+    candidates carry the corresponding true/false fields explicitly.  A
+    LibTuner best-config table has one value-column schema for the whole
+    Cartesian config set, so whichever family tunes first must not determine
+    a narrower table that later candidates cannot be written to.
+
+    Only materialize a field when at least one config in this search set uses
+    it.  This keeps compile-only experimental constexprs out of the production
+    cache signature until their exact experiment is enabled.
+    """
+
+    configs = list(configs)
+    active_defaults = {
+        name: default
+        for name, default in _PERSISTENT_OPTIONAL_META_DEFAULTS.items()
+        if any(name in config.kwargs for config in configs)
+    }
+    for config in configs:
+        for name, default in active_defaults.items():
+            config.kwargs.setdefault(name, default)
+    return configs
+
 
 def _persistent_configs():
-    if any(name.startswith("FLAG_GEMS_FA3_TLE_EXPERIMENT_") for name in os.environ):
-        return PersistentSchedulingHeuristics.autotune_configs()
+    has_experiment = any(
+        name.startswith("FLAG_GEMS_FA3_TLE_EXPERIMENT_")
+        for name in os.environ
+    )
+    if has_experiment:
+        return _normalize_persistent_config_schema(
+            PersistentSchedulingHeuristics.autotune_configs()
+        )
     configs = runtime.get_tuned_config("flash_attn_varlen_fa3_persistent")
-    return configs or PersistentSchedulingHeuristics.autotune_configs()
+    return _normalize_persistent_config_schema(
+        configs or PersistentSchedulingHeuristics.autotune_configs()
+    )
 
 
 @libentry()
