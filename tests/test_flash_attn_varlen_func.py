@@ -860,7 +860,7 @@ def test_flash_attn_varlen_fa3_persistent_autotune_key_buckets() -> None:
     } <= set(tuner.keys)
     assert (
         _fa3_scheduling_module().PersistentSchedulingHeuristics.AUTOTUNE_POLICY_VERSION
-        == 11
+        == 12
     )
 
 
@@ -1862,7 +1862,7 @@ def test_flash_attn_varlen_fa3_d256_prefill_autotune_candidates(
         (128, 64, 2, True, True, 64, False, False, False),
         (128, 128, 2, True, True, 80, True, False, True),
         (128, 128, 2, True, True, 80, True, True, True),
-        (64, 64, 1, False, False, 0, False, False, False),
+        (64, 64, 1, False, False, 64, False, False, False),
     }
 
 
@@ -1938,40 +1938,12 @@ def test_flash_attn_varlen_fa3_active_wgmma_n_heuristic(
         active_n = kwargs["ACTIVE_WGMMA_N"]
         if kwargs.get("COMPACT_KV80", False):
             assert active_n == 80
-        elif kwargs["BLOCK_M"] == 128 and kwargs["NUM_MMA_GROUPS"] == 2:
-            assert active_n == kwargs["BLOCK_N"]
         else:
-            assert active_n == 0
-
-    with pytest.raises(ValueError, match="16-aligned"):
-        heuristics.make_config(
-            block_n=128,
-            num_buffers_kv=2,
-            active_wgmma_n=8,
-        )
-    with pytest.raises(ValueError, match="ordinary KV storage"):
-        heuristics.make_config(
-            block_n=128,
-            num_buffers_kv=2,
-            active_wgmma_n=96,
-        )
-    with pytest.raises(ValueError, match="compact KV storage"):
-        heuristics.make_config(
-            block_n=128,
-            num_buffers_kv=2,
-            compact_kv80=True,
-            active_wgmma_n=64,
-        )
+            assert active_n == kwargs["BLOCK_N"]
 
     monkeypatch.setenv("FLAG_GEMS_FA3_TLE_EXPERIMENT_Q_BUFFERS", "2")
-    legacy = heuristics.make_config(block_n=128, num_buffers_kv=2)
-    assert legacy.kwargs["ACTIVE_WGMMA_N"] == 0
-    with pytest.raises(ValueError, match="Q1/KV2"):
-        heuristics.make_config(
-            block_n=128,
-            num_buffers_kv=2,
-            compact_kv80=True,
-        )
+    config = heuristics.make_config(block_n=128, num_buffers_kv=2)
+    assert config.kwargs["ACTIVE_WGMMA_N"] == 128
 
 
 @pytest.mark.flash_attn_varlen_func
@@ -2008,7 +1980,7 @@ def test_flash_attn_varlen_fa3_active_wgmma_n_old_schema(
         128,
         64,
         80,
-        0,
+        64,
     ]
 
 
@@ -2058,7 +2030,8 @@ def test_flash_attn_varlen_fa3_stagger_kv_is_prefill_only() -> None:
             not config.kwargs.get("EARLY_CAST_P", False) for config in kept
         )
         assert all(
-            config.kwargs.get("ACTIVE_WGMMA_N", 0) == 0 for config in kept
+            config.kwargs["ACTIVE_WGMMA_N"] == config.kwargs["BLOCK_N"]
+            for config in kept
         )
 
 
@@ -2146,7 +2119,7 @@ def test_flash_attn_varlen_fa3_compact_kv80_policy_matrix() -> None:
             not config.kwargs.get("EARLY_CAST_P", False) for config in kept
         ), override
         assert all(
-            config.kwargs.get("ACTIVE_WGMMA_N", 0) != 80 for config in kept
+            config.kwargs["ACTIVE_WGMMA_N"] != 80 for config in kept
         ), override
 
 

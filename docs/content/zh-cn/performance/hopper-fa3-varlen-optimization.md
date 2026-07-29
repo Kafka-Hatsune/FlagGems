@@ -66,6 +66,7 @@ H100 的百分比直接当成 H800 结果。
 | `a4bdfb464` | compact KV stage/chunk 的精确 shared-memory alias 建模 | Membar 分析基础 |
 | `9f2abcc95` | 将精确 paged-pointer broadcast 降为 warp shuffle | 已测性能优化 |
 | `90815bacf` | WGMMA 已完成后的精确 release rendezvous 抑制 | 静态有效，运行时收益待复验 |
+| `67e44dfb4` | 将 full-carrier `active_n` 规范化为普通 WGMMA | 正值 config 与原 codegen 的兼容层 |
 
 ### FlagGems
 
@@ -84,6 +85,7 @@ FlagTree 746704102 ─> c814ab090 ─> 299095b61 ─> a4bdfb464 ─┐
 FlagTree 9f2abcc95 ────────────────────────────────────────┘
 
 FlagTree a4bdfb464 + completed-WGMMA analysis ─> 90815bacf
+FlagTree 746704102 ──> FlagTree 67e44dfb4 ──> positive full-N config
 
 FlagGems fd041383 ──> FlagGems f59f5485
 FlagGems dec24aa0 ──> benchmark / pre-tune coverage
@@ -324,13 +326,13 @@ qk = tle.gpu.wgmma(
 key，因此不同 head dim 不会错误复用同一 winner；获胜的
 `ACTIVE_WGMMA_N` 则和 `BLOCK_N`、buffer 数等一起写入 value columns。
 
-这次候选集合变化把 `AUTOTUNE_POLICY_VERSION` 从 10 提升到 11，避免旧
-winner 跨 policy 复用。对于 policy v10 或更早的 YAML/SQLite row，
-`_normalize_persistent_config_schema()` 会从 topology、`BLOCK_N` 和
-`COMPACT_KV80` 推导并补齐 `ACTIVE_WGMMA_N`，使旧记录仍能以新 kernel
-signature 安全加载。
+这次候选集合变化先把 `AUTOTUNE_POLICY_VERSION` 从 10 提升到 11；移除
+`ACTIVE_WGMMA_N=0` 哨兵后又提升到 12，避免旧 winner 跨 config 语义复用。
+对于旧 YAML/SQLite row，`_normalize_persistent_config_schema()` 根据
+`BLOCK_N` 和 `COMPACT_KV80` 补齐正值：ordinary 使用 `BLOCK_N`，compact
+使用 80。
 
-### head dim 启发式与固定 topology
+### head dim 启发式与候选生成契约
 
 先把运行时 head dim 补齐为 `Dpad`，再构造 1P2C 搜索面：
 
@@ -350,22 +352,26 @@ D256、paged、causal、PackGQA、page/GQA 等契约，不是只看 `Dpad`。
 active-N64”。当前唯一允许 active extent 小于物理 carrier 的 production
 配置仍是 compact D256/N80。
 
-非零 `ACTIVE_WGMMA_N` 只允许以下固定 topology：
+`ACTIVE_WGMMA_N` 不再使用 0 表示另一个 API overload。每个 config 都携带
+正的逻辑 N，且满足 `16 <= ACTIVE_WGMMA_N <= BLOCK_N`。当前生成器只产生
+N64、N80 和 N128，这三个值在构造候选时已经满足 N16 流水粒度，不在
+kernel、pruner 和 config consumer 中重复检查 `% 16`。
 
-- `BLOCK_M=128`；
-- 1 producer + 2 consumer，即 `NUM_MMA_GROUPS=2`；
-- 8 个 MMA warps；
-- `NUM_BUFFERS_Q=1`、`NUM_BUFFERS_KV=2`；
-- `Q_STAGE_CAPACITY=2`。
+这里的“搜索参数”不是把 16 到 `BLOCK_N` 的所有倍数独立地与 storage 做
+笛卡尔积。当前合法 config 对由 storage 决定：
 
-decode、Split-K、1P1C、BM64 或 Q 双缓冲实验都使用
-`ACTIVE_WGMMA_N=0`。0 不是“执行 N0”，而是显式选择旧的、不带
-`active_n` 参数的 WGMMA 调用，从而保留原 codegen。逻辑 tile 统一按
+- ordinary N64/N128：`ACTIVE_WGMMA_N=BLOCK_N`；
+- compact N80：物理 accumulator carrier 为 N128，
+  `ACTIVE_WGMMA_N=80`，K/V backing 为精确 N80。
+
+因此 head-dim heuristic 先生成完整、合法的 config 对，再由 autotuner 实测
+选择，而不是先生成任意 active N、再在 kernel 内拒绝不一致状态。partial-N80
+仍只在 BM128、1P2C、Q1/KV2 的 compact profile 中出现；decode、Split-K、
+1P1C、BM64 或 Q 双缓冲使用 ordinary config，其正值
+`ACTIVE_WGMMA_N` 等于各自的 `BLOCK_N`。逻辑 tile 直接按
 
 ```text
-LOGICAL_BLOCK_N = ACTIVE_WGMMA_N != 0
-                    ? ACTIVE_WGMMA_N
-                    : BLOCK_N
+LOGICAL_BLOCK_N = ACTIVE_WGMMA_N
 ```
 
 计算。因此 producer tile count、offset 和 causal boundary 不再用
@@ -377,28 +383,26 @@ backing 计费。compact config 中 native N80 由 N128 accumulator carrier
 本身只存精确的 80 行。将来即使开放 ordinary N96/N112，也不能直接用
 `ACTIVE_WGMMA_N` 缩小 SMEM 估算，除非同时实现对应的窄 storage。
 
-### 为什么保留内联 constexpr 分支
+### 统一调用与 full-N canonicalization
 
 四个 QK hot site 都直接写：
 
 ```python
-if ACTIVE_WGMMA_N == 0:
-    qk = tle.gpu.wgmma(..., trans_b=True)
-else:
-    qk = tle.gpu.wgmma(
-        ..., trans_b=True, active_n=ACTIVE_WGMMA_N
-    )
+qk = tle.gpu.wgmma(
+    ...,
+    trans_b=True,
+    active_n=ACTIVE_WGMMA_N,
+)
 ```
 
-没有把它抽成一个返回 accumulator 的 `@triton.jit` helper。当前 TLE
-frontend 对这种 helper 的 WGMMA accumulator 返回值存在 flatten/type
-contract 限制；内联可以让每个 site 在已知 result carrier 的上下文中完成
-lowering。条件是 `tl.constexpr`，未选择的分支在编译期消失，不会在 GPU
-hot loop 中增加运行时判断。尤其 `ACTIVE_WGMMA_N=0` 会完整保留原始 API
-overload，而不是生成一个带冗余 active attribute 的等价 op。
-ordinary full-carrier N64/N128 虽然数学范围没有缩窄，仍会进入新增的
-NVIDIA-TLE active op；因此 D64/D128 attention gate 检查的正是这条新
-lowering 相对 legacy overload 是否产生编译或调度回退。
+FlagTree 的 TLE lowering 将
+`active_n == physical N carrier` 规范化为普通
+`ttng.warp_group_dot`；只有 `active_n < physical N carrier` 才生成
+`ttng.tle_warp_group_dot`。这把“config 中总是正值”和“full-N 必须保持旧
+codegen”分离开：FlagGems 不需要数字哨兵或四处重复 constexpr 分支，
+ordinary/decode 仍得到原来的同步分析和 PTX，compact N80 才进入 active-N
+lowering。编译器回归测试还覆盖 M128 full-N，避免统一接口被 active-N
+专用的 M64 约束误伤。
 
 ### 为什么暂不开放 ordinary N96
 
@@ -420,8 +424,8 @@ chunk 和 PV reduction 都以 N16/K16 为流水粒度。即使 compiler 已能�
 ### 本轮正确性、ABBA 与 NCU 验证
 
 首先用 H100 PCIe 对 ordinary D64/D128 做了同进程 full-attention gate。
-每个 case 都固定 BM128、1P2C，分别比较旧的无 `active_n` overload 与
-`ACTIVE_WGMMA_N=BLOCK_N`：
+每个 case 都固定 BM128、1P2C，比较无 `active_n` overload 与
+`ACTIVE_WGMMA_N=BLOCK_N` 的 API 语义：
 
 | `Dpad` | `BLOCK_N` / active N | active / legacy 延迟 | active 与 legacy 最大绝对误差 |
 | ---: | ---: | ---: | ---: |
@@ -436,8 +440,14 @@ chunk 和 PV reduction 都以 N16/K16 为流水粒度。即使 compiler 已能�
 另在 small16、small32、B5、B25 和 decode 上通过 5/5 gate：三次重复均
 bitwise stable，compact 与 legacy N64 的最大绝对误差为
 `0.00048828125`，small case 相对 PyTorch FP32 的最大绝对误差为
-`0.00096774101`，decode 为 `0.00004330277`。decode pruner 保留的 config
-中 `ACTIVE_WGMMA_N=0` 且 compact 数量为 0。
+`0.00096774101`，decode 为 `0.00004330277`。去掉哨兵后的 decode pruner
+仍不保留 compact config，ordinary config 分别携带 N64 或 N128。
+
+最终 compiler canonicalization 的检查比延迟 gate 更严格：B1/B5 ordinary
+kernel 的 TTGIR 都只有 11 个 `ttng.warp_group_dot`、没有
+`ttng.tle_warp_group_dot`；去掉 debug line 信息后，full-N 正值版与原
+overload 版的 PTX SHA-256 逐一相同。compact kernel 则仍包含 TLE active
+Op 和 `m64n80k16`，说明 canonicalization 没有吞掉真正的 partial-N。
 
 修改前后还使用相同 H100、相同 shape 和三轮 ABBA 快速 gate 做了 focused
 对照：

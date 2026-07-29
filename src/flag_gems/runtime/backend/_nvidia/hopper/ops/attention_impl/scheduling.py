@@ -1814,7 +1814,7 @@ class DirectSchedulingHeuristics:
 class PersistentSchedulingHeuristics:
     """Autotune, pipeline, and launch-shape policy for the persistent path."""
 
-    AUTOTUNE_POLICY_VERSION = 11
+    AUTOTUNE_POLICY_VERSION = 12
     DEFAULT_BLOCK_M = 128
     DEFAULT_NUM_MMA_GROUPS = 2
     DEFAULT_NUM_Q_BUFFERS = 1
@@ -1908,37 +1908,10 @@ class PersistentSchedulingHeuristics:
         return value
 
     @staticmethod
-    def infer_active_wgmma_n(
-        *,
-        block_m: int,
-        block_n: int,
-        num_mma_groups: int,
-        num_mma_warps: int,
-        num_buffers_q: int,
-        num_buffers_kv: int,
-        q_stage_capacity: int,
-        compact_kv80: bool,
-    ) -> int:
-        """Choose the logical QK WGMMA N carried by one physical tile.
+    def logical_wgmma_n(*, block_n: int, compact_kv80: bool) -> int:
+        """Return the logical N represented by an autotune config."""
 
-        Only the fixed BM128 1P2C prefill topology opts into active-N lowering.
-        Ordinary storage uses its full physical carrier; the compact D256
-        profile owns the one measured partial carrier, N80 inside N128.
-        """
-
-        active_n_topology = (
-            block_m == 128
-            and num_mma_groups == 2
-            and num_mma_warps == 8
-            and num_buffers_q == 1
-            and num_buffers_kv == 2
-            and q_stage_capacity == 2
-        )
-        if compact_kv80:
-            return 80
-        if active_n_topology:
-            return block_n
-        return 0
+        return 80 if compact_kv80 else block_n
 
     @staticmethod
     def active_wgmma_n_candidates(
@@ -1974,7 +1947,6 @@ class PersistentSchedulingHeuristics:
         use_tma_kv: bool = True,
         stagger_kv: bool = False,
         compact_kv80: bool = False,
-        active_wgmma_n: int | None = None,
         rescale_o_before_pv: bool = False,
         early_cast_p: bool = False,
     ):
@@ -1985,47 +1957,10 @@ class PersistentSchedulingHeuristics:
         num_buffers_q = cls.num_q_buffers()
         num_mma_warps = 4 * num_mma_groups
         q_stage_capacity = num_mma_groups * num_buffers_q
-        if active_wgmma_n is None:
-            active_wgmma_n = cls.infer_active_wgmma_n(
-                block_m=block_m,
-                block_n=block_n,
-                num_mma_groups=num_mma_groups,
-                num_mma_warps=num_mma_warps,
-                num_buffers_q=num_buffers_q,
-                num_buffers_kv=num_buffers_kv,
-                q_stage_capacity=q_stage_capacity,
-                compact_kv80=compact_kv80,
-            )
-        if (
-            active_wgmma_n != 0
-            and (
-                active_wgmma_n < 16
-                or active_wgmma_n % 16 != 0
-                or active_wgmma_n > block_n
-            )
-        ):
-            raise ValueError(
-                "ACTIVE_WGMMA_N must be zero or a 16-aligned extent within "
-                "BLOCK_N"
-            )
-        if compact_kv80:
-            if active_wgmma_n != 80:
-                raise ValueError("compact KV storage requires ACTIVE_WGMMA_N=80")
-        elif active_wgmma_n not in (0, block_n):
-            raise ValueError(
-                "ordinary KV storage requires ACTIVE_WGMMA_N=BLOCK_N"
-            )
-        if active_wgmma_n and (
-            block_m != 128
-            or num_mma_groups != 2
-            or num_mma_warps != 8
-            or num_buffers_q != 1
-            or num_buffers_kv != 2
-            or q_stage_capacity != 2
-        ):
-            raise ValueError(
-                "ACTIVE_WGMMA_N requires BM128, 1P2C, Q1/KV2, and eight MMA warps"
-            )
+        active_wgmma_n = cls.logical_wgmma_n(
+            block_n=block_n,
+            compact_kv80=compact_kv80,
+        )
         if use_tma_qo is None:
             default = "1" if cls.DEFAULT_USE_TMA_QO else "0"
             use_tma_qo = (
@@ -2470,7 +2405,7 @@ class PersistentSchedulingHeuristics:
             and config.kwargs["USE_TMA_KV"] == use_tma_kv
             and not (
                 config.kwargs["NUM_MMA_GROUPS"] == 2
-                and config.kwargs.get("ACTIVE_WGMMA_N", 0)
+                and config.kwargs["ACTIVE_WGMMA_N"]
                 not in active_wgmma_n_candidates
             )
             and not (
