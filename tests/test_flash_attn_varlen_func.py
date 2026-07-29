@@ -698,6 +698,21 @@ def _fa3_scheduling_module():
     return import_module(f"{hopper_package}.ops.attention_impl.scheduling")
 
 
+_FA3_AUTOTUNE_EXPERIMENT_ENV = (
+    "FLAG_GEMS_FA3_TLE_EXPERIMENT_MMA_GROUPS",
+    "FLAG_GEMS_FA3_TLE_EXPERIMENT_BLOCK_M",
+    "FLAG_GEMS_FA3_TLE_EXPERIMENT_BLOCK_N",
+    "FLAG_GEMS_FA3_TLE_EXPERIMENT_KV_BUFFERS",
+    "FLAG_GEMS_FA3_TLE_EXPERIMENT_DECODE_TMA_QO",
+    "FLAG_GEMS_FA3_TLE_EXPERIMENT_TMA_QO",
+    "FLAG_GEMS_FA3_TLE_EXPERIMENT_Q_BUFFERS",
+    "FLAG_GEMS_FA3_TLE_EXPERIMENT_WARP_MMA",
+    "FLAG_GEMS_FA3_TLE_EXPERIMENT_Q_PIPE_ASYNC",
+    "FLAG_GEMS_FA3_TLE_EXPERIMENT_REUSE_Q_SMEM_O",
+    "FLAG_GEMS_FA3_TLE_EXPERIMENT_PIPE_ASYNC",
+)
+
+
 def _capture_fa3_plans(monkeypatch):
     """Observe scheduler results in tests without production instrumentation."""
 
@@ -845,7 +860,7 @@ def test_flash_attn_varlen_fa3_persistent_autotune_key_buckets() -> None:
     } <= set(tuner.keys)
     assert (
         _fa3_scheduling_module().PersistentSchedulingHeuristics.AUTOTUNE_POLICY_VERSION
-        == 10
+        == 11
     )
 
 
@@ -1788,14 +1803,7 @@ def test_flash_attn_varlen_fa3_d256_prefill_autotune_candidates(
 ) -> None:
     scheduling = _fa3_scheduling_module()
     heuristics = scheduling.PersistentSchedulingHeuristics
-    for name in (
-        "FLAG_GEMS_FA3_TLE_EXPERIMENT_MMA_GROUPS",
-        "FLAG_GEMS_FA3_TLE_EXPERIMENT_BLOCK_M",
-        "FLAG_GEMS_FA3_TLE_EXPERIMENT_BLOCK_N",
-        "FLAG_GEMS_FA3_TLE_EXPERIMENT_KV_BUFFERS",
-        "FLAG_GEMS_FA3_TLE_EXPERIMENT_DECODE_TMA_QO",
-        "FLAG_GEMS_FA3_TLE_EXPERIMENT_TMA_QO",
-        "FLAG_GEMS_FA3_TLE_EXPERIMENT_Q_BUFFERS",
+    for name in _FA3_AUTOTUNE_EXPERIMENT_ENV + (
         "FLAG_GEMS_FA3_TLE_PAGED_PREFILL_MIN_AVG_Q",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -1841,6 +1849,7 @@ def test_flash_attn_varlen_fa3_d256_prefill_autotune_candidates(
             config.kwargs["NUM_MMA_GROUPS"],
             config.kwargs["USE_TMA_QO"],
             config.kwargs["STAGGER_KV"],
+            config.kwargs["ACTIVE_WGMMA_N"],
             config.kwargs.get("COMPACT_KV80", False),
             config.kwargs.get("RESCALE_O_BEFORE_PV", False),
             config.kwargs.get("EARLY_CAST_P", False),
@@ -1849,12 +1858,158 @@ def test_flash_attn_varlen_fa3_d256_prefill_autotune_candidates(
     }
 
     assert signatures == {
-        (128, 64, 2, True, False, False, False, False),
-        (128, 64, 2, True, True, False, False, False),
-        (128, 128, 2, True, True, True, False, True),
-        (128, 128, 2, True, True, True, True, True),
-        (64, 64, 1, False, False, False, False, False),
+        (128, 64, 2, True, False, 64, False, False, False),
+        (128, 64, 2, True, True, 64, False, False, False),
+        (128, 128, 2, True, True, 80, True, False, True),
+        (128, 128, 2, True, True, 80, True, True, True),
+        (64, 64, 1, False, False, 0, False, False, False),
     }
+
+
+@pytest.mark.flash_attn_varlen_func
+def test_flash_attn_varlen_fa3_active_wgmma_n_heuristic(
+    monkeypatch,
+) -> None:
+    scheduling = _fa3_scheduling_module()
+    heuristics = scheduling.PersistentSchedulingHeuristics
+    for name in _FA3_AUTOTUNE_EXPERIMENT_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+    assert heuristics.active_wgmma_n_candidates(64, compact_kv80_eligible=False) == (
+        128,
+        64,
+    )
+    assert heuristics.active_wgmma_n_candidates(128, compact_kv80_eligible=False) == (
+        128,
+        64,
+    )
+    assert heuristics.active_wgmma_n_candidates(192, compact_kv80_eligible=False) == (
+        64,
+    )
+    assert heuristics.active_wgmma_n_candidates(256, compact_kv80_eligible=True) == (
+        80,
+        64,
+    )
+    assert heuristics.active_wgmma_n_candidates(256, compact_kv80_eligible=False) == (
+        64,
+    )
+
+    common_nargs = {
+        "b": 1,
+        "h": 8,
+        "hk": 8,
+        "seqlen_q": 1024,
+        "seqlen_k": 1024,
+        "total_q": 1024,
+        "is_paged": False,
+        "is_seqused_k": False,
+        "block_size": 1,
+        "is_causal": True,
+        "is_local": False,
+        "is_alibi": False,
+        "is_softcap": False,
+        "PAGED_KV_NON_TMA": False,
+        "PACK_GQA": False,
+        "RAGGED_SCHEDULER": False,
+        "SPLIT_KV": False,
+        "PAGED_PREFILL_PROFILE": False,
+        "DENSE_KV_TMA_PROFILE": True,
+    }
+    for head_dim, expected_active_n in (
+        (64, {64, 128}),
+        (128, {64, 128}),
+        (192, {64}),
+        (256, {64}),
+    ):
+        kept = heuristics.prune_autotune_configs(
+            heuristics.autotune_configs(),
+            {},
+            d=head_dim,
+            **common_nargs,
+        )
+        assert {
+            config.kwargs["ACTIVE_WGMMA_N"]
+            for config in kept
+            if config.kwargs["NUM_MMA_GROUPS"] == 2
+        } == expected_active_n
+
+    for config in heuristics.autotune_configs():
+        kwargs = config.kwargs
+        active_n = kwargs["ACTIVE_WGMMA_N"]
+        if kwargs.get("COMPACT_KV80", False):
+            assert active_n == 80
+        elif kwargs["BLOCK_M"] == 128 and kwargs["NUM_MMA_GROUPS"] == 2:
+            assert active_n == kwargs["BLOCK_N"]
+        else:
+            assert active_n == 0
+
+    with pytest.raises(ValueError, match="16-aligned"):
+        heuristics.make_config(
+            block_n=128,
+            num_buffers_kv=2,
+            active_wgmma_n=8,
+        )
+    with pytest.raises(ValueError, match="ordinary KV storage"):
+        heuristics.make_config(
+            block_n=128,
+            num_buffers_kv=2,
+            active_wgmma_n=96,
+        )
+    with pytest.raises(ValueError, match="compact KV storage"):
+        heuristics.make_config(
+            block_n=128,
+            num_buffers_kv=2,
+            compact_kv80=True,
+            active_wgmma_n=64,
+        )
+
+    monkeypatch.setenv("FLAG_GEMS_FA3_TLE_EXPERIMENT_Q_BUFFERS", "2")
+    legacy = heuristics.make_config(block_n=128, num_buffers_kv=2)
+    assert legacy.kwargs["ACTIVE_WGMMA_N"] == 0
+    with pytest.raises(ValueError, match="Q1/KV2"):
+        heuristics.make_config(
+            block_n=128,
+            num_buffers_kv=2,
+            compact_kv80=True,
+        )
+
+
+@pytest.mark.flash_attn_varlen_func
+def test_flash_attn_varlen_fa3_active_wgmma_n_old_schema(
+    monkeypatch,
+) -> None:
+    scheduling = _fa3_scheduling_module()
+    heuristics = scheduling.PersistentSchedulingHeuristics
+    hopper_package = flag_gems.flash_attn_varlen_func.__module__.split(".ops.", 1)[0]
+    persistent = import_module(f"{hopper_package}.ops.attention_impl.persistent")
+    for name in _FA3_AUTOTUNE_EXPERIMENT_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+    configs = [
+        heuristics.make_config(block_n=128, num_buffers_kv=2),
+        heuristics.make_config(block_n=64, num_buffers_kv=2),
+        heuristics.make_config(
+            block_n=128,
+            num_buffers_kv=2,
+            compact_kv80=True,
+        ),
+        heuristics.make_config(
+            block_m=64,
+            block_n=64,
+            num_buffers_kv=2,
+            num_mma_groups=1,
+        ),
+    ]
+    for config in configs:
+        config.kwargs.pop("ACTIVE_WGMMA_N")
+
+    normalized = persistent._normalize_persistent_config_schema(configs)
+    assert [config.kwargs["ACTIVE_WGMMA_N"] for config in normalized] == [
+        128,
+        64,
+        80,
+        0,
+    ]
 
 
 @pytest.mark.flash_attn_varlen_func
@@ -1902,6 +2057,9 @@ def test_flash_attn_varlen_fa3_stagger_kv_is_prefill_only() -> None:
         assert all(
             not config.kwargs.get("EARLY_CAST_P", False) for config in kept
         )
+        assert all(
+            config.kwargs.get("ACTIVE_WGMMA_N", 0) == 0 for config in kept
+        )
 
 
 @pytest.mark.flash_attn_varlen_func
@@ -1947,13 +2105,14 @@ def test_flash_attn_varlen_fa3_compact_kv80_policy_matrix() -> None:
         assert {
             (
                 config.kwargs["STAGGER_KV"],
+                config.kwargs["ACTIVE_WGMMA_N"],
                 config.kwargs.get("RESCALE_O_BEFORE_PV", False),
                 config.kwargs.get("EARLY_CAST_P", False),
             )
             for config in compact
         } == {
-            (True, False, True),
-            (True, True, True),
+            (True, 80, False, True),
+            (True, 80, True, True),
         }
 
     negative_overrides = (
@@ -1985,6 +2144,9 @@ def test_flash_attn_varlen_fa3_compact_kv80_policy_matrix() -> None:
         ), override
         assert all(
             not config.kwargs.get("EARLY_CAST_P", False) for config in kept
+        ), override
+        assert all(
+            config.kwargs.get("ACTIVE_WGMMA_N", 0) != 80 for config in kept
         ), override
 
 

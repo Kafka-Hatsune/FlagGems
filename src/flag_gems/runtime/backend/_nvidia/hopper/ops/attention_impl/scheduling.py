@@ -1814,7 +1814,7 @@ class DirectSchedulingHeuristics:
 class PersistentSchedulingHeuristics:
     """Autotune, pipeline, and launch-shape policy for the persistent path."""
 
-    AUTOTUNE_POLICY_VERSION = 10
+    AUTOTUNE_POLICY_VERSION = 11
     DEFAULT_BLOCK_M = 128
     DEFAULT_NUM_MMA_GROUPS = 2
     DEFAULT_NUM_Q_BUFFERS = 1
@@ -1907,6 +1907,61 @@ class PersistentSchedulingHeuristics:
             raise ValueError("FLAG_GEMS_FA3_TLE_EXPERIMENT_Q_BUFFERS must be 1 or 2")
         return value
 
+    @staticmethod
+    def infer_active_wgmma_n(
+        *,
+        block_m: int,
+        block_n: int,
+        num_mma_groups: int,
+        num_mma_warps: int,
+        num_buffers_q: int,
+        num_buffers_kv: int,
+        q_stage_capacity: int,
+        compact_kv80: bool,
+    ) -> int:
+        """Choose the logical QK WGMMA N carried by one physical tile.
+
+        Only the fixed BM128 1P2C prefill topology opts into active-N lowering.
+        Ordinary storage uses its full physical carrier; the compact D256
+        profile owns the one measured partial carrier, N80 inside N128.
+        """
+
+        active_n_topology = (
+            block_m == 128
+            and num_mma_groups == 2
+            and num_mma_warps == 8
+            and num_buffers_q == 1
+            and num_buffers_kv == 2
+            and q_stage_capacity == 2
+        )
+        if compact_kv80:
+            return 80
+        if active_n_topology:
+            return block_n
+        return 0
+
+    @staticmethod
+    def active_wgmma_n_candidates(
+        head_dim: int,
+        *,
+        compact_kv80_eligible: bool,
+    ) -> tuple[int, ...]:
+        """Return the head-dimension-aware 1P2C active-N search space.
+
+        The 1P2C shared-memory payload is
+        ``Dpad * (256 + 8 * N)`` bytes for FP16 with Q1/KV2.  N128 fits
+        comfortably through Dpad=128.  At Dpad=256, N80 is the largest
+        measured compact carrier below Hopper's per-CTA limit; N64 remains
+        in the search as the no-regression legacy candidate.
+        """
+
+        head_dim_padded = CommonSchedulingHeuristics.padded_head_dim(head_dim)
+        if head_dim_padded <= 128:
+            return (128, 64)
+        if head_dim_padded == 256 and compact_kv80_eligible:
+            return (80, 64)
+        return (64,)
+
     @classmethod
     def make_config(
         cls,
@@ -1919,6 +1974,7 @@ class PersistentSchedulingHeuristics:
         use_tma_kv: bool = True,
         stagger_kv: bool = False,
         compact_kv80: bool = False,
+        active_wgmma_n: int | None = None,
         rescale_o_before_pv: bool = False,
         early_cast_p: bool = False,
     ):
@@ -1927,6 +1983,49 @@ class PersistentSchedulingHeuristics:
         elif num_mma_groups not in (1, 2):
             raise ValueError("FLAG_GEMS_FA3_TLE_EXPERIMENT_MMA_GROUPS must be 1 or 2")
         num_buffers_q = cls.num_q_buffers()
+        num_mma_warps = 4 * num_mma_groups
+        q_stage_capacity = num_mma_groups * num_buffers_q
+        if active_wgmma_n is None:
+            active_wgmma_n = cls.infer_active_wgmma_n(
+                block_m=block_m,
+                block_n=block_n,
+                num_mma_groups=num_mma_groups,
+                num_mma_warps=num_mma_warps,
+                num_buffers_q=num_buffers_q,
+                num_buffers_kv=num_buffers_kv,
+                q_stage_capacity=q_stage_capacity,
+                compact_kv80=compact_kv80,
+            )
+        if (
+            active_wgmma_n != 0
+            and (
+                active_wgmma_n < 16
+                or active_wgmma_n % 16 != 0
+                or active_wgmma_n > block_n
+            )
+        ):
+            raise ValueError(
+                "ACTIVE_WGMMA_N must be zero or a 16-aligned extent within "
+                "BLOCK_N"
+            )
+        if compact_kv80:
+            if active_wgmma_n != 80:
+                raise ValueError("compact KV storage requires ACTIVE_WGMMA_N=80")
+        elif active_wgmma_n not in (0, block_n):
+            raise ValueError(
+                "ordinary KV storage requires ACTIVE_WGMMA_N=BLOCK_N"
+            )
+        if active_wgmma_n and (
+            block_m != 128
+            or num_mma_groups != 2
+            or num_mma_warps != 8
+            or num_buffers_q != 1
+            or num_buffers_kv != 2
+            or q_stage_capacity != 2
+        ):
+            raise ValueError(
+                "ACTIVE_WGMMA_N requires BM128, 1P2C, Q1/KV2, and eight MMA warps"
+            )
         if use_tma_qo is None:
             default = "1" if cls.DEFAULT_USE_TMA_QO else "0"
             use_tma_qo = (
@@ -1936,33 +2035,34 @@ class PersistentSchedulingHeuristics:
         q_pipe_default = "1" if cls.DEFAULT_Q_PIPE_ASYNC else "0"
         pipe_default = "1" if cls.DEFAULT_PAGED_PIPE_ASYNC else "0"
         config_kwargs = {
-                "BLOCK_M": block_m,
-                "BLOCK_N": block_n,
-                "NUM_BUFFERS_Q": num_buffers_q,
-                "NUM_BUFFERS_KV": num_buffers_kv,
-                "NUM_MMA_WARPS": 4 * num_mma_groups,
-                "NUM_MMA_GROUPS": num_mma_groups,
-                "Q_STAGE_CAPACITY": num_mma_groups * num_buffers_q,
-                "USE_TMA_QO": use_tma_qo,
-                "Q_PIPE_ASYNC": os.getenv(
-                    "FLAG_GEMS_FA3_TLE_EXPERIMENT_Q_PIPE_ASYNC",
-                    q_pipe_default,
-                )
-                != "0",
-                "REUSE_Q_SMEM_O": os.getenv(
-                    "FLAG_GEMS_FA3_TLE_EXPERIMENT_REUSE_Q_SMEM_O", reuse_default
-                )
-                == "1",
-                "USE_TMA_KV": use_tma_kv,
-                "PAGED_PIPE_ASYNC": os.getenv(
-                    "FLAG_GEMS_FA3_TLE_EXPERIMENT_PIPE_ASYNC", pipe_default
-                )
-                != "0",
-                "STAGGER_KV": stagger_kv,
-                "COMPACT_KV80": compact_kv80,
-                "RESCALE_O_BEFORE_PV": rescale_o_before_pv,
-                "EARLY_CAST_P": early_cast_p,
-            }
+            "BLOCK_M": block_m,
+            "BLOCK_N": block_n,
+            "NUM_BUFFERS_Q": num_buffers_q,
+            "NUM_BUFFERS_KV": num_buffers_kv,
+            "NUM_MMA_WARPS": num_mma_warps,
+            "NUM_MMA_GROUPS": num_mma_groups,
+            "Q_STAGE_CAPACITY": q_stage_capacity,
+            "USE_TMA_QO": use_tma_qo,
+            "Q_PIPE_ASYNC": os.getenv(
+                "FLAG_GEMS_FA3_TLE_EXPERIMENT_Q_PIPE_ASYNC",
+                q_pipe_default,
+            )
+            != "0",
+            "REUSE_Q_SMEM_O": os.getenv(
+                "FLAG_GEMS_FA3_TLE_EXPERIMENT_REUSE_Q_SMEM_O", reuse_default
+            )
+            == "1",
+            "USE_TMA_KV": use_tma_kv,
+            "PAGED_PIPE_ASYNC": os.getenv(
+                "FLAG_GEMS_FA3_TLE_EXPERIMENT_PIPE_ASYNC", pipe_default
+            )
+            != "0",
+            "STAGGER_KV": stagger_kv,
+            "COMPACT_KV80": compact_kv80,
+            "ACTIVE_WGMMA_N": active_wgmma_n,
+            "RESCALE_O_BEFORE_PV": rescale_o_before_pv,
+            "EARLY_CAST_P": early_cast_p,
+        }
         return triton.Config(
             config_kwargs,
             num_warps=4,
@@ -2117,6 +2217,9 @@ class PersistentSchedulingHeuristics:
     def config_smem_bytes(config, head_dim: int) -> int:
         block_k = _next_power_of_2(head_dim)
         block_m = config.kwargs["BLOCK_M"]
+        # ACTIVE_WGMMA_N is a compute extent, not a storage extent.  Ordinary
+        # tiles still allocate the full BLOCK_N carrier; only the compact N80
+        # allocator owns physically narrow K/V stages.
         block_n = (
             80
             if config.kwargs.get("COMPACT_KV80", False)
@@ -2282,6 +2385,12 @@ class PersistentSchedulingHeuristics:
             and is_seqused_k
             and not is_s_aux
         )
+        active_wgmma_n_candidates = set(
+            cls.active_wgmma_n_candidates(
+                head_dim,
+                compact_kv80_eligible=compact_kv80_policy,
+            )
+        )
         wide_paged_nontma = (
             is_paged and paged_kv_non_tma and not pack_gqa and head_dim > 128
         )
@@ -2360,9 +2469,9 @@ class PersistentSchedulingHeuristics:
             if selected_shape_config(config)
             and config.kwargs["USE_TMA_KV"] == use_tma_kv
             and not (
-                head_dim > 128
-                and config.kwargs["BLOCK_N"] > 64
-                and not config.kwargs.get("COMPACT_KV80", False)
+                config.kwargs["NUM_MMA_GROUPS"] == 2
+                and config.kwargs.get("ACTIVE_WGMMA_N", 0)
+                not in active_wgmma_n_candidates
             )
             and not (
                 is_paged

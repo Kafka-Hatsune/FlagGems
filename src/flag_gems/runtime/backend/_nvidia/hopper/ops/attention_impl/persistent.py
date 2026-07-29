@@ -92,6 +92,7 @@ _PERSISTENT_AUTOTUNE_STRATEGY = tuple(
 )
 
 _PERSISTENT_OPTIONAL_META_DEFAULTS = {
+    "ACTIVE_WGMMA_N": 0,
     "COMPACT_KV80": False,
     "RESCALE_O_BEFORE_PV": False,
     "EARLY_CAST_P": False,
@@ -107,12 +108,27 @@ def _normalize_persistent_config_schema(configs):
     Cartesian config set, so whichever family tunes first must not determine
     a narrower table that later candidates cannot be written to.
 
-    Only materialize a field when at least one config in this search set uses
-    it.  This keeps compile-only experimental constexprs out of the production
-    cache signature until their exact experiment is enabled.
+    ACTIVE_WGMMA_N is inferred for every config because old tuned/YAML rows
+    predate that required kernel meta.  Other optional fields are materialized
+    only when at least one config in this search set uses them.
     """
 
     configs = list(configs)
+    for config in configs:
+        kwargs = config.kwargs
+        if "ACTIVE_WGMMA_N" not in kwargs:
+            kwargs["ACTIVE_WGMMA_N"] = (
+                PersistentSchedulingHeuristics.infer_active_wgmma_n(
+                    block_m=kwargs["BLOCK_M"],
+                    block_n=kwargs["BLOCK_N"],
+                    num_mma_groups=kwargs["NUM_MMA_GROUPS"],
+                    num_mma_warps=kwargs["NUM_MMA_WARPS"],
+                    num_buffers_q=kwargs["NUM_BUFFERS_Q"],
+                    num_buffers_kv=kwargs["NUM_BUFFERS_KV"],
+                    q_stage_capacity=kwargs["Q_STAGE_CAPACITY"],
+                    compact_kv80=kwargs.get("COMPACT_KV80", False),
+                )
+            )
     active_defaults = {
         name: default
         for name, default in _PERSISTENT_OPTIONAL_META_DEFAULTS.items()
@@ -198,6 +214,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM_PADDED: tl.constexpr,
+    ACTIVE_WGMMA_N: tl.constexpr,
     NUM_BUFFERS_Q: tl.constexpr,
     NUM_MMA_GROUPS: tl.constexpr,
     BM_SPLIT: tl.constexpr,
@@ -221,7 +238,9 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
     num_progs = tl.num_programs(0)
     pack_factor: tl.constexpr = h_hk_ratio if PACK_GQA else 1
     effective_heads: tl.constexpr = hk if PACK_GQA else h
-    LOGICAL_BLOCK_N: tl.constexpr = 80 if COMPACT_KV80 else BLOCK_N
+    LOGICAL_BLOCK_N: tl.constexpr = (
+        ACTIVE_WGMMA_N if ACTIVE_WGMMA_N != 0 else BLOCK_N
+    )
     num_pid_m = tl.cdiv(seqlen_q * pack_factor, BLOCK_M)
     total_tiles = num_pid_m * b * effective_heads
 
@@ -995,15 +1014,15 @@ def _load_paged_k_for_warp_mma(
 
 
 @triton.jit
-def _mask_compact_kv_carrier(
+def _mask_wgmma_n_carrier(
     qk,
     BLOCK_N: tl.constexpr,
-    COMPACT_KV80: tl.constexpr,
+    LOGICAL_BLOCK_N: tl.constexpr,
 ):
-    if COMPACT_KV80:
+    if LOGICAL_BLOCK_N < BLOCK_N:
         physical_cols = tl.arange(0, BLOCK_N)
         return tl.where(
-            physical_cols[None, :] < 80,
+            physical_cols[None, :] < LOGICAL_BLOCK_N,
             qk,
             float("-inf"),
         )
@@ -1068,6 +1087,7 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM_PADDED: tl.constexpr,
+    ACTIVE_WGMMA_N: tl.constexpr,
     NUM_BUFFERS_Q: tl.constexpr,
     NUM_MMA_GROUPS: tl.constexpr,
     BM_SPLIT: tl.constexpr,
@@ -1094,7 +1114,9 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
     num_progs = tl.num_programs(0)
     pack_factor: tl.constexpr = h // hk if PACK_GQA else 1
     effective_heads: tl.constexpr = hk if PACK_GQA else h
-    LOGICAL_BLOCK_N: tl.constexpr = 80 if COMPACT_KV80 else BLOCK_N
+    LOGICAL_BLOCK_N: tl.constexpr = (
+        ACTIVE_WGMMA_N if ACTIVE_WGMMA_N != 0 else BLOCK_N
+    )
     num_pid_m = tl.cdiv(seqlen_q * pack_factor, BLOCK_M)
     total_tiles = num_pid_m * b * effective_heads
 
@@ -1268,13 +1290,12 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                     )
                     qk = tl.dot(q_regs, k_regs, out_dtype=tl.float32)
                 else:
-                    if COMPACT_KV80:
+                    if ACTIVE_WGMMA_N == 0:
                         qk = tle.gpu.wgmma(
                             q_tile,
                             k_tile,
                             out_dtype=tl.float32,
                             trans_b=True,
-                            active_n=80,
                         )
                     else:
                         qk = tle.gpu.wgmma(
@@ -1282,6 +1303,7 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                             k_tile,
                             out_dtype=tl.float32,
                             trans_b=True,
+                            active_n=ACTIVE_WGMMA_N,
                         )
                 if NUM_MMA_GROUPS == 2:
                     if cid == 0:
@@ -1306,10 +1328,10 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                     IS_ALIBI=is_alibi,
                     alibi_slope=alibi_slope,
                 )
-                qk = _mask_compact_kv_carrier(
+                qk = _mask_wgmma_n_carrier(
                     qk,
                     BLOCK_N,
-                    COMPACT_KV80,
+                    LOGICAL_BLOCK_N,
                 )
                 if is_causal and not is_local:
                     if n_block < causal_full_block_max:
@@ -1397,13 +1419,12 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                             )
                             qk = tl.dot(q_regs, k_regs, out_dtype=tl.float32)
                         else:
-                            if COMPACT_KV80:
+                            if ACTIVE_WGMMA_N == 0:
                                 qk = tle.gpu.wgmma(
                                     q_tile,
                                     k_tile,
                                     out_dtype=tl.float32,
                                     trans_b=True,
-                                    active_n=80,
                                 )
                             else:
                                 qk = tle.gpu.wgmma(
@@ -1411,6 +1432,7 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                                     k_tile,
                                     out_dtype=tl.float32,
                                     trans_b=True,
+                                    active_n=ACTIVE_WGMMA_N,
                                 )
                         if NUM_MMA_GROUPS == 2:
                             if cid == 0:
@@ -1435,7 +1457,7 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                                     p.to(INPUT_DTYPE),
                                     v_tile,
                                     acc,
-                                    active_k=80,
+                                    active_k=ACTIVE_WGMMA_N,
                                 )
                             else:
                                 acc = tle.gpu.wgmma(
@@ -1460,10 +1482,10 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                             IS_ALIBI=is_alibi,
                             alibi_slope=alibi_slope,
                         )
-                        qk = _mask_compact_kv_carrier(
+                        qk = _mask_wgmma_n_carrier(
                             qk,
                             BLOCK_N,
-                            COMPACT_KV80,
+                            LOGICAL_BLOCK_N,
                         )
                         alpha, p, rowmax, rowsum = _softmax_online_deferred(
                             qk,
@@ -1516,13 +1538,12 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                             )
                             qk = tl.dot(q_regs, k_regs, out_dtype=tl.float32)
                         else:
-                            if COMPACT_KV80:
+                            if ACTIVE_WGMMA_N == 0:
                                 qk = tle.gpu.wgmma(
                                     q_tile,
                                     k_tile,
                                     out_dtype=tl.float32,
                                     trans_b=True,
-                                    active_n=80,
                                 )
                             else:
                                 qk = tle.gpu.wgmma(
@@ -1530,6 +1551,7 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                                     k_tile,
                                     out_dtype=tl.float32,
                                     trans_b=True,
+                                    active_n=ACTIVE_WGMMA_N,
                                 )
                         if NUM_MMA_GROUPS == 2:
                             if cid == 0:
@@ -1554,7 +1576,7 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                                     p.to(INPUT_DTYPE),
                                     v_tile,
                                     acc,
-                                    active_k=80,
+                                    active_k=ACTIVE_WGMMA_N,
                                 )
                             else:
                                 acc = tle.gpu.wgmma(
@@ -1579,10 +1601,10 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                             IS_ALIBI=is_alibi,
                             alibi_slope=alibi_slope,
                         )
-                        qk = _mask_compact_kv_carrier(
+                        qk = _mask_wgmma_n_carrier(
                             qk,
                             BLOCK_N,
-                            COMPACT_KV80,
+                            LOGICAL_BLOCK_N,
                         )
                         qk = _apply_mask_v3(
                             qk,
@@ -1640,13 +1662,12 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                             )
                             qk = tl.dot(q_regs, k_regs, out_dtype=tl.float32)
                         else:
-                            if COMPACT_KV80:
+                            if ACTIVE_WGMMA_N == 0:
                                 qk = tle.gpu.wgmma(
                                     q_tile,
                                     k_tile,
                                     out_dtype=tl.float32,
                                     trans_b=True,
-                                    active_n=80,
                                 )
                             else:
                                 qk = tle.gpu.wgmma(
@@ -1654,6 +1675,7 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                                     k_tile,
                                     out_dtype=tl.float32,
                                     trans_b=True,
+                                    active_n=ACTIVE_WGMMA_N,
                                 )
                         if NUM_MMA_GROUPS == 2:
                             if cid == 0:
@@ -1678,7 +1700,7 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                                     p.to(INPUT_DTYPE),
                                     v_tile,
                                     acc,
-                                    active_k=80,
+                                    active_k=ACTIVE_WGMMA_N,
                                 )
                             else:
                                 acc = tle.gpu.wgmma(
@@ -1703,21 +1725,21 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                             IS_ALIBI=is_alibi,
                             alibi_slope=alibi_slope,
                         )
-                        qk = _mask_compact_kv_carrier(
+                        qk = _mask_wgmma_n_carrier(
                             qk,
                             BLOCK_N,
-                            COMPACT_KV80,
+                            LOGICAL_BLOCK_N,
                         )
                         if is_causal and not is_local:
                             if n_block + 1 < n_block_max:
                                 alpha, p, rowmax, rowsum = (
                                     _softmax_online_deferred(
-                                    qk,
-                                    rowmax,
-                                    rowsum,
-                                    softmax_scale_log2e=scale_softmax_log2,
-                                    IS_BORDER=False,
-                                )
+                                        qk,
+                                        rowmax,
+                                        rowsum,
+                                        softmax_scale_log2e=scale_softmax_log2,
+                                        IS_BORDER=False,
+                                    )
                                 )
                             else:
                                 qk = _apply_mask_v3(
@@ -1734,12 +1756,12 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                                 )
                                 alpha, p, rowmax, rowsum = (
                                     _softmax_online_deferred(
-                                    qk,
-                                    rowmax,
-                                    rowsum,
-                                    softmax_scale_log2e=scale_softmax_log2,
-                                    IS_BORDER=True,
-                                )
+                                        qk,
+                                        rowmax,
+                                        rowsum,
+                                        softmax_scale_log2e=scale_softmax_log2,
+                                        IS_BORDER=True,
+                                    )
                                 )
                         else:
                             qk = _apply_mask_v3(
@@ -1756,12 +1778,12 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                             )
                             alpha, p, rowmax, rowsum = (
                                 _softmax_online_deferred(
-                                qk,
-                                rowmax,
-                                rowsum,
-                                softmax_scale_log2e=scale_softmax_log2,
-                                IS_BORDER=True,
-                            )
+                                    qk,
+                                    rowmax,
+                                    rowsum,
+                                    softmax_scale_log2e=scale_softmax_log2,
+                                    IS_BORDER=True,
+                                )
                             )
                         if EARLY_CAST_P:
                             p = p.to(INPUT_DTYPE)
@@ -1790,7 +1812,7 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                             p.to(INPUT_DTYPE),
                             v_tile,
                             acc,
-                            active_k=80,
+                            active_k=ACTIVE_WGMMA_N,
                         )
                     else:
                         acc = tle.gpu.wgmma(
@@ -2129,6 +2151,7 @@ def flash_varlen_fwd_v3_tle_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ACTIVE_WGMMA_N: tl.constexpr,
     NUM_BUFFERS_Q: tl.constexpr,
     NUM_BUFFERS_KV: tl.constexpr,
     NUM_MMA_WARPS: tl.constexpr,
@@ -2159,7 +2182,9 @@ def flash_varlen_fwd_v3_tle_kernel(
 ):
     BM_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
     HEAD_DIM_PADDED: tl.constexpr = BLOCK_K
-    LOGICAL_BLOCK_N: tl.constexpr = 80 if COMPACT_KV80 else BLOCK_N
+    LOGICAL_BLOCK_N: tl.constexpr = (
+        ACTIVE_WGMMA_N if ACTIVE_WGMMA_N != 0 else BLOCK_N
+    )
     Q_PIPE_ASYNC_EFFECTIVE: tl.constexpr = Q_PIPE_ASYNC and d < 256
     PAGED_KV_NON_TMA_EFFECTIVE: tl.constexpr = PAGED_KV_NON_TMA or (
         block_size % LOGICAL_BLOCK_N != 0
@@ -2167,6 +2192,25 @@ def flash_varlen_fwd_v3_tle_kernel(
     INPUT_DTYPE = q_ptr.dtype.element_ty
     page_stride_rows = k_batch_stride // k_row_stride
     THREADS_IN_MMA_GROUPS: tl.constexpr = NUM_MMA_WARPS * 32
+    tl.static_assert(
+        ACTIVE_WGMMA_N == 0
+        or (
+            ACTIVE_WGMMA_N >= 16
+            and ACTIVE_WGMMA_N % 16 == 0
+            and ACTIVE_WGMMA_N <= BLOCK_N
+        )
+    )
+    if ACTIVE_WGMMA_N != 0:
+        tl.static_assert(BLOCK_M == 128)
+        tl.static_assert(NUM_MMA_GROUPS == 2 and NUM_MMA_WARPS == 8)
+        tl.static_assert(NUM_BUFFERS_KV == 2 and NUM_BUFFERS_Q == 1)
+        tl.static_assert(Q_STAGE_CAPACITY == 2)
+    if COMPACT_KV80:
+        tl.static_assert(ACTIVE_WGMMA_N == 80)
+    else:
+        tl.static_assert(
+            ACTIVE_WGMMA_N == 0 or ACTIVE_WGMMA_N == BLOCK_N
+        )
     tl.static_assert(not RESCALE_O_BEFORE_PV or COMPACT_KV80)
     tl.static_assert(not EARLY_CAST_P or COMPACT_KV80)
     if COMPACT_KV80:
@@ -2405,6 +2449,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                         BLOCK_M,
                         BLOCK_N,
                         HEAD_DIM_PADDED,
+                        ACTIVE_WGMMA_N,
                         NUM_BUFFERS_Q,
                         NUM_MMA_GROUPS,
                         BM_SPLIT,
@@ -2483,6 +2528,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                         BLOCK_M,
                         BLOCK_N,
                         HEAD_DIM_PADDED,
+                        ACTIVE_WGMMA_N,
                         NUM_BUFFERS_Q,
                         NUM_MMA_GROUPS,
                         BM_SPLIT,
@@ -2561,6 +2607,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                         BLOCK_M,
                         BLOCK_N,
                         HEAD_DIM_PADDED,
+                        ACTIVE_WGMMA_N,
                         NUM_BUFFERS_Q,
                         NUM_MMA_GROUPS,
                         BM_SPLIT,
@@ -2639,6 +2686,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                         BLOCK_M,
                         BLOCK_N,
                         HEAD_DIM_PADDED,
+                        ACTIVE_WGMMA_N,
                         NUM_BUFFERS_Q,
                         NUM_MMA_GROUPS,
                         BM_SPLIT,
@@ -2717,6 +2765,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                         BLOCK_M,
                         BLOCK_N,
                         HEAD_DIM_PADDED,
+                        ACTIVE_WGMMA_N,
                         NUM_BUFFERS_Q,
                         NUM_MMA_GROUPS,
                         BM_SPLIT,
