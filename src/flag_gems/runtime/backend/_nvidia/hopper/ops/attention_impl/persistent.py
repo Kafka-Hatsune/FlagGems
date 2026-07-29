@@ -207,17 +207,21 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
     PAGED_KV_NON_TMA: tl.constexpr,
     PAGED_PIPE_ASYNC: tl.constexpr,
     PAGED_GATHER_MODE: tl.constexpr,
+    STAGGER_KV: tl.constexpr,
+    COMPACT_KV80: tl.constexpr,
     PACK_GQA: tl.constexpr,
     RAGGED_SCHEDULER: tl.constexpr,
     HEADS_IN_L2: tl.constexpr,
     DYNAMIC_SCHEDULER: tl.constexpr,
     SPLIT_KV: tl.constexpr,
     MAX_SPLITS: tl.constexpr,
+    EXPLICIT_SPLIT_K_CHUNK: tl.constexpr,
 ):
     prog_id = tl.program_id(0)
     num_progs = tl.num_programs(0)
     pack_factor: tl.constexpr = h_hk_ratio if PACK_GQA else 1
     effective_heads: tl.constexpr = hk if PACK_GQA else h
+    LOGICAL_BLOCK_N: tl.constexpr = 80 if COMPACT_KV80 else BLOCK_N
     num_pid_m = tl.cdiv(seqlen_q * pack_factor, BLOCK_M)
     total_tiles = num_pid_m * b * effective_heads
 
@@ -243,6 +247,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
             MAX_SPLITS,
             pack_factor,
             HEADS_IN_L2,
+            EXPLICIT_SPLIT_K_CHUNK,
         )
     elif RAGGED_SCHEDULER:
         m_block, bid, hid, work_valid = _ragged_persistent_tile_coords(
@@ -284,18 +289,19 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
             if is_local:
                 n_block_min = tl.maximum(
                     0,
-                    (q_block_start + k_len - q_len - window_size_left) // BLOCK_N,
+                    (q_block_start + k_len - q_len - window_size_left)
+                    // LOGICAL_BLOCK_N,
                 )
             else:
                 n_block_min = 0
 
-            n_block_max = tl.cdiv(k_len, BLOCK_N)
+            n_block_max = tl.cdiv(k_len, LOGICAL_BLOCK_N)
             if is_causal or is_local:
                 n_block_max = tl.minimum(
                     n_block_max,
                     tl.cdiv(
                         q_block_end + k_len - q_len + window_size_right,
-                        BLOCK_N,
+                        LOGICAL_BLOCK_N,
                     ),
                 )
             if SPLIT_KV:
@@ -349,7 +355,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             k_row_stride,
                             1,
                         ],
-                        block_shape=[1, BLOCK_N, HEAD_DIM_PADDED],
+                        block_shape=[1, LOGICAL_BLOCK_N, HEAD_DIM_PADDED],
                     )
                     v_desc = tl.make_tensor_descriptor(
                         base=v_base,
@@ -359,20 +365,20 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             v_row_stride,
                             1,
                         ],
-                        block_shape=[1, BLOCK_N, HEAD_DIM_PADDED],
+                        block_shape=[1, LOGICAL_BLOCK_N, HEAD_DIM_PADDED],
                     )
                 elif (not is_paged) and USE_TMA_KV:
                     k_desc = tl.make_tensor_descriptor(
                         base=k_base,
                         shape=[k_len, d],
                         strides=[k_row_stride, 1],
-                        block_shape=[BLOCK_N, HEAD_DIM_PADDED],
+                        block_shape=[LOGICAL_BLOCK_N, HEAD_DIM_PADDED],
                     )
                     v_desc = tl.make_tensor_descriptor(
                         base=v_base,
                         shape=[k_len, d],
                         strides=[v_row_stride, 1],
-                        block_shape=[BLOCK_N, HEAD_DIM_PADDED],
+                        block_shape=[LOGICAL_BLOCK_N, HEAD_DIM_PADDED],
                     )
 
                 q_buf, q_phase_idx = _buf_phase_tle(tile_count, NUM_BUFFERS_Q)
@@ -474,7 +480,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                     _fence_async_shared_cta()
                     tle.gpu.barrier_arrive(q_fulls_manual[q0_idx], phaseIdx=q_phase_idx)
 
-                kv_offset = n_block_min * BLOCK_N
+                kv_offset = n_block_min * LOGICAL_BLOCK_N
                 if is_paged and PAGED_KV_NON_TMA:
                     if BM_SPLIT != 16:
                         _copy_paged_kv_tile_to_pipe(
@@ -489,9 +495,10 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             d,
                             block_size,
                             page_stride_rows,
-                            BLOCK_N,
+                            LOGICAL_BLOCK_N,
                             HEAD_DIM_PADDED,
                             PAGED_GATHER_MODE,
+                            COMPACT_KV80=COMPACT_KV80,
                         )
                 elif BM_SPLIT != 16:
                     if is_paged:
@@ -502,7 +509,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             page_table_ptr_b,
                             kv_offset,
                             block_size,
-                            BLOCK_N,
+                            LOGICAL_BLOCK_N,
                             HEAD_DIM_PADDED,
                         )
                     elif USE_TMA_KV:
@@ -511,7 +518,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             accum_cnt_kv,
                             k_desc,
                             kv_offset,
-                            BLOCK_N,
+                            LOGICAL_BLOCK_N,
                             HEAD_DIM_PADDED,
                         )
                     else:
@@ -523,7 +530,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             kv_offset,
                             k_len,
                             d,
-                            BLOCK_N,
+                            LOGICAL_BLOCK_N,
                             HEAD_DIM_PADDED,
                         )
 
@@ -599,22 +606,24 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                         )
 
                 if is_paged and PAGED_KV_NON_TMA:
-                    _copy_paged_kv_tile_to_pipe(
-                        v_writer,
-                        accum_cnt_kv,
-                        PAGED_PIPE_ASYNC,
-                        v_base,
-                        v_row_stride,
-                        page_table_ptr_b,
-                        kv_offset,
-                        k_len,
-                        d,
-                        block_size,
-                        page_stride_rows,
-                        BLOCK_N,
-                        HEAD_DIM_PADDED,
-                        PAGED_GATHER_MODE,
-                    )
+                    if not STAGGER_KV:
+                        _copy_paged_kv_tile_to_pipe(
+                            v_writer,
+                            accum_cnt_kv,
+                            PAGED_PIPE_ASYNC,
+                            v_base,
+                            v_row_stride,
+                            page_table_ptr_b,
+                            kv_offset,
+                            k_len,
+                            d,
+                            block_size,
+                            page_stride_rows,
+                            LOGICAL_BLOCK_N,
+                            HEAD_DIM_PADDED,
+                            PAGED_GATHER_MODE,
+                            COMPACT_KV80=COMPACT_KV80,
+                        )
                 elif is_paged:
                     _copy_paged_kv_tma_tile_to_pipe(
                         v_writer,
@@ -623,7 +632,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                         page_table_ptr_b,
                         kv_offset,
                         block_size,
-                        BLOCK_N,
+                        LOGICAL_BLOCK_N,
                         HEAD_DIM_PADDED,
                     )
                 elif USE_TMA_KV:
@@ -632,7 +641,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                         accum_cnt_kv,
                         v_desc,
                         kv_offset,
-                        BLOCK_N,
+                        LOGICAL_BLOCK_N,
                         HEAD_DIM_PADDED,
                     )
                 else:
@@ -644,7 +653,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                         kv_offset,
                         k_len,
                         d,
-                        BLOCK_N,
+                        LOGICAL_BLOCK_N,
                         HEAD_DIM_PADDED,
                     )
                 accum_cnt_kv += 1
@@ -653,9 +662,11 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                 # trailing loop preserves correctness for a partial KV tile
                 # without carrying its predicates through every full tile.
                 if is_paged and PAGED_KV_NON_TMA:
-                    full_n_block_max = tl.minimum(n_block_max, k_len // BLOCK_N)
+                    full_n_block_max = tl.minimum(
+                        n_block_max, k_len // LOGICAL_BLOCK_N
+                    )
                     for n_block in tl.range(n_block_min + 1, full_n_block_max):
-                        kv_offset = n_block * BLOCK_N
+                        kv_offset = n_block * LOGICAL_BLOCK_N
                         if BM_SPLIT != 16:
                             _copy_paged_kv_tile_to_pipe(
                                 k_writer,
@@ -669,33 +680,40 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                                 d,
                                 block_size,
                                 page_stride_rows,
-                                BLOCK_N,
+                                LOGICAL_BLOCK_N,
                                 HEAD_DIM_PADDED,
                                 PAGED_GATHER_MODE,
                                 False,
+                                COMPACT_KV80=COMPACT_KV80,
                             )
+                        v_iteration = accum_cnt_kv
+                        v_offset = kv_offset
+                        if STAGGER_KV:
+                            v_iteration -= 1
+                            v_offset -= LOGICAL_BLOCK_N
                         _copy_paged_kv_tile_to_pipe(
                             v_writer,
-                            accum_cnt_kv,
+                            v_iteration,
                             PAGED_PIPE_ASYNC,
                             v_base,
                             v_row_stride,
                             page_table_ptr_b,
-                            kv_offset,
+                            v_offset,
                             k_len,
                             d,
                             block_size,
                             page_stride_rows,
-                            BLOCK_N,
+                            LOGICAL_BLOCK_N,
                             HEAD_DIM_PADDED,
                             PAGED_GATHER_MODE,
                             False,
+                            COMPACT_KV80=COMPACT_KV80,
                         )
                         accum_cnt_kv += 1
 
                     border_n_block_start = tl.maximum(n_block_min + 1, full_n_block_max)
                     for n_block in tl.range(border_n_block_start, n_block_max):
-                        kv_offset = n_block * BLOCK_N
+                        kv_offset = n_block * LOGICAL_BLOCK_N
                         if BM_SPLIT != 16:
                             _copy_paged_kv_tile_to_pipe(
                                 k_writer,
@@ -709,35 +727,63 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                                 d,
                                 block_size,
                                 page_stride_rows,
-                                BLOCK_N,
+                                LOGICAL_BLOCK_N,
                                 HEAD_DIM_PADDED,
                                 PAGED_GATHER_MODE,
                                 True,
+                                COMPACT_KV80=COMPACT_KV80,
                             )
+                        v_iteration = accum_cnt_kv
+                        v_offset = kv_offset
+                        if STAGGER_KV:
+                            v_iteration -= 1
+                            v_offset -= LOGICAL_BLOCK_N
                         _copy_paged_kv_tile_to_pipe(
                             v_writer,
-                            accum_cnt_kv,
+                            v_iteration,
                             PAGED_PIPE_ASYNC,
                             v_base,
                             v_row_stride,
                             page_table_ptr_b,
-                            kv_offset,
+                            v_offset,
                             k_len,
                             d,
                             block_size,
                             page_stride_rows,
-                            BLOCK_N,
+                            LOGICAL_BLOCK_N,
                             HEAD_DIM_PADDED,
                             PAGED_GATHER_MODE,
                             True,
+                            COMPACT_KV80=COMPACT_KV80,
                         )
                         accum_cnt_kv += 1
+
+                if is_paged and PAGED_KV_NON_TMA and STAGGER_KV:
+                    # Drain V(last) after all K stages have been published.
+                    _copy_paged_kv_tile_to_pipe(
+                        v_writer,
+                        accum_cnt_kv - 1,
+                        PAGED_PIPE_ASYNC,
+                        v_base,
+                        v_row_stride,
+                        page_table_ptr_b,
+                        (n_block_max - 1) * LOGICAL_BLOCK_N,
+                        k_len,
+                        d,
+                        block_size,
+                        page_stride_rows,
+                        LOGICAL_BLOCK_N,
+                        HEAD_DIM_PADDED,
+                        PAGED_GATHER_MODE,
+                        True,
+                        COMPACT_KV80=COMPACT_KV80,
+                    )
 
                 remaining_n_block_start = n_block_min + 1
                 if is_paged and PAGED_KV_NON_TMA:
                     remaining_n_block_start = n_block_max
                 for n_block in tl.range(remaining_n_block_start, n_block_max):
-                    kv_offset = n_block * BLOCK_N
+                    kv_offset = n_block * LOGICAL_BLOCK_N
 
                     if is_paged and PAGED_KV_NON_TMA:
                         if BM_SPLIT != 16:
@@ -753,9 +799,10 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                                 d,
                                 block_size,
                                 page_stride_rows,
-                                BLOCK_N,
+                                LOGICAL_BLOCK_N,
                                 HEAD_DIM_PADDED,
                                 PAGED_GATHER_MODE,
+                                COMPACT_KV80=COMPACT_KV80,
                             )
                     elif BM_SPLIT != 16:
                         if is_paged:
@@ -766,7 +813,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                                 page_table_ptr_b,
                                 kv_offset,
                                 block_size,
-                                BLOCK_N,
+                                LOGICAL_BLOCK_N,
                                 HEAD_DIM_PADDED,
                             )
                         elif USE_TMA_KV:
@@ -775,7 +822,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                                 accum_cnt_kv,
                                 k_desc,
                                 kv_offset,
-                                BLOCK_N,
+                                LOGICAL_BLOCK_N,
                                 HEAD_DIM_PADDED,
                             )
                         else:
@@ -787,7 +834,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                                 kv_offset,
                                 k_len,
                                 d,
-                                BLOCK_N,
+                                LOGICAL_BLOCK_N,
                                 HEAD_DIM_PADDED,
                             )
 
@@ -804,9 +851,10 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             d,
                             block_size,
                             page_stride_rows,
-                            BLOCK_N,
+                            LOGICAL_BLOCK_N,
                             HEAD_DIM_PADDED,
                             PAGED_GATHER_MODE,
+                            COMPACT_KV80=COMPACT_KV80,
                         )
                     elif is_paged:
                         _copy_paged_kv_tma_tile_to_pipe(
@@ -816,7 +864,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             page_table_ptr_b,
                             kv_offset,
                             block_size,
-                            BLOCK_N,
+                            LOGICAL_BLOCK_N,
                             HEAD_DIM_PADDED,
                         )
                     elif USE_TMA_KV:
@@ -825,7 +873,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             accum_cnt_kv,
                             v_desc,
                             kv_offset,
-                            BLOCK_N,
+                            LOGICAL_BLOCK_N,
                             HEAD_DIM_PADDED,
                         )
                     else:
@@ -837,7 +885,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             kv_offset,
                             k_len,
                             d,
-                            BLOCK_N,
+                            LOGICAL_BLOCK_N,
                             HEAD_DIM_PADDED,
                         )
                     accum_cnt_kv += 1
@@ -885,6 +933,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                 MAX_SPLITS,
                 pack_factor,
                 HEADS_IN_L2,
+                EXPLICIT_SPLIT_K_CHUNK,
             )
         elif RAGGED_SCHEDULER:
             m_block, bid, hid, work_valid = _ragged_persistent_tile_coords(
@@ -943,6 +992,23 @@ def _load_paged_k_for_warp_mma(
         mask=(n_offset + rows[None, :] < k_len) & (d_idx[:, None] < d),
         other=0.0,
     )
+
+
+@triton.jit
+def _mask_compact_kv_carrier(
+    qk,
+    BLOCK_N: tl.constexpr,
+    COMPACT_KV80: tl.constexpr,
+):
+    if COMPACT_KV80:
+        physical_cols = tl.arange(0, BLOCK_N)
+        return tl.where(
+            physical_cols[None, :] < 80,
+            qk,
+            float("-inf"),
+        )
+    else:
+        return qk
 
 
 @triton.jit
@@ -1010,11 +1076,15 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
     REUSE_Q_SMEM_O: tl.constexpr,
     CID: tl.constexpr,
     PACK_GQA: tl.constexpr,
+    COMPACT_KV80: tl.constexpr,
+    RESCALE_O_BEFORE_PV: tl.constexpr,
+    EARLY_CAST_P: tl.constexpr,
     RAGGED_SCHEDULER: tl.constexpr,
     HEADS_IN_L2: tl.constexpr,
     DYNAMIC_SCHEDULER: tl.constexpr,
     SPLIT_KV: tl.constexpr,
     MAX_SPLITS: tl.constexpr,
+    EXPLICIT_SPLIT_K_CHUNK: tl.constexpr,
     STORE_LSE: tl.constexpr,
 ):
     INPUT_DTYPE = q_ptr.dtype.element_ty
@@ -1024,6 +1094,7 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
     num_progs = tl.num_programs(0)
     pack_factor: tl.constexpr = h // hk if PACK_GQA else 1
     effective_heads: tl.constexpr = hk if PACK_GQA else h
+    LOGICAL_BLOCK_N: tl.constexpr = 80 if COMPACT_KV80 else BLOCK_N
     num_pid_m = tl.cdiv(seqlen_q * pack_factor, BLOCK_M)
     total_tiles = num_pid_m * b * effective_heads
 
@@ -1057,6 +1128,7 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
             MAX_SPLITS,
             pack_factor,
             HEADS_IN_L2,
+            EXPLICIT_SPLIT_K_CHUNK,
         )
     elif RAGGED_SCHEDULER:
         m_block, bid, hid, work_valid = _ragged_persistent_tile_coords(
@@ -1119,18 +1191,19 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
             if is_local:
                 n_block_min = tl.maximum(
                     0,
-                    (q_block_start + k_len - q_len - window_size_left) // BLOCK_N,
+                    (q_block_start + k_len - q_len - window_size_left)
+                    // LOGICAL_BLOCK_N,
                 )
             else:
                 n_block_min = 0
 
-            n_block_max = tl.cdiv(k_len, BLOCK_N)
+            n_block_max = tl.cdiv(k_len, LOGICAL_BLOCK_N)
             if is_causal or is_local:
                 n_block_max = tl.minimum(
                     n_block_max,
                     tl.cdiv(
                         q_block_end + k_len - q_len + window_size_right,
-                        BLOCK_N,
+                        LOGICAL_BLOCK_N,
                     ),
                 )
             if SPLIT_KV:
@@ -1154,7 +1227,7 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                     packed_row_start // pack_factor + k_len - q_len + 1
                 )
                 causal_full_block_max = tl.maximum(
-                    n_block_min, causal_col_exclusive // BLOCK_N
+                    n_block_min, causal_col_exclusive // LOGICAL_BLOCK_N
                 )
                 rowmax = tl.full([BM_SPLIT], float("-inf"), dtype=tl.float32)
                 rowsum = tl.zeros([BM_SPLIT], dtype=tl.float32)
@@ -1185,22 +1258,31 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                         k_head_stride,
                         kv_head,
                         page_table_ptr_b,
-                        n_block_min * BLOCK_N,
+                        n_block_min * LOGICAL_BLOCK_N,
                         k_len,
                         d,
                         block_size,
                         page_stride_rows,
-                        BLOCK_N,
+                        LOGICAL_BLOCK_N,
                         HEAD_DIM_PADDED,
                     )
                     qk = tl.dot(q_regs, k_regs, out_dtype=tl.float32)
                 else:
-                    qk = tle.gpu.wgmma(
-                        q_tile,
-                        k_tile,
-                        out_dtype=tl.float32,
-                        trans_b=True,
-                    )
+                    if COMPACT_KV80:
+                        qk = tle.gpu.wgmma(
+                            q_tile,
+                            k_tile,
+                            out_dtype=tl.float32,
+                            trans_b=True,
+                            active_n=80,
+                        )
+                    else:
+                        qk = tle.gpu.wgmma(
+                            q_tile,
+                            k_tile,
+                            out_dtype=tl.float32,
+                            trans_b=True,
+                        )
                 if NUM_MMA_GROUPS == 2:
                     if cid == 0:
                         tle.gpu.barrier_arrive(ping_to_c1)
@@ -1212,7 +1294,7 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                     k_reader.release(accum_cnt_kv)
 
                 n_block = n_block_min
-                col_idx = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+                col_idx = n_block * LOGICAL_BLOCK_N + tl.arange(0, BLOCK_N)
                 qk = _apply_softcap_v3(qk, softcap, is_softcap)
                 qk = _apply_alibi_v3(
                     qk,
@@ -1223,6 +1305,11 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                     IS_CAUSAL=is_causal,
                     IS_ALIBI=is_alibi,
                     alibi_slope=alibi_slope,
+                )
+                qk = _mask_compact_kv_carrier(
+                    qk,
+                    BLOCK_N,
+                    COMPACT_KV80,
                 )
                 if is_causal and not is_local:
                     if n_block < causal_full_block_max:
@@ -1273,6 +1360,8 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                         softmax_scale_log2e=scale_softmax_log2,
                         IS_BORDER=True,
                     )
+                if EARLY_CAST_P:
+                    p = p.to(INPUT_DTYPE)
                 accum_cnt_kv += 1
 
                 if is_causal and not is_local:
@@ -1298,22 +1387,31 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                                 k_head_stride,
                                 kv_head,
                                 page_table_ptr_b,
-                                n_block * BLOCK_N,
+                                n_block * LOGICAL_BLOCK_N,
                                 k_len,
                                 d,
                                 block_size,
                                 page_stride_rows,
-                                BLOCK_N,
+                                LOGICAL_BLOCK_N,
                                 HEAD_DIM_PADDED,
                             )
                             qk = tl.dot(q_regs, k_regs, out_dtype=tl.float32)
                         else:
-                            qk = tle.gpu.wgmma(
-                                q_tile,
-                                k_tile,
-                                out_dtype=tl.float32,
-                                trans_b=True,
-                            )
+                            if COMPACT_KV80:
+                                qk = tle.gpu.wgmma(
+                                    q_tile,
+                                    k_tile,
+                                    out_dtype=tl.float32,
+                                    trans_b=True,
+                                    active_n=80,
+                                )
+                            else:
+                                qk = tle.gpu.wgmma(
+                                    q_tile,
+                                    k_tile,
+                                    out_dtype=tl.float32,
+                                    trans_b=True,
+                                )
                         if NUM_MMA_GROUPS == 2:
                             if cid == 0:
                                 tle.gpu.barrier_arrive(ping_to_c1)
@@ -1321,6 +1419,8 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                                 tle.gpu.barrier_arrive(ping_to_c0)
 
                         v_tile = v_reader.wait(accum_cnt_kv - 1).slot.kv
+                        if RESCALE_O_BEFORE_PV:
+                            acc = acc * alpha[:, None]
                         if USE_WARP_MMA:
                             v_regs = tl.load(tle.gpu.local_ptr(v_tile))
                             acc = tl.dot(
@@ -1330,11 +1430,25 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                                 out_dtype=tl.float32,
                             )
                         else:
-                            acc = tle.gpu.wgmma(p.to(INPUT_DTYPE), v_tile, acc)
+                            if COMPACT_KV80:
+                                acc = tle.gpu.wgmma(
+                                    p.to(INPUT_DTYPE),
+                                    v_tile,
+                                    acc,
+                                    active_k=80,
+                                )
+                            else:
+                                acc = tle.gpu.wgmma(
+                                    p.to(INPUT_DTYPE),
+                                    v_tile,
+                                    acc,
+                                )
                             qk = tle.gpu.wgmma_wait(1, qk)
                             k_reader.release(accum_cnt_kv)
 
-                        col_idx = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+                        col_idx = (
+                            n_block * LOGICAL_BLOCK_N + tl.arange(0, BLOCK_N)
+                        )
                         qk = _apply_softcap_v3(qk, softcap, is_softcap)
                         qk = _apply_alibi_v3(
                             qk,
@@ -1346,6 +1460,11 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                             IS_ALIBI=is_alibi,
                             alibi_slope=alibi_slope,
                         )
+                        qk = _mask_compact_kv_carrier(
+                            qk,
+                            BLOCK_N,
+                            COMPACT_KV80,
+                        )
                         alpha, p, rowmax, rowsum = _softmax_online_deferred(
                             qk,
                             rowmax,
@@ -1353,11 +1472,14 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                             softmax_scale_log2e=scale_softmax_log2,
                             IS_BORDER=False,
                         )
+                        if EARLY_CAST_P:
+                            p = p.to(INPUT_DTYPE)
 
                         if not USE_WARP_MMA:
                             acc = tle.gpu.wgmma_wait(0, acc)
                         v_reader.release(accum_cnt_kv - 1)
-                        acc = acc * alpha[:, None]
+                        if not RESCALE_O_BEFORE_PV:
+                            acc = acc * alpha[:, None]
                         accum_cnt_kv += 1
 
                     # One or more trailing tiles can cross the earliest
@@ -1384,22 +1506,31 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                                 k_head_stride,
                                 kv_head,
                                 page_table_ptr_b,
-                                n_block * BLOCK_N,
+                                n_block * LOGICAL_BLOCK_N,
                                 k_len,
                                 d,
                                 block_size,
                                 page_stride_rows,
-                                BLOCK_N,
+                                LOGICAL_BLOCK_N,
                                 HEAD_DIM_PADDED,
                             )
                             qk = tl.dot(q_regs, k_regs, out_dtype=tl.float32)
                         else:
-                            qk = tle.gpu.wgmma(
-                                q_tile,
-                                k_tile,
-                                out_dtype=tl.float32,
-                                trans_b=True,
-                            )
+                            if COMPACT_KV80:
+                                qk = tle.gpu.wgmma(
+                                    q_tile,
+                                    k_tile,
+                                    out_dtype=tl.float32,
+                                    trans_b=True,
+                                    active_n=80,
+                                )
+                            else:
+                                qk = tle.gpu.wgmma(
+                                    q_tile,
+                                    k_tile,
+                                    out_dtype=tl.float32,
+                                    trans_b=True,
+                                )
                         if NUM_MMA_GROUPS == 2:
                             if cid == 0:
                                 tle.gpu.barrier_arrive(ping_to_c1)
@@ -1407,6 +1538,8 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                                 tle.gpu.barrier_arrive(ping_to_c0)
 
                         v_tile = v_reader.wait(accum_cnt_kv - 1).slot.kv
+                        if RESCALE_O_BEFORE_PV:
+                            acc = acc * alpha[:, None]
                         if USE_WARP_MMA:
                             v_regs = tl.load(tle.gpu.local_ptr(v_tile))
                             acc = tl.dot(
@@ -1416,11 +1549,25 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                                 out_dtype=tl.float32,
                             )
                         else:
-                            acc = tle.gpu.wgmma(p.to(INPUT_DTYPE), v_tile, acc)
+                            if COMPACT_KV80:
+                                acc = tle.gpu.wgmma(
+                                    p.to(INPUT_DTYPE),
+                                    v_tile,
+                                    acc,
+                                    active_k=80,
+                                )
+                            else:
+                                acc = tle.gpu.wgmma(
+                                    p.to(INPUT_DTYPE),
+                                    v_tile,
+                                    acc,
+                                )
                             qk = tle.gpu.wgmma_wait(1, qk)
                             k_reader.release(accum_cnt_kv)
 
-                        col_idx = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+                        col_idx = (
+                            n_block * LOGICAL_BLOCK_N + tl.arange(0, BLOCK_N)
+                        )
                         qk = _apply_softcap_v3(qk, softcap, is_softcap)
                         qk = _apply_alibi_v3(
                             qk,
@@ -1431,6 +1578,11 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                             IS_CAUSAL=True,
                             IS_ALIBI=is_alibi,
                             alibi_slope=alibi_slope,
+                        )
+                        qk = _mask_compact_kv_carrier(
+                            qk,
+                            BLOCK_N,
+                            COMPACT_KV80,
                         )
                         qk = _apply_mask_v3(
                             qk,
@@ -1451,11 +1603,14 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                             softmax_scale_log2e=scale_softmax_log2,
                             IS_BORDER=True,
                         )
+                        if EARLY_CAST_P:
+                            p = p.to(INPUT_DTYPE)
 
                         if not USE_WARP_MMA:
                             acc = tle.gpu.wgmma_wait(0, acc)
                         v_reader.release(accum_cnt_kv - 1)
-                        acc = acc * alpha[:, None]
+                        if not RESCALE_O_BEFORE_PV:
+                            acc = acc * alpha[:, None]
                         accum_cnt_kv += 1
                 else:
                     for n_block in tl.range(n_block_min + 1, n_block_max):
@@ -1475,22 +1630,31 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                                 k_head_stride,
                                 kv_head,
                                 page_table_ptr_b,
-                                n_block * BLOCK_N,
+                                n_block * LOGICAL_BLOCK_N,
                                 k_len,
                                 d,
                                 block_size,
                                 page_stride_rows,
-                                BLOCK_N,
+                                LOGICAL_BLOCK_N,
                                 HEAD_DIM_PADDED,
                             )
                             qk = tl.dot(q_regs, k_regs, out_dtype=tl.float32)
                         else:
-                            qk = tle.gpu.wgmma(
-                                q_tile,
-                                k_tile,
-                                out_dtype=tl.float32,
-                                trans_b=True,
-                            )
+                            if COMPACT_KV80:
+                                qk = tle.gpu.wgmma(
+                                    q_tile,
+                                    k_tile,
+                                    out_dtype=tl.float32,
+                                    trans_b=True,
+                                    active_n=80,
+                                )
+                            else:
+                                qk = tle.gpu.wgmma(
+                                    q_tile,
+                                    k_tile,
+                                    out_dtype=tl.float32,
+                                    trans_b=True,
+                                )
                         if NUM_MMA_GROUPS == 2:
                             if cid == 0:
                                 tle.gpu.barrier_arrive(ping_to_c1)
@@ -1498,6 +1662,8 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                                 tle.gpu.barrier_arrive(ping_to_c0)
 
                         v_tile = v_reader.wait(accum_cnt_kv - 1).slot.kv
+                        if RESCALE_O_BEFORE_PV:
+                            acc = acc * alpha[:, None]
                         if USE_WARP_MMA:
                             v_regs = tl.load(tle.gpu.local_ptr(v_tile))
                             acc = tl.dot(
@@ -1507,11 +1673,25 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                                 out_dtype=tl.float32,
                             )
                         else:
-                            acc = tle.gpu.wgmma(p.to(INPUT_DTYPE), v_tile, acc)
+                            if COMPACT_KV80:
+                                acc = tle.gpu.wgmma(
+                                    p.to(INPUT_DTYPE),
+                                    v_tile,
+                                    acc,
+                                    active_k=80,
+                                )
+                            else:
+                                acc = tle.gpu.wgmma(
+                                    p.to(INPUT_DTYPE),
+                                    v_tile,
+                                    acc,
+                                )
                             qk = tle.gpu.wgmma_wait(1, qk)
                             k_reader.release(accum_cnt_kv)
 
-                        col_idx = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+                        col_idx = (
+                            n_block * LOGICAL_BLOCK_N + tl.arange(0, BLOCK_N)
+                        )
                         qk = _apply_softcap_v3(qk, softcap, is_softcap)
                         qk = _apply_alibi_v3(
                             qk,
@@ -1523,14 +1703,21 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                             IS_ALIBI=is_alibi,
                             alibi_slope=alibi_slope,
                         )
+                        qk = _mask_compact_kv_carrier(
+                            qk,
+                            BLOCK_N,
+                            COMPACT_KV80,
+                        )
                         if is_causal and not is_local:
                             if n_block + 1 < n_block_max:
-                                alpha, p, rowmax, rowsum = _softmax_online_deferred(
+                                alpha, p, rowmax, rowsum = (
+                                    _softmax_online_deferred(
                                     qk,
                                     rowmax,
                                     rowsum,
                                     softmax_scale_log2e=scale_softmax_log2,
                                     IS_BORDER=False,
+                                )
                                 )
                             else:
                                 qk = _apply_mask_v3(
@@ -1545,12 +1732,14 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                                     IS_CAUSAL=True,
                                     IS_LOCAL=False,
                                 )
-                                alpha, p, rowmax, rowsum = _softmax_online_deferred(
+                                alpha, p, rowmax, rowsum = (
+                                    _softmax_online_deferred(
                                     qk,
                                     rowmax,
                                     rowsum,
                                     softmax_scale_log2e=scale_softmax_log2,
                                     IS_BORDER=True,
+                                )
                                 )
                         else:
                             qk = _apply_mask_v3(
@@ -1565,21 +1754,28 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                                 IS_CAUSAL=is_causal,
                                 IS_LOCAL=is_local,
                             )
-                            alpha, p, rowmax, rowsum = _softmax_online_deferred(
+                            alpha, p, rowmax, rowsum = (
+                                _softmax_online_deferred(
                                 qk,
                                 rowmax,
                                 rowsum,
                                 softmax_scale_log2e=scale_softmax_log2,
                                 IS_BORDER=True,
                             )
+                            )
+                        if EARLY_CAST_P:
+                            p = p.to(INPUT_DTYPE)
 
                         if not USE_WARP_MMA:
                             acc = tle.gpu.wgmma_wait(0, acc)
                         v_reader.release(accum_cnt_kv - 1)
-                        acc = acc * alpha[:, None]
+                        if not RESCALE_O_BEFORE_PV:
+                            acc = acc * alpha[:, None]
                         accum_cnt_kv += 1
 
                 v_tile = v_reader.wait(accum_cnt_kv - 1).slot.kv
+                if RESCALE_O_BEFORE_PV:
+                    acc = acc * alpha[:, None]
                 if USE_WARP_MMA:
                     v_regs = tl.load(tle.gpu.local_ptr(v_tile))
                     acc = tl.dot(
@@ -1589,7 +1785,19 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                         out_dtype=tl.float32,
                     )
                 else:
-                    acc = tle.gpu.wgmma(p.to(INPUT_DTYPE), v_tile, acc)
+                    if COMPACT_KV80:
+                        acc = tle.gpu.wgmma(
+                            p.to(INPUT_DTYPE),
+                            v_tile,
+                            acc,
+                            active_k=80,
+                        )
+                    else:
+                        acc = tle.gpu.wgmma(
+                            p.to(INPUT_DTYPE),
+                            v_tile,
+                            acc,
+                        )
                     acc = tle.gpu.wgmma_wait(1, acc)
                 # Dense output and the register-store fallback no longer need
                 # Q once WGMMA has retired.  Packed TMA output reuses this Q
@@ -1821,6 +2029,7 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                 MAX_SPLITS,
                 pack_factor,
                 HEADS_IN_L2,
+                EXPLICIT_SPLIT_K_CHUNK,
             )
         elif RAGGED_SCHEDULER:
             m_block, bid, hid, work_valid = _ragged_persistent_tile_coords(
@@ -1850,31 +2059,8 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
     warmup=10,
     rep=20,
     reset_to_zero=["scheduler_counter_ptr"],
-    key=[
-        "b",
-        "h",
-        "hk",
-        "d",
-        "block_size",
-        "is_paged",
-        "is_causal",
-        "is_local",
-        "is_alibi",
-        "is_s_aux",
-        "h_hk_ratio",
-        "seqlen_q",
-        "seqlen_k",
-        "total_q",
-        "PAGED_GATHER_MODE",
-        "PAGED_KV_NON_TMA",
-        "PACK_GQA",
-        "RAGGED_SCHEDULER",
-        "HEADS_IN_L2",
-        "DYNAMIC_SCHEDULER",
-        "SPLIT_KV",
-        "MAX_SPLITS",
-        "STORE_LSE",
-    ],
+    key=_PERSISTENT_AUTOTUNE_KEYS,
+    strategy=_PERSISTENT_AUTOTUNE_STRATEGY,
 )
 @triton.heuristics(
     values={
@@ -1960,18 +2146,49 @@ def flash_varlen_fwd_v3_tle_kernel(
     DYNAMIC_SCHEDULER: tl.constexpr,
     SPLIT_KV: tl.constexpr,
     MAX_SPLITS: tl.constexpr,
+    EXPLICIT_SPLIT_K_CHUNK: tl.constexpr,
     STORE_LSE: tl.constexpr,
+    PAGED_PREFILL_PROFILE: tl.constexpr,
+    DENSE_KV_TMA_PROFILE: tl.constexpr,
+    AUTOTUNE_POLICY_VERSION: tl.constexpr,
     PAGED_GATHER_MODE: tl.constexpr = 2,
+    STAGGER_KV: tl.constexpr = False,
+    COMPACT_KV80: tl.constexpr = False,
+    RESCALE_O_BEFORE_PV: tl.constexpr = False,
+    EARLY_CAST_P: tl.constexpr = False,
 ):
     BM_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
     HEAD_DIM_PADDED: tl.constexpr = BLOCK_K
+    LOGICAL_BLOCK_N: tl.constexpr = 80 if COMPACT_KV80 else BLOCK_N
     Q_PIPE_ASYNC_EFFECTIVE: tl.constexpr = Q_PIPE_ASYNC and d < 256
     PAGED_KV_NON_TMA_EFFECTIVE: tl.constexpr = PAGED_KV_NON_TMA or (
-        block_size % BLOCK_N != 0
+        block_size % LOGICAL_BLOCK_N != 0
     )
     INPUT_DTYPE = q_ptr.dtype.element_ty
     page_stride_rows = k_batch_stride // k_row_stride
     THREADS_IN_MMA_GROUPS: tl.constexpr = NUM_MMA_WARPS * 32
+    tl.static_assert(not RESCALE_O_BEFORE_PV or COMPACT_KV80)
+    tl.static_assert(not EARLY_CAST_P or COMPACT_KV80)
+    if COMPACT_KV80:
+        # Fail closed if a future cost-model or autotune change leaks the
+        # narrow native-N80 carrier outside its measured Hopper profile.
+        tl.static_assert(INPUT_DTYPE == tl.float16)
+        tl.static_assert(d == 256 and BLOCK_K == 256)
+        tl.static_assert(BLOCK_M == 128 and BLOCK_N == 128)
+        tl.static_assert(NUM_MMA_GROUPS == 2 and NUM_MMA_WARPS == 8)
+        tl.static_assert(NUM_BUFFERS_KV == 2 and NUM_BUFFERS_Q == 1)
+        tl.static_assert(Q_STAGE_CAPACITY == 2)
+        tl.static_assert(USE_TMA_QO and REUSE_Q_SMEM_O)
+        tl.static_assert(PAGED_KV_NON_TMA_EFFECTIVE and PAGED_PIPE_ASYNC)
+        tl.static_assert(PACK_GQA and PAGED_PREFILL_PROFILE)
+        tl.static_assert(is_paged and is_seqused_k and is_causal)
+        tl.static_assert(not SPLIT_KV)
+        tl.static_assert(not (is_local or is_alibi or is_softcap or is_s_aux))
+        tl.static_assert(
+            (block_size == 16 and h_hk_ratio == 4)
+            or (block_size == 32 and h_hk_ratio == 8)
+        )
+        tl.static_assert(PAGED_GATHER_MODE != 0)
 
     q_smem = tle.gpu.alloc(
         [Q_STAGE_CAPACITY, BM_SPLIT, HEAD_DIM_PADDED],
@@ -2000,7 +2217,10 @@ def flash_varlen_fwd_v3_tle_kernel(
         q_reader0 = q0_pipe.reader()
         q_writer1 = q_writer0
         q_reader1 = q_reader0
-    if BM_SPLIT == 16:
+    if COMPACT_KV80:
+        k_smem = tle.gpu.alloc_compact_kv(INPUT_DTYPE)
+        v_smem = tle.gpu.alloc_compact_kv(INPUT_DTYPE)
+    elif BM_SPLIT == 16:
         k_smem = tle.gpu.alloc(
             [NUM_BUFFERS_KV, 1, 1],
             dtype=INPUT_DTYPE,
@@ -2014,12 +2234,13 @@ def flash_varlen_fwd_v3_tle_kernel(
             layout=None,
             scope=tle.gpu.smem,
         )
-    v_smem = tle.gpu.alloc(
-        [NUM_BUFFERS_KV, BLOCK_N, HEAD_DIM_PADDED],
-        dtype=INPUT_DTYPE,
-        layout=None,
-        scope=tle.gpu.smem,
-    )
+    if not COMPACT_KV80:
+        v_smem = tle.gpu.alloc(
+            [NUM_BUFFERS_KV, BLOCK_N, HEAD_DIM_PADDED],
+            dtype=INPUT_DTYPE,
+            layout=None,
+            scope=tle.gpu.smem,
+        )
 
     # One transport-independent pipe owns every K/V GMEM-to-SMEM stage.  The
     # payload window selects TMA for descriptor copies and cp.async (or a
@@ -2193,12 +2414,15 @@ def flash_varlen_fwd_v3_tle_kernel(
                         PAGED_KV_NON_TMA_EFFECTIVE,
                         PAGED_PIPE_ASYNC,
                         PAGED_GATHER_MODE,
+                        STAGGER_KV,
+                        COMPACT_KV80,
                         PACK_GQA,
                         RAGGED_SCHEDULER,
                         HEADS_IN_L2,
                         DYNAMIC_SCHEDULER,
                         SPLIT_KV,
                         MAX_SPLITS,
+                        EXPLICIT_SPLIT_K_CHUNK,
                     ),
                 ),
                 (
@@ -2267,11 +2491,15 @@ def flash_varlen_fwd_v3_tle_kernel(
                         REUSE_Q_SMEM_O,
                         0,
                         PACK_GQA,
+                        COMPACT_KV80,
+                        RESCALE_O_BEFORE_PV,
+                        EARLY_CAST_P,
                         RAGGED_SCHEDULER,
                         HEADS_IN_L2,
                         DYNAMIC_SCHEDULER,
                         SPLIT_KV,
                         MAX_SPLITS,
+                        EXPLICIT_SPLIT_K_CHUNK,
                         STORE_LSE,
                     ),
                 ),
@@ -2341,11 +2569,15 @@ def flash_varlen_fwd_v3_tle_kernel(
                         REUSE_Q_SMEM_O,
                         1,
                         PACK_GQA,
+                        COMPACT_KV80,
+                        RESCALE_O_BEFORE_PV,
+                        EARLY_CAST_P,
                         RAGGED_SCHEDULER,
                         HEADS_IN_L2,
                         DYNAMIC_SCHEDULER,
                         SPLIT_KV,
                         MAX_SPLITS,
+                        EXPLICIT_SPLIT_K_CHUNK,
                         STORE_LSE,
                     ),
                 ),
@@ -2416,12 +2648,15 @@ def flash_varlen_fwd_v3_tle_kernel(
                         PAGED_KV_NON_TMA_EFFECTIVE,
                         PAGED_PIPE_ASYNC,
                         PAGED_GATHER_MODE,
+                        STAGGER_KV,
+                        COMPACT_KV80,
                         PACK_GQA,
                         RAGGED_SCHEDULER,
                         HEADS_IN_L2,
                         DYNAMIC_SCHEDULER,
                         SPLIT_KV,
                         MAX_SPLITS,
+                        EXPLICIT_SPLIT_K_CHUNK,
                     ),
                 ),
                 (
@@ -2490,11 +2725,15 @@ def flash_varlen_fwd_v3_tle_kernel(
                         REUSE_Q_SMEM_O,
                         0,
                         PACK_GQA,
+                        COMPACT_KV80,
+                        RESCALE_O_BEFORE_PV,
+                        EARLY_CAST_P,
                         RAGGED_SCHEDULER,
                         HEADS_IN_L2,
                         DYNAMIC_SCHEDULER,
                         SPLIT_KV,
                         MAX_SPLITS,
+                        EXPLICIT_SPLIT_K_CHUNK,
                         STORE_LSE,
                     ),
                 ),
@@ -2522,17 +2761,42 @@ def launch_persistent(
     paged_gather_mode,
     paged_kv_non_tma,
     ragged_scheduler,
+    is_paged,
+    is_causal,
+    is_local,
+    is_alibi,
+    is_softcap,
     heads_in_l2,
     dynamic_scheduler,
     store_lse,
+    paged_prefill_profile=False,
     partial_out=None,
     partial_lse=None,
     max_splits=1,
+    explicit_split_k_chunk=12 * 128,
     scheduler_counter=None,
 ):
     """Launch the long family using its private persistent grid."""
     gqa_ratio = num_heads // num_heads_k
     split_kv = partial_out is not None
+    max_seqlen_q = effective_max_q // pack_factor
+    dense_kv_tma_profile = PersistentSchedulingHeuristics.use_dense_kv_tma(
+        batch_size=batch_size,
+        num_heads=num_heads,
+        num_heads_k=num_heads_k,
+        head_dim=head_size,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        total_q=total_q,
+        is_paged=is_paged,
+        is_causal=is_causal,
+        is_local=is_local,
+        is_alibi=is_alibi,
+        is_softcap=is_softcap,
+        pack_gqa=pack_gqa,
+        ragged_scheduler=ragged_scheduler,
+        split_kv=split_kv,
+    )
     plan = PersistentSchedulingHeuristics.launch_plan(
         heads_in_l2=heads_in_l2,
         allow_head_swizzle=not split_kv,
@@ -2594,6 +2858,10 @@ def launch_persistent(
         DYNAMIC_SCHEDULER=plan.dynamic_scheduler,
         SPLIT_KV=split_kv,
         MAX_SPLITS=max_splits,
+        EXPLICIT_SPLIT_K_CHUNK=explicit_split_k_chunk,
         STORE_LSE=store_lse,
+        PAGED_PREFILL_PROFILE=paged_prefill_profile,
+        DENSE_KV_TMA_PROFILE=dense_kv_tma_profile,
+        AUTOTUNE_POLICY_VERSION=PersistentSchedulingHeuristics.AUTOTUNE_POLICY_VERSION,
         PAGED_GATHER_MODE=paged_gather_mode,
     )

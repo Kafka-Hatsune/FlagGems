@@ -22,7 +22,7 @@ only select Triton configs, tile sizes, and launch shapes inside that plan.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, IntEnum
 from functools import lru_cache
 from typing import Any, TypeVar
@@ -214,6 +214,7 @@ class FA3ExecutionPlan:
     paged_kv_load: PagedKVLoadMode
     paged_prefill_candidate: bool
     paged_prefill_long: bool
+    paged_d256_prefill_profile: bool
     reason: str
     pack_gqa: bool
     pack_factor: int
@@ -223,6 +224,7 @@ class FA3ExecutionPlan:
     dynamic_scheduler: bool
     persistent_split_kv: bool
     persistent_num_splits: int
+    explicit_split_k_chunk: int
     requires_tma_alignment: bool
     log_plan: bool
 
@@ -279,7 +281,7 @@ class FA3RouteFeatures:
 class FA3RouteCostModel:
     """Measured route rules plus a compatibility fallback for unseen shapes."""
 
-    VERSION = "h100_coarse_buckets_v2"
+    VERSION = "sm90_coarse_buckets_v8"
     DENSE_WORK_CROSSOVER = 1 << 26
 
     @staticmethod
@@ -352,15 +354,17 @@ class FA3RouteCostModel:
         )
         compact_paged = is_paged and block_size in _COMPACT_PAGED_PROFILE_SIZES
         measured_d256_prefill = (
-            paged_prefill_candidate
-            and arch == 90
+            arch == 90
             and dtype == torch.float16
-            and input_bucket.population is QueryPopulation.SINGLE
+            and has_cache_kv
+            and is_paged
+            and input_bucket.workload
+            in {FA3Workload.PREFILL, FA3Workload.SERVING_PREFILL}
+            and input_bucket.population is not QueryPopulation.OVERSIZED
             and input_bucket.profile
             in {FA3InputProfile.HEAVY, FA3InputProfile.LARGE_SINGLE_PREFILL}
             and head_size == 256
             and (block_size, gqa_ratio) in {(16, 4), (32, 8)}
-            and pack_factor == 1
             and is_causal
             and not (is_local or is_alibi or is_softcap)
         )
@@ -615,6 +619,39 @@ class FA3Scheduler:
     DEFAULT_PAGED_PREFILL_MIN_Q = 1024
     MAX_DYNAMIC_SPLITS = 3
     MIN_EXPLICIT_SPLIT_K = 12 * 128
+    WIDE_SPLIT_BLOCK_M = 64
+    MIN_SPLIT_WAVE_FILL_NUMERATOR = 9
+    MIN_SPLIT_WAVE_FILL_DENOMINATOR = 10
+
+    @classmethod
+    def _has_minimum_wave_fill(cls, work_items: int, num_sms: int) -> bool:
+        return (
+            work_items * cls.MIN_SPLIT_WAVE_FILL_DENOMINATOR
+            >= num_sms * cls.MIN_SPLIT_WAVE_FILL_NUMERATOR
+        )
+
+    @classmethod
+    def _splits_for_target_wave(cls, base_work: int, num_sms: int) -> int:
+        """Choose a power-of-two split count without overfilling a near-full wave."""
+
+        required_splits = _ceil_div(num_sms, base_work)
+        upper_splits = _next_power_of_2(required_splits)
+        lower_splits = upper_splits // 2
+        if (
+            lower_splits >= 1
+            and cls._has_minimum_wave_fill(base_work * lower_splits, num_sms)
+        ):
+            return lower_splits
+        return upper_splits
+
+    @classmethod
+    def _splits_for_exact_target_wave(cls, base_work: int, num_sms: int) -> int:
+        """Use an integer split only when it leaves a nearly full first wave."""
+
+        lower_splits = max(1, num_sms // base_work)
+        if cls._has_minimum_wave_fill(base_work * lower_splits, num_sms):
+            return lower_splits
+        return cls._splits_for_target_wave(base_work, num_sms)
 
     @staticmethod
     def _parse_arg(
@@ -968,6 +1005,7 @@ class FA3Scheduler:
         pagedkv_tma: bool | None = None,
         max_num_splits: int = 0,
         explicit_split_has_work: bool = False,
+        explicit_wide_split_under_wave: bool = False,
     ) -> FA3ExecutionPlan:
         """Return a complete plan keyed only by discrete/stable route facts."""
 
@@ -990,12 +1028,31 @@ class FA3Scheduler:
             and is_paged
             and config.dynamic_split
             and config.pack_gqa is not Toggle.OFF
-            and bucket.population is QueryPopulation.SINGLE
+            and (
+                bucket.population is QueryPopulation.SINGLE
+                or bucket.workload is FA3Workload.SHORT_QUERY
+            )
+            and explicit_wide_split_under_wave
             and bucket.profile is FA3InputProfile.HEAVY
             and bucket.workload in {FA3Workload.TOKEN_QUERY, FA3Workload.SHORT_QUERY}
             and head_size == 256
             and (block_size, gqa_ratio) in {(16, 4), (32, 8)}
             and (bucket.workload is FA3Workload.TOKEN_QUERY or is_causal)
+            and not (is_local or is_alibi or is_softcap)
+        )
+        measured_wide_prefill_candidate = (
+            arch == 90
+            and dtype == torch.float16
+            and has_cache_kv
+            and is_paged
+            and bucket.workload
+            in {FA3Workload.PREFILL, FA3Workload.SERVING_PREFILL}
+            and bucket.population is not QueryPopulation.OVERSIZED
+            and bucket.profile
+            in {FA3InputProfile.HEAVY, FA3InputProfile.LARGE_SINGLE_PREFILL}
+            and head_size == 256
+            and (block_size, gqa_ratio) in {(16, 4), (32, 8)}
+            and is_causal
             and not (is_local or is_alibi or is_softcap)
         )
         pack_gqa = (
@@ -1009,10 +1066,12 @@ class FA3Scheduler:
                     and head_size in (192, 256)
                 )
                 or explicit_wide_split
+                or measured_wide_prefill_candidate
                 or config.wide_pack_gqa
             )
             and config.pack_gqa is not Toggle.OFF
         )
+        measured_wide_prefill_pack = measured_wide_prefill_candidate and pack_gqa
         pack_factor = gqa_ratio if pack_gqa else 1
 
         ragged_scheduler = cls.select_ragged_scheduler(
@@ -1103,6 +1162,11 @@ class FA3Scheduler:
             causal=is_causal,
             local=is_local,
         )
+        if (
+            measured_wide_prefill_pack
+            and config.heads_in_l2.mode is HeadsInL2Mode.AUTO
+        ):
+            heads_in_l2 = HeadsInL2Policy(HeadsInL2Mode.L2_AUTO)
         dynamic_scheduler = cls.select_dynamic_scheduler(
             config.dynamic_scheduler,
             causal=is_causal,
@@ -1154,6 +1218,12 @@ class FA3Scheduler:
             # CUDA-Graph latency favors blockwise address generation.  Keep the
             # existing one-pass and auto-s3 gather choices unchanged.
             paged_gather_mode = int(PagedGatherMode.BLOCKWISE)
+        elif (
+            paged_gather_mode == int(PagedGatherMode.AUTO)
+            and measured_wide_prefill_pack
+            and decision.family is KernelFamily.LONG
+        ):
+            paged_gather_mode = int(PagedGatherMode.BLOCKWISE)
         elif persistent_split_kv or decision.family is KernelFamily.LONG:
             paged_gather_mode = cls.select_persistent_paged_gather(
                 paged_gather_mode,
@@ -1188,6 +1258,7 @@ class FA3Scheduler:
             paged_kv_load=decision.paged_kv_load,
             paged_prefill_candidate=paged_prefill_candidate,
             paged_prefill_long=paged_prefill_long,
+            paged_d256_prefill_profile=measured_wide_prefill_pack,
             reason=(
                 f"model={FA3RouteCostModel.VERSION} "
                 f"kernel_profile={decision.kernel_profile.value} "
@@ -1205,6 +1276,7 @@ class FA3Scheduler:
             dynamic_scheduler=dynamic_scheduler,
             persistent_split_kv=persistent_split_kv,
             persistent_num_splits=persistent_num_splits,
+            explicit_split_k_chunk=12 * 128,
             requires_tma_alignment=(
                 (is_paged and not paged_kv_non_tma)
                 or (decision.family is KernelFamily.LONG and not persistent_split_kv)
@@ -1286,7 +1358,73 @@ class FA3Scheduler:
         if config is None:
             config = cls.load_config()
         bucket = cls.analyze_inputs(inputs, config)
-        plan = cls.route(
+        gqa_ratio = inputs.num_heads // inputs.num_heads_k
+        forced_split_block_m = int(
+            os.getenv("FLAG_GEMS_FA3_TLE_EXPERIMENT_BLOCK_M", "0")
+        )
+        if forced_split_block_m not in (0, 16, 64, 128):
+            raise ValueError(
+                "FLAG_GEMS_FA3_TLE_EXPERIMENT_BLOCK_M must be 0, 16, 64, or 128"
+            )
+        split_block_m = forced_split_block_m or cls.WIDE_SPLIT_BLOCK_M
+        single_long_ragged_query = (
+            bucket.population
+            in {QueryPopulation.RAGGED, QueryPopulation.MIXED}
+            and inputs.batch_size > 1
+            and inputs.max_seqlen_q > 1
+            and inputs.total_q
+            == inputs.max_seqlen_q + inputs.batch_size - 1
+        )
+        if bucket.population is QueryPopulation.UNIFORM:
+            # Uniform lengths are known exactly from host metadata.  The
+            # compact ``ceil(total)+B-1`` upper bound can be almost 2x too
+            # large for Q=9..16, causing adaptive Split-K to underfill H800.
+            wide_split_base_work = (
+                _ceil_div(inputs.max_seqlen_q * gqa_ratio, split_block_m)
+                * inputs.batch_size
+                * inputs.num_heads_k
+            )
+        elif single_long_ragged_query:
+            # The host metadata proves that one request has max_seqlen_q rows
+            # and every other request has exactly one.  Unlike a generic
+            # ragged population, its packed compact work is therefore exact.
+            wide_split_base_work = (
+                _ceil_div(inputs.max_seqlen_q * gqa_ratio, split_block_m)
+                + (inputs.batch_size - 1)
+                * _ceil_div(gqa_ratio, split_block_m)
+            ) * inputs.num_heads_k
+        else:
+            # Ragged per-sequence lengths live on device.  This compact upper
+            # bound matches the launch geometry without synchronizing them to
+            # the host; invalid compact slots are discarded by the mapper.
+            wide_split_base_work = (
+                _ceil_div(
+                    inputs.total_q * gqa_ratio,
+                    split_block_m,
+                )
+                + inputs.batch_size
+                - 1
+            ) * inputs.num_heads_k
+        packed_padded_work = (
+            _ceil_div(inputs.max_seqlen_q * gqa_ratio, 128)
+            * inputs.batch_size
+            * inputs.num_heads_k
+        )
+        near_full_uniform_decode = (
+            inputs.arch == 90
+            and inputs.q.dtype == torch.float16
+            and inputs.is_paged
+            and bucket.workload is FA3Workload.TOKEN_QUERY
+            and bucket.population is QueryPopulation.UNIFORM
+            and bucket.profile is FA3InputProfile.THROUGHPUT_DECODE
+            and inputs.head_dim == 256
+            and (inputs.block_size, gqa_ratio) == (16, 4)
+            and inputs.alibi_slopes is None
+            and not (inputs.window.local or inputs.is_softcap)
+            and packed_padded_work < inputs.num_sms
+            and cls._has_minimum_wave_fill(packed_padded_work, inputs.num_sms)
+        )
+        route_kwargs = dict(
             config=config,
             bucket=bucket,
             arch=inputs.arch,
@@ -1303,13 +1441,106 @@ class FA3Scheduler:
             is_causal=inputs.window.causal,
             is_softcap=inputs.is_softcap,
             has_seqused_k=inputs.seqused_k is not None,
-            requested_family=KernelFamily.AUTO,
+            # A 90%-full direct wave is faster than manufacturing Split-KV
+            # work for uniform D256 decode.  B112/114 measured 1.63x faster at
+            # K=1 and 1.05x at K=4096; this also covers B128/132 on H800.
+            requested_family=(
+                KernelFamily.DIRECT
+                if near_full_uniform_decode
+                else KernelFamily.AUTO
+            ),
             max_num_splits=inputs.max_num_splits,
             explicit_split_has_work=(
                 inputs.max_num_splits > 1
                 and inputs.max_seqlen_k > cls.MIN_EXPLICIT_SPLIT_K
             ),
+            explicit_wide_split_under_wave=(
+                bucket.population is QueryPopulation.SINGLE
+                or wide_split_base_work < inputs.num_sms
+            ),
         )
+        plan = cls.route(**route_kwargs)
+        if (
+            plan.persistent_split_kv
+            and inputs.max_num_splits > 1
+            and bucket.population is not QueryPopulation.SINGLE
+            and bucket.workload is FA3Workload.SHORT_QUERY
+            and inputs.head_dim == 256
+        ):
+            splits_for_one_wave = (
+                cls._splits_for_exact_target_wave(
+                    wide_split_base_work,
+                    inputs.num_sms,
+                )
+                if single_long_ragged_query
+                else cls._splits_for_target_wave(
+                    wide_split_base_work,
+                    inputs.num_sms,
+                )
+            )
+            useful_k_splits = _ceil_div(
+                inputs.max_seqlen_k,
+                cls.MIN_EXPLICIT_SPLIT_K,
+            )
+            adaptive_splits = min(
+                plan.persistent_num_splits,
+                useful_k_splits,
+                splits_for_one_wave,
+            )
+            if adaptive_splits == 1:
+                # Re-route as an explicit non-split request instead of only
+                # clearing the split flags.  Gather mode, dynamic scheduling,
+                # family selection, alignment, and the ragged kernel suffix
+                # are all derived from the final split decision.
+                plan = cls.route(
+                    **{
+                        **route_kwargs,
+                        "max_num_splits": 1,
+                        "explicit_split_has_work": False,
+                        "explicit_wide_split_under_wave": False,
+                    }
+                )
+            elif adaptive_splits != plan.persistent_num_splits:
+                plan = replace(
+                    plan,
+                    kernel_name=f"persistent_splitkv_s{adaptive_splits}",
+                    persistent_num_splits=adaptive_splits,
+                )
+        if (
+            config.paged_gather is PagedGatherMode.AUTO
+            and plan.persistent_split_kv
+            and single_long_ragged_query
+            and bucket.workload is FA3Workload.SHORT_QUERY
+            and inputs.arch == 90
+            and inputs.q.dtype == torch.float16
+            and inputs.head_dim == 256
+            and (inputs.block_size, gqa_ratio) == (32, 8)
+            and inputs.window.causal
+            and inputs.alibi_slopes is None
+            and not (inputs.window.local or inputs.is_softcap)
+        ):
+            # Clean H100 replay for this exact one-long-query cohort favors
+            # page-aligned loads: page32/BN64 needs two page-table entries per
+            # tile instead of repeating per-token div/mod and table loads.
+            plan = replace(
+                plan,
+                paged_gather_mode=int(PagedGatherMode.BLOCKWISE),
+            )
+        if (
+            plan.persistent_split_kv
+            and plan.persistent_num_splits == 32
+            and bucket.population is QueryPopulation.SINGLE
+            and bucket.workload is FA3Workload.SHORT_QUERY
+            and inputs.q.dtype == torch.float16
+            and inputs.head_dim == 256
+            and inputs.block_size == 16
+            and gqa_ratio == 4
+            and inputs.total_q == inputs.max_seqlen_q
+            and 8 < inputs.max_seqlen_q <= 16
+        ):
+            # Qwen3.6 Q11/Q12 needs all 32 explicit splits to fill H100.  Keep
+            # this measured chunk size out of unrelated high-cap profiles.
+            plan = replace(plan, explicit_split_k_chunk=8 * 128)
         return plan
 
 
@@ -1583,6 +1814,7 @@ class DirectSchedulingHeuristics:
 class PersistentSchedulingHeuristics:
     """Autotune, pipeline, and launch-shape policy for the persistent path."""
 
+    AUTOTUNE_POLICY_VERSION = 10
     DEFAULT_BLOCK_M = 128
     DEFAULT_NUM_MMA_GROUPS = 2
     DEFAULT_NUM_Q_BUFFERS = 1
@@ -1603,11 +1835,44 @@ class PersistentSchedulingHeuristics:
 
     @staticmethod
     def combine_launch_plan(
-        *, max_seqlen_q: int, head_dim: int, total_q: int, batch_size: int
+        *,
+        max_seqlen_q: int,
+        head_dim: int,
+        total_q: int,
+        batch_size: int,
+        num_heads: int | None = None,
+        num_heads_k: int | None = None,
+        block_size: int | None = None,
+        explicit_split_k_chunk: int = 12 * 128,
     ) -> SplitCombineLaunchPlan:
         """Choose the Split-KV reduction tile and compact work mapping."""
 
-        block_m = min(64, _next_power_of_2(max_seqlen_q))
+        short_single_d256 = (
+            head_dim == 256
+            and batch_size == 1
+            and total_q == max_seqlen_q
+            and 8 < max_seqlen_q <= 16
+            and explicit_split_k_chunk == 8 * 128
+        )
+        tiny_gqa8_single_long = (
+            head_dim == 256
+            and batch_size > 1
+            and num_heads is not None
+            and num_heads_k is not None
+            and (block_size, num_heads // num_heads_k) == (32, 8)
+            and 1 < max_seqlen_q <= 64
+            and total_q == max_seqlen_q + batch_size - 1
+        )
+        max_block_m = (
+            1
+            if tiny_gqa8_single_long
+            else (
+                8
+                if head_dim == 256 and (batch_size > 1 or short_single_d256)
+                else 64
+            )
+        )
+        block_m = min(max_block_m, _next_power_of_2(max_seqlen_q))
         block_k = CommonSchedulingHeuristics.padded_head_dim(head_dim)
         rectangular_mblocks = _ceil_div(max_seqlen_q, block_m) * batch_size
         compact_mblocks = _ceil_div(total_q, block_m) + batch_size - 1
@@ -1652,6 +1917,10 @@ class PersistentSchedulingHeuristics:
         num_mma_groups: int | None = None,
         use_tma_qo: bool | None = None,
         use_tma_kv: bool = True,
+        stagger_kv: bool = False,
+        compact_kv80: bool = False,
+        rescale_o_before_pv: bool = False,
+        early_cast_p: bool = False,
     ):
         if num_mma_groups is None:
             num_mma_groups = cls.num_mma_groups()
@@ -1666,8 +1935,7 @@ class PersistentSchedulingHeuristics:
         reuse_default = "1" if cls.DEFAULT_REUSE_Q_SMEM_O else "0"
         q_pipe_default = "1" if cls.DEFAULT_Q_PIPE_ASYNC else "0"
         pipe_default = "1" if cls.DEFAULT_PAGED_PIPE_ASYNC else "0"
-        return triton.Config(
-            {
+        config_kwargs = {
                 "BLOCK_M": block_m,
                 "BLOCK_N": block_n,
                 "NUM_BUFFERS_Q": num_buffers_q,
@@ -1690,7 +1958,13 @@ class PersistentSchedulingHeuristics:
                     "FLAG_GEMS_FA3_TLE_EXPERIMENT_PIPE_ASYNC", pipe_default
                 )
                 != "0",
-            },
+                "STAGGER_KV": stagger_kv,
+                "COMPACT_KV80": compact_kv80,
+                "RESCALE_O_BEFORE_PV": rescale_o_before_pv,
+                "EARLY_CAST_P": early_cast_p,
+            }
+        return triton.Config(
+            config_kwargs,
             num_warps=4,
         )
 
@@ -1706,6 +1980,29 @@ class PersistentSchedulingHeuristics:
 
         add_transport_pair(block_n=128, num_buffers_kv=2)
         add_transport_pair(block_n=64, num_buffers_kv=2)
+        add_transport_pair(
+            block_n=64,
+            num_buffers_kv=2,
+            stagger_kv=True,
+        )
+        # The compact N80 profile has one legal transport/topology after the
+        # static contract and production pruner are applied: staggered K/V,
+        # early FP16 P carry, and the dense-profile transport selector set.
+        # Retain only the measured rescale Cartesian dimension.  The previous
+        # twelve surface configs collapsed to these two candidates after
+        # pruning and only inflated first-use search and cache signatures.
+        for rescale_o_before_pv in (False, True):
+            configs.append(
+                cls.make_config(
+                    block_n=128,
+                    num_buffers_kv=2,
+                    use_tma_kv=True,
+                    stagger_kv=True,
+                    compact_kv80=True,
+                    rescale_o_before_pv=rescale_o_before_pv,
+                    early_cast_p=True,
+                )
+            )
         forced_mma_groups = os.getenv("FLAG_GEMS_FA3_TLE_EXPERIMENT_MMA_GROUPS")
         decode_tma_default = "1" if cls.DEFAULT_DECODE_USE_TMA_QO else "0"
         decode_tma_qo = (
@@ -1820,7 +2117,11 @@ class PersistentSchedulingHeuristics:
     def config_smem_bytes(config, head_dim: int) -> int:
         block_k = _next_power_of_2(head_dim)
         block_m = config.kwargs["BLOCK_M"]
-        block_n = config.kwargs["BLOCK_N"]
+        block_n = (
+            80
+            if config.kwargs.get("COMPACT_KV80", False)
+            else config.kwargs["BLOCK_N"]
+        )
         num_groups = config.kwargs["NUM_MMA_GROUPS"]
         bm_split = block_m // num_groups
         q_elems = config.kwargs["Q_STAGE_CAPACITY"] * bm_split * block_k
@@ -1897,27 +2198,46 @@ class PersistentSchedulingHeuristics:
         )
         pack_gqa = kwargs.get("PACK_GQA", nargs.get("PACK_GQA", False))
         split_kv = kwargs.get("SPLIT_KV", nargs.get("SPLIT_KV", False))
+        paged_prefill_profile = kwargs.get(
+            "PAGED_PREFILL_PROFILE",
+            nargs.get("PAGED_PREFILL_PROFILE", False),
+        )
         block_size = kwargs.get("block_size", nargs.get("block_size", 1))
         seqlen_q = kwargs.get("seqlen_q", nargs.get("seqlen_q"))
-        use_tma_kv = cls.use_dense_kv_tma(
-            batch_size=kwargs.get("b", nargs.get("b")),
-            num_heads=kwargs.get("h", nargs.get("h")),
-            num_heads_k=kwargs.get("hk", nargs.get("hk")),
-            head_dim=head_dim,
-            max_seqlen_q=seqlen_q,
-            max_seqlen_k=kwargs.get("seqlen_k", nargs.get("seqlen_k")),
-            total_q=kwargs.get("total_q", nargs.get("total_q")),
-            is_paged=is_paged,
-            is_causal=kwargs.get("is_causal", nargs.get("is_causal", False)),
-            is_local=kwargs.get("is_local", nargs.get("is_local", False)),
-            is_alibi=kwargs.get("is_alibi", nargs.get("is_alibi", False)),
-            is_softcap=kwargs.get("is_softcap", nargs.get("is_softcap", False)),
-            pack_gqa=pack_gqa,
-            ragged_scheduler=kwargs.get(
-                "RAGGED_SCHEDULER", nargs.get("RAGGED_SCHEDULER", False)
-            ),
-            split_kv=split_kv,
+        num_heads = kwargs.get("h", nargs.get("h"))
+        num_heads_k = kwargs.get("hk", nargs.get("hk"))
+        is_seqused_k = kwargs.get(
+            "is_seqused_k", nargs.get("is_seqused_k", False)
         )
+        is_causal = kwargs.get("is_causal", nargs.get("is_causal", False))
+        is_local = kwargs.get("is_local", nargs.get("is_local", False))
+        is_alibi = kwargs.get("is_alibi", nargs.get("is_alibi", False))
+        is_softcap = kwargs.get("is_softcap", nargs.get("is_softcap", False))
+        is_s_aux = kwargs.get("is_s_aux", nargs.get("is_s_aux", False))
+        use_tma_kv = kwargs.get(
+            "DENSE_KV_TMA_PROFILE",
+            nargs.get("DENSE_KV_TMA_PROFILE"),
+        )
+        if use_tma_kv is None:
+            use_tma_kv = cls.use_dense_kv_tma(
+                batch_size=kwargs.get("b", nargs.get("b")),
+                num_heads=kwargs.get("h", nargs.get("h")),
+                num_heads_k=kwargs.get("hk", nargs.get("hk")),
+                head_dim=head_dim,
+                max_seqlen_q=kwargs.get("seqlen_q", nargs.get("seqlen_q")),
+                max_seqlen_k=kwargs.get("seqlen_k", nargs.get("seqlen_k")),
+                total_q=kwargs.get("total_q", nargs.get("total_q")),
+                is_paged=is_paged,
+                is_causal=is_causal,
+                is_local=is_local,
+                is_alibi=is_alibi,
+                is_softcap=is_softcap,
+                pack_gqa=pack_gqa,
+                ragged_scheduler=kwargs.get(
+                    "RAGGED_SCHEDULER", nargs.get("RAGGED_SCHEDULER", False)
+                ),
+                split_kv=split_kv,
+            )
         decode_packgqa_ws = (
             is_paged
             and paged_kv_non_tma
@@ -1931,6 +2251,7 @@ class PersistentSchedulingHeuristics:
             and paged_kv_non_tma
             and pack_gqa
             and block_size in _COMPACT_PAGED_PROFILE_SIZES
+            and seqlen_q is not None
             and 1 < seqlen_q <= 8
             and head_dim == 128
         )
@@ -1942,11 +2263,52 @@ class PersistentSchedulingHeuristics:
             and block_size in (16, 32)
             and head_dim == 256
         )
+        wide_paged_prefill_packgqa_ws = (
+            paged_prefill_profile
+            and not split_kv
+            and is_paged
+            and paged_kv_non_tma
+            and pack_gqa
+            and block_size in (16, 32)
+            and head_dim == 256
+            and is_causal
+            and not (is_local or is_alibi or is_softcap)
+        )
+        compact_kv80_policy = (
+            wide_paged_prefill_packgqa_ws
+            and num_heads is not None
+            and num_heads_k not in (None, 0)
+            and (block_size, num_heads // num_heads_k) in {(16, 4), (32, 8)}
+            and is_seqused_k
+            and not is_s_aux
+        )
         wide_paged_nontma = (
             is_paged and paged_kv_non_tma and not pack_gqa and head_dim > 128
         )
 
         def selected_shape_config(config):
+            stagger_kv = config.kwargs.get("STAGGER_KV", False)
+            compact_kv80 = config.kwargs.get("COMPACT_KV80", False)
+            rescale_o_before_pv = config.kwargs.get(
+                "RESCALE_O_BEFORE_PV", False
+            )
+            early_cast_p = config.kwargs.get("EARLY_CAST_P", False)
+            if rescale_o_before_pv and not compact_kv80:
+                return False
+            if early_cast_p and not compact_kv80:
+                return False
+            if (
+                stagger_kv or compact_kv80 or rescale_o_before_pv
+            ) and not wide_paged_prefill_packgqa_ws:
+                return False
+            if compact_kv80 and (
+                not compact_kv80_policy
+                or not config.kwargs["PAGED_PIPE_ASYNC"]
+                or not config.kwargs["REUSE_Q_SMEM_O"]
+                or not stagger_kv
+                or not early_cast_p
+            ):
+                return False
             if decode_packgqa_ws or explicit_wide_split_ws or wide_paged_nontma:
                 return (
                     config.kwargs["BLOCK_M"] == 64
@@ -1955,6 +2317,33 @@ class PersistentSchedulingHeuristics:
                     and config.kwargs["NUM_MMA_GROUPS"] == 1
                     and not config.kwargs["USE_TMA_QO"]
                 )
+            if wide_paged_prefill_packgqa_ws:
+                group2 = (
+                    config.kwargs["BLOCK_M"] == 128
+                    and (
+                        (
+                            config.kwargs["BLOCK_N"] == 64
+                            and not compact_kv80
+                        )
+                        or (
+                            config.kwargs["BLOCK_N"] == 128
+                            and compact_kv80
+                        )
+                    )
+                    and config.kwargs["NUM_BUFFERS_KV"] == 2
+                    and config.kwargs["NUM_MMA_GROUPS"] == 2
+                    and config.kwargs["USE_TMA_QO"]
+                )
+                group1 = (
+                    config.kwargs["BLOCK_M"] == 64
+                    and config.kwargs["BLOCK_N"] == 64
+                    and config.kwargs["NUM_BUFFERS_KV"] == 2
+                    and config.kwargs["NUM_MMA_GROUPS"] == 1
+                    and not config.kwargs["USE_TMA_QO"]
+                    and not stagger_kv
+                    and not compact_kv80
+                )
+                return group2 or group1
             if spec_packgqa_ws:
                 return (
                     config.kwargs["BLOCK_M"] == 64
@@ -1970,20 +2359,33 @@ class PersistentSchedulingHeuristics:
             for config in configs
             if selected_shape_config(config)
             and config.kwargs["USE_TMA_KV"] == use_tma_kv
-            and not (head_dim > 128 and config.kwargs["BLOCK_N"] > 64)
+            and not (
+                head_dim > 128
+                and config.kwargs["BLOCK_N"] > 64
+                and not config.kwargs.get("COMPACT_KV80", False)
+            )
             and not (
                 is_paged
                 and paged_kv_non_tma
                 and pack_gqa
                 and config.kwargs["BLOCK_N"] < 128
-                and not (decode_packgqa_ws or explicit_wide_split_ws)
+                and not (
+                    decode_packgqa_ws
+                    or explicit_wide_split_ws
+                    or wide_paged_prefill_packgqa_ws
+                )
             )
             and (
                 not is_paged
                 or paged_kv_non_tma
                 or block_size % config.kwargs["BLOCK_N"] == 0
             )
-            and cls.config_smem_bytes(config, head_dim) <= 220 * 1024
+            and cls.config_smem_bytes(config, head_dim)
+            <= (
+                225 * 1024
+                if config.kwargs.get("COMPACT_KV80", False)
+                else 220 * 1024
+            )
         ]
         if kept:
             return kept
@@ -1991,6 +2393,11 @@ class PersistentSchedulingHeuristics:
             config
             for config in reversed(configs)
             if config.kwargs["USE_TMA_KV"] == use_tma_kv
+            and not config.kwargs.get("COMPACT_KV80", False)
+            and (
+                wide_paged_prefill_packgqa_ws
+                or not config.kwargs.get("STAGGER_KV", False)
+            )
         ]
         return fallback[:1] or [configs[-1]]
 

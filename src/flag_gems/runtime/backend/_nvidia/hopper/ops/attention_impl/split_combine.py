@@ -47,6 +47,7 @@ def _combine_persistent_split_kv_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     MAX_SPLITS: tl.constexpr,
+    EXPLICIT_SPLIT_K_CHUNK: tl.constexpr,
     COMPACT_RAGGED: tl.constexpr,
     STORE_LSE: tl.constexpr,
 ):
@@ -70,7 +71,11 @@ def _combine_persistent_split_kv_kernel(
     q_eos = tl.load(cu_seqlens_q_ptr + bid + 1).to(tl.int32)
     q_len = q_eos - q_bos
     k_len = tl.load(seqused_k_ptr + bid).to(tl.int32)
-    split_count = _split_kv_count(k_len, MAX_SPLITS)
+    split_count = _split_kv_count(
+        k_len,
+        MAX_SPLITS,
+        EXPLICIT_SPLIT_K_CHUNK,
+    )
 
     rows = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
     global_rows = q_bos + rows
@@ -152,10 +157,13 @@ def combine_persistent_split_kv(
     *,
     batch_size,
     num_heads,
+    num_heads_k,
+    block_size,
     max_seqlen_q,
     head_dim,
     total_q,
     max_splits,
+    explicit_split_k_chunk,
     store_lse,
 ):
     """Combine normalized partial O and natural-log LSE tensors."""
@@ -165,6 +173,10 @@ def combine_persistent_split_kv(
         head_dim=head_dim,
         total_q=total_q,
         batch_size=batch_size,
+        num_heads=num_heads,
+        num_heads_k=num_heads_k,
+        block_size=block_size,
+        explicit_split_k_chunk=explicit_split_k_chunk,
     )
     grid = (
         (plan.compact_mblocks * num_heads, 1, 1)
@@ -188,6 +200,7 @@ def combine_persistent_split_kv(
         BLOCK_M=plan.block_m,
         BLOCK_K=plan.block_k,
         MAX_SPLITS=max_splits,
+        EXPLICIT_SPLIT_K_CHUNK=explicit_split_k_chunk,
         COMPACT_RAGGED=plan.compact_ragged,
         STORE_LSE=store_lse,
         num_warps=8,

@@ -253,6 +253,7 @@ flash_attn_varlen_fa3_persistent:
       REUSE_Q_SMEM_O: true
       USE_TMA_KV: true
       PAGED_PIPE_ASYNC: true
+      STAGGER_KV: false
     num_warps: 4
     num_stages: 3
   - <<: *persistent_group2
@@ -269,6 +270,7 @@ flash_attn_varlen_fa3_persistent:
       REUSE_Q_SMEM_O: true
       USE_TMA_KV: false
       PAGED_PIPE_ASYNC: true
+      STAGGER_KV: false
   - <<: *persistent_group2
     META:
       BLOCK_M: 128
@@ -283,6 +285,7 @@ flash_attn_varlen_fa3_persistent:
       REUSE_Q_SMEM_O: true
       USE_TMA_KV: true
       PAGED_PIPE_ASYNC: true
+      STAGGER_KV: false
   - <<: *persistent_group2
     META:
       BLOCK_M: 128
@@ -297,6 +300,73 @@ flash_attn_varlen_fa3_persistent:
       REUSE_Q_SMEM_O: true
       USE_TMA_KV: false
       PAGED_PIPE_ASYNC: true
+      STAGGER_KV: false
+  - <<: *persistent_group2
+    META:
+      BLOCK_M: 128
+      BLOCK_N: 64
+      NUM_BUFFERS_Q: 1
+      NUM_BUFFERS_KV: 2
+      NUM_MMA_WARPS: 8
+      NUM_MMA_GROUPS: 2
+      Q_STAGE_CAPACITY: 2
+      USE_TMA_QO: true
+      Q_PIPE_ASYNC: true
+      REUSE_Q_SMEM_O: true
+      USE_TMA_KV: true
+      PAGED_PIPE_ASYNC: true
+      STAGGER_KV: true
+  - <<: *persistent_group2
+    META:
+      BLOCK_M: 128
+      BLOCK_N: 64
+      NUM_BUFFERS_Q: 1
+      NUM_BUFFERS_KV: 2
+      NUM_MMA_WARPS: 8
+      NUM_MMA_GROUPS: 2
+      Q_STAGE_CAPACITY: 2
+      USE_TMA_QO: true
+      Q_PIPE_ASYNC: true
+      REUSE_Q_SMEM_O: true
+      USE_TMA_KV: false
+      PAGED_PIPE_ASYNC: true
+      STAGGER_KV: true
+  - <<: *persistent_group2
+    META:
+      BLOCK_M: 128
+      BLOCK_N: 128
+      NUM_BUFFERS_Q: 1
+      NUM_BUFFERS_KV: 2
+      NUM_MMA_WARPS: 8
+      NUM_MMA_GROUPS: 2
+      Q_STAGE_CAPACITY: 2
+      USE_TMA_QO: true
+      Q_PIPE_ASYNC: true
+      REUSE_Q_SMEM_O: true
+      USE_TMA_KV: true
+      PAGED_PIPE_ASYNC: true
+      STAGGER_KV: true
+      COMPACT_KV80: true
+      RESCALE_O_BEFORE_PV: false
+      EARLY_CAST_P: true
+  - <<: *persistent_group2
+    META:
+      BLOCK_M: 128
+      BLOCK_N: 128
+      NUM_BUFFERS_Q: 1
+      NUM_BUFFERS_KV: 2
+      NUM_MMA_WARPS: 8
+      NUM_MMA_GROUPS: 2
+      Q_STAGE_CAPACITY: 2
+      USE_TMA_QO: true
+      Q_PIPE_ASYNC: true
+      REUSE_Q_SMEM_O: true
+      USE_TMA_KV: true
+      PAGED_PIPE_ASYNC: true
+      STAGGER_KV: true
+      COMPACT_KV80: true
+      RESCALE_O_BEFORE_PV: true
+      EARLY_CAST_P: true
   - &persistent_group1
     META:
       BLOCK_M: 64
@@ -311,6 +381,7 @@ flash_attn_varlen_fa3_persistent:
       REUSE_Q_SMEM_O: true
       USE_TMA_KV: true
       PAGED_PIPE_ASYNC: true
+      STAGGER_KV: false
     num_warps: 4
     num_stages: 3
   - <<: *persistent_group1
@@ -327,6 +398,7 @@ flash_attn_varlen_fa3_persistent:
       REUSE_Q_SMEM_O: true
       USE_TMA_KV: false
       PAGED_PIPE_ASYNC: true
+      STAGGER_KV: false
   - <<: *persistent_group1
     META:
       BLOCK_M: 64
@@ -341,6 +413,7 @@ flash_attn_varlen_fa3_persistent:
       REUSE_Q_SMEM_O: true
       USE_TMA_KV: true
       PAGED_PIPE_ASYNC: true
+      STAGGER_KV: false
   - <<: *persistent_group1
     META:
       BLOCK_M: 64
@@ -355,3 +428,4 @@ flash_attn_varlen_fa3_persistent:
       REUSE_Q_SMEM_O: true
       USE_TMA_KV: false
       PAGED_PIPE_ASYNC: true
+      STAGGER_KV: false

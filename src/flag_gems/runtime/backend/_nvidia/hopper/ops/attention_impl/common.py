@@ -315,7 +315,11 @@ def _ragged_persistent_tile_coords(
 
 
 @triton.jit
-def _split_kv_count(k_len, MAX_SPLITS: tl.constexpr):
+def _split_kv_count(
+    k_len,
+    MAX_SPLITS: tl.constexpr,
+    EXPLICIT_SPLIT_K_CHUNK: tl.constexpr = 12 * 128,
+):
     """Choose the Split-KV count from the key sequence length."""
 
     # Preserve both the values and generated comparison-only mapper used by the
@@ -324,7 +328,7 @@ def _split_kv_count(k_len, MAX_SPLITS: tl.constexpr):
     if MAX_SPLITS <= 3:
         split_count = 1 + (k_len > 12 * 128) + (k_len > 24 * 128)
     else:
-        split_count = tl.maximum(1, tl.cdiv(k_len, 12 * 128))
+        split_count = tl.maximum(1, tl.cdiv(k_len, EXPLICIT_SPLIT_K_CHUNK))
     return tl.minimum(split_count, MAX_SPLITS)
 
 
@@ -339,6 +343,7 @@ def _ragged_persistent_split_tile_coords(
     MAX_SPLITS: tl.constexpr,
     PACK_FACTOR: tl.constexpr = 1,
     HEADS_IN_L2: tl.constexpr = 0,
+    EXPLICIT_SPLIT_K_CHUNK: tl.constexpr = 12 * 128,
 ):
     """Map a compact ragged Split-KV work id to its work unit."""
 
@@ -359,7 +364,11 @@ def _ragged_persistent_split_tile_coords(
         q_len = q_eos - q_bos
         m_blocks = tl.cdiv(q_len * PACK_FACTOR, BLOCK_M)
         k_len = tl.load(seqused_k_ptr + bids, mask=valid, other=0)
-        split_counts = _split_kv_count(k_len, MAX_SPLITS)
+        split_counts = _split_kv_count(
+            k_len,
+            MAX_SPLITS,
+            EXPLICIT_SPLIT_K_CHUNK,
+        )
         batch_work = tl.where(valid, m_blocks * num_heads * split_counts, 0)
         work_prefix = tl.cumsum(batch_work, axis=0)
         work_before = work_prefix - batch_work
@@ -442,11 +451,57 @@ def _copy_paged_kv_tile_to_pipe(
     HEAD_DIM_PADDED: tl.constexpr,
     PAGED_GATHER_MODE: tl.constexpr = 2,
     BOUNDARY_CHECK: tl.constexpr = True,
+    COMPACT_KV80: tl.constexpr = False,
 ):
     """Publish one paged KV tile through a cp.async-capable TLE pipe."""
 
     slot = writer.acquire(iteration)
-    if ASYNC_COMMIT:
+    if COMPACT_KV80:
+        # Twenty N16-by-D64 views exactly cover the logical N80-by-D256 stage.
+        # Keep N16 outermost so one paged-row lookup feeds all four D64 panels.
+        rows = tl.arange(0, 16)
+        local_cols = tl.arange(0, 64)
+        for n_chunk in tl.static_range(0, 5):
+            chunk_offset = n_chunk * 16
+            logical_idx = n_offset + chunk_offset + rows
+            cache_idx = _paged_blockwise_cache_indices(
+                n_offset + chunk_offset,
+                rows,
+                k_len,
+                page_table_ptr_b,
+                block_size,
+                page_stride_rows,
+                16,
+                PAGED_GATHER_MODE,
+                BOUNDARY_CHECK=BOUNDARY_CHECK,
+            )
+            for d_chunk in tl.static_range(0, 4):
+                cols = d_chunk * 64 + local_cols
+                src_ptrs = (
+                    src_base
+                    + cache_idx[:, None] * row_stride
+                    + cols[None, :]
+                )
+                if BOUNDARY_CHECK:
+                    load_mask = (logical_idx[:, None] < k_len) & (
+                        cols[None, :] < d
+                    )
+                    vals = tl.load(src_ptrs, mask=load_mask, other=0.0)
+                elif d == HEAD_DIM_PADDED:
+                    vals = tl.load(src_ptrs)
+                else:
+                    vals = tl.load(
+                        src_ptrs,
+                        mask=cols[None, :] < d,
+                        other=0.0,
+                    )
+                tl.store(
+                    tle.gpu.local_ptr(
+                        slot.kv.chunk_view(n_chunk, d_chunk)
+                    ),
+                    vals,
+                )
+    elif ASYNC_COMMIT:
         rows = tl.arange(0, BLOCK_N)
         cols = tl.arange(0, HEAD_DIM_PADDED)
         logical_idx = n_offset + rows

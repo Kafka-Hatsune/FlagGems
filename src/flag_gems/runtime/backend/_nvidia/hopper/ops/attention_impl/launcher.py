@@ -247,12 +247,19 @@ def launch_fa3(
                 paged_gather_mode=plan.paged_gather_mode,
                 paged_kv_non_tma=plan.paged_kv_non_tma,
                 ragged_scheduler=True,
+                is_paged=is_paged,
+                is_causal=is_causal,
+                is_local=is_local,
+                is_alibi=is_alibi,
+                is_softcap=inputs.is_softcap,
                 heads_in_l2=plan.heads_in_l2,
                 dynamic_scheduler=plan.dynamic_scheduler,
                 store_lse=inputs.return_softmax_lse,
+                paged_prefill_profile=False,
                 partial_out=partial_out,
                 partial_lse=partial_lse,
                 max_splits=plan.persistent_num_splits,
+                explicit_split_k_chunk=plan.explicit_split_k_chunk,
                 scheduler_counter=scheduler_counter,
             )
             combine_persistent_split_kv(
@@ -265,10 +272,13 @@ def launch_fa3(
                 cu_seqlens_q,
                 batch_size=batch_size,
                 num_heads=num_heads,
+                num_heads_k=num_heads_k,
+                block_size=block_size,
                 max_seqlen_q=max_seqlen_q,
                 head_dim=head_size,
                 total_q=total_q,
                 max_splits=plan.persistent_num_splits,
+                explicit_split_k_chunk=plan.explicit_split_k_chunk,
                 store_lse=inputs.return_softmax_lse,
             )
         elif plan.kernel is KernelFamily.DIRECT:
@@ -307,9 +317,15 @@ def launch_fa3(
                 paged_gather_mode=plan.paged_gather_mode,
                 paged_kv_non_tma=plan.paged_kv_non_tma,
                 ragged_scheduler=plan.ragged_scheduler,
+                is_paged=is_paged,
+                is_causal=is_causal,
+                is_local=is_local,
+                is_alibi=is_alibi,
+                is_softcap=inputs.is_softcap,
                 heads_in_l2=plan.heads_in_l2,
                 dynamic_scheduler=plan.dynamic_scheduler,
                 store_lse=inputs.return_softmax_lse,
+                paged_prefill_profile=plan.paged_d256_prefill_profile,
             )
 
     return out, lse
