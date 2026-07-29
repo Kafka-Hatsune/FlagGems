@@ -92,7 +92,6 @@ _PERSISTENT_AUTOTUNE_STRATEGY = tuple(
 )
 
 _PERSISTENT_OPTIONAL_META_DEFAULTS = {
-    "COMPACT_KV80": False,
     "RESCALE_O_BEFORE_PV": False,
     "EARLY_CAST_P": False,
 }
@@ -101,8 +100,8 @@ _PERSISTENT_OPTIONAL_META_DEFAULTS = {
 def _normalize_persistent_config_schema(configs):
     """Give every config the same SQL-persisted optional-meta schema.
 
-    The YAML loader omits false-valued optional metadata while compact
-    candidates carry the corresponding true/false fields explicitly.  A
+    The YAML loader omits false-valued optional metadata while specialized
+    candidates carry the corresponding true/false fields explicitly. A
     LibTuner best-config table has one value-column schema for the whole
     Cartesian config set, so whichever family tunes first must not determine
     a narrower table that later candidates cannot be written to.
@@ -116,12 +115,7 @@ def _normalize_persistent_config_schema(configs):
     for config in configs:
         kwargs = config.kwargs
         if "ACTIVE_WGMMA_N" not in kwargs:
-            kwargs["ACTIVE_WGMMA_N"] = (
-                PersistentSchedulingHeuristics.logical_wgmma_n(
-                    block_n=kwargs["BLOCK_N"],
-                    compact_kv80=kwargs.get("COMPACT_KV80", False),
-                )
-            )
+            kwargs["ACTIVE_WGMMA_N"] = kwargs["BLOCK_N"]
     active_defaults = {
         name: default
         for name, default in _PERSISTENT_OPTIONAL_META_DEFAULTS.items()
@@ -218,7 +212,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
     PAGED_PIPE_ASYNC: tl.constexpr,
     PAGED_GATHER_MODE: tl.constexpr,
     STAGGER_KV: tl.constexpr,
-    COMPACT_KV80: tl.constexpr,
     PACK_GQA: tl.constexpr,
     RAGGED_SCHEDULER: tl.constexpr,
     HEADS_IN_L2: tl.constexpr,
@@ -507,7 +500,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             ACTIVE_WGMMA_N,
                             HEAD_DIM_PADDED,
                             PAGED_GATHER_MODE,
-                            COMPACT_KV80=COMPACT_KV80,
                         )
                 elif BM_SPLIT != 16:
                     if is_paged:
@@ -631,7 +623,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             ACTIVE_WGMMA_N,
                             HEAD_DIM_PADDED,
                             PAGED_GATHER_MODE,
-                            COMPACT_KV80=COMPACT_KV80,
                         )
                 elif is_paged:
                     _copy_paged_kv_tma_tile_to_pipe(
@@ -693,7 +684,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                                 HEAD_DIM_PADDED,
                                 PAGED_GATHER_MODE,
                                 False,
-                                COMPACT_KV80=COMPACT_KV80,
                             )
                         v_iteration = accum_cnt_kv
                         v_offset = kv_offset
@@ -716,7 +706,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             HEAD_DIM_PADDED,
                             PAGED_GATHER_MODE,
                             False,
-                            COMPACT_KV80=COMPACT_KV80,
                         )
                         accum_cnt_kv += 1
 
@@ -740,7 +729,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                                 HEAD_DIM_PADDED,
                                 PAGED_GATHER_MODE,
                                 True,
-                                COMPACT_KV80=COMPACT_KV80,
                             )
                         v_iteration = accum_cnt_kv
                         v_offset = kv_offset
@@ -763,7 +751,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             HEAD_DIM_PADDED,
                             PAGED_GATHER_MODE,
                             True,
-                            COMPACT_KV80=COMPACT_KV80,
                         )
                         accum_cnt_kv += 1
 
@@ -785,7 +772,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                         HEAD_DIM_PADDED,
                         PAGED_GATHER_MODE,
                         True,
-                        COMPACT_KV80=COMPACT_KV80,
                     )
 
                 remaining_n_block_start = n_block_min + 1
@@ -811,7 +797,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                                 ACTIVE_WGMMA_N,
                                 HEAD_DIM_PADDED,
                                 PAGED_GATHER_MODE,
-                                COMPACT_KV80=COMPACT_KV80,
                             )
                     elif BM_SPLIT != 16:
                         if is_paged:
@@ -863,7 +848,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             ACTIVE_WGMMA_N,
                             HEAD_DIM_PADDED,
                             PAGED_GATHER_MODE,
-                            COMPACT_KV80=COMPACT_KV80,
                         )
                     elif is_paged:
                         _copy_paged_kv_tma_tile_to_pipe(
@@ -1086,7 +1070,6 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
     REUSE_Q_SMEM_O: tl.constexpr,
     CID: tl.constexpr,
     PACK_GQA: tl.constexpr,
-    COMPACT_KV80: tl.constexpr,
     RESCALE_O_BEFORE_PV: tl.constexpr,
     EARLY_CAST_P: tl.constexpr,
     RAGGED_SCHEDULER: tl.constexpr,
@@ -2103,7 +2086,6 @@ def flash_varlen_fwd_v3_tle_kernel(
     AUTOTUNE_POLICY_VERSION: tl.constexpr,
     PAGED_GATHER_MODE: tl.constexpr = 2,
     STAGGER_KV: tl.constexpr = False,
-    COMPACT_KV80: tl.constexpr = False,
     RESCALE_O_BEFORE_PV: tl.constexpr = False,
     EARLY_CAST_P: tl.constexpr = False,
 ):
@@ -2116,8 +2098,7 @@ def flash_varlen_fwd_v3_tle_kernel(
     INPUT_DTYPE = q_ptr.dtype.element_ty
     page_stride_rows = k_batch_stride // k_row_stride
     THREADS_IN_MMA_GROUPS: tl.constexpr = NUM_MMA_WARPS * 32
-    # Config generation and pruning own the static contract. Ordinary configs
-    # use their full BLOCK_N carrier; the compact D256 profile uses N80.
+    # Config generation and pruning own the positive active-extent contract.
 
     q_smem = tle.gpu.alloc(
         [Q_STAGE_CAPACITY, BM_SPLIT, HEAD_DIM_PADDED],
@@ -2134,7 +2115,7 @@ def flash_varlen_fwd_v3_tle_kernel(
         q_reader0 = q_smem
         q_reader1 = q_smem
     else:
-        # The compact single-consumer path can overlap Q cp.async completion
+        # The single-consumer path can overlap Q cp.async completion
         # without paying for a second pipe's lifecycle bookkeeping.
         q0_pipe = tle.pipe(
             capacity=NUM_BUFFERS_Q,
@@ -2146,10 +2127,7 @@ def flash_varlen_fwd_v3_tle_kernel(
         q_reader0 = q0_pipe.reader()
         q_writer1 = q_writer0
         q_reader1 = q_reader0
-    if COMPACT_KV80:
-        k_smem = tle.gpu.alloc_compact_kv(INPUT_DTYPE)
-        v_smem = tle.gpu.alloc_compact_kv(INPUT_DTYPE)
-    elif BM_SPLIT == 16:
+    if BM_SPLIT == 16:
         k_smem = tle.gpu.alloc(
             [NUM_BUFFERS_KV, 1, 1],
             dtype=INPUT_DTYPE,
@@ -2158,18 +2136,17 @@ def flash_varlen_fwd_v3_tle_kernel(
         )
     else:
         k_smem = tle.gpu.alloc(
-            [NUM_BUFFERS_KV, BLOCK_N, HEAD_DIM_PADDED],
+            [NUM_BUFFERS_KV, ACTIVE_WGMMA_N, HEAD_DIM_PADDED],
             dtype=INPUT_DTYPE,
             layout=None,
             scope=tle.gpu.smem,
         )
-    if not COMPACT_KV80:
-        v_smem = tle.gpu.alloc(
-            [NUM_BUFFERS_KV, BLOCK_N, HEAD_DIM_PADDED],
-            dtype=INPUT_DTYPE,
-            layout=None,
-            scope=tle.gpu.smem,
-        )
+    v_smem = tle.gpu.alloc(
+        [NUM_BUFFERS_KV, ACTIVE_WGMMA_N, HEAD_DIM_PADDED],
+        dtype=INPUT_DTYPE,
+        layout=None,
+        scope=tle.gpu.smem,
+    )
 
     # One transport-independent pipe owns every K/V GMEM-to-SMEM stage.  The
     # payload window selects TMA for descriptor copies and cp.async (or a
@@ -2345,7 +2322,6 @@ def flash_varlen_fwd_v3_tle_kernel(
                         PAGED_PIPE_ASYNC,
                         PAGED_GATHER_MODE,
                         STAGGER_KV,
-                        COMPACT_KV80,
                         PACK_GQA,
                         RAGGED_SCHEDULER,
                         HEADS_IN_L2,
@@ -2422,7 +2398,6 @@ def flash_varlen_fwd_v3_tle_kernel(
                         REUSE_Q_SMEM_O,
                         0,
                         PACK_GQA,
-                        COMPACT_KV80,
                         RESCALE_O_BEFORE_PV,
                         EARLY_CAST_P,
                         RAGGED_SCHEDULER,
@@ -2501,7 +2476,6 @@ def flash_varlen_fwd_v3_tle_kernel(
                         REUSE_Q_SMEM_O,
                         1,
                         PACK_GQA,
-                        COMPACT_KV80,
                         RESCALE_O_BEFORE_PV,
                         EARLY_CAST_P,
                         RAGGED_SCHEDULER,
@@ -2582,7 +2556,6 @@ def flash_varlen_fwd_v3_tle_kernel(
                         PAGED_PIPE_ASYNC,
                         PAGED_GATHER_MODE,
                         STAGGER_KV,
-                        COMPACT_KV80,
                         PACK_GQA,
                         RAGGED_SCHEDULER,
                         HEADS_IN_L2,
@@ -2659,7 +2632,6 @@ def flash_varlen_fwd_v3_tle_kernel(
                         REUSE_Q_SMEM_O,
                         0,
                         PACK_GQA,
-                        COMPACT_KV80,
                         RESCALE_O_BEFORE_PV,
                         EARLY_CAST_P,
                         RAGGED_SCHEDULER,

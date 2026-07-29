@@ -353,7 +353,6 @@ flash_attn_varlen_fa3_persistent:
       USE_TMA_KV: true
       PAGED_PIPE_ASYNC: true
       STAGGER_KV: true
-      COMPACT_KV80: true
       RESCALE_O_BEFORE_PV: false
       EARLY_CAST_P: true
   - <<: *persistent_group2
@@ -372,7 +371,6 @@ flash_attn_varlen_fa3_persistent:
       USE_TMA_KV: true
       PAGED_PIPE_ASYNC: true
       STAGGER_KV: true
-      COMPACT_KV80: true
       RESCALE_O_BEFORE_PV: true
       EARLY_CAST_P: true
   - &persistent_group1

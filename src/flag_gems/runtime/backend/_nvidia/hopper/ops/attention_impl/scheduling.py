@@ -1814,7 +1814,10 @@ class DirectSchedulingHeuristics:
 class PersistentSchedulingHeuristics:
     """Autotune, pipeline, and launch-shape policy for the persistent path."""
 
-    AUTOTUNE_POLICY_VERSION = 12
+    # Generic tiled-SMEM changes both the physical allocation and generated
+    # producer/WGMMA instruction mix for ACTIVE_WGMMA_N candidates.  Keep
+    # persisted pre-tiled timings from selecting an obsolete N64 result.
+    AUTOTUNE_POLICY_VERSION = 13
     DEFAULT_BLOCK_M = 128
     DEFAULT_NUM_MMA_GROUPS = 2
     DEFAULT_NUM_Q_BUFFERS = 1
@@ -1908,16 +1911,10 @@ class PersistentSchedulingHeuristics:
         return value
 
     @staticmethod
-    def logical_wgmma_n(*, block_n: int, compact_kv80: bool) -> int:
-        """Return the logical N represented by an autotune config."""
-
-        return 80 if compact_kv80 else block_n
-
-    @staticmethod
     def active_wgmma_n_candidates(
         head_dim: int,
         *,
-        compact_kv80_eligible: bool,
+        tiled_extent_eligible: bool,
     ) -> tuple[int, ...]:
         """Return the head-dimension-aware 1P2C active-N search space.
 
@@ -1931,7 +1928,7 @@ class PersistentSchedulingHeuristics:
         head_dim_padded = CommonSchedulingHeuristics.padded_head_dim(head_dim)
         if head_dim_padded <= 128:
             return (128, 64)
-        if head_dim_padded == 256 and compact_kv80_eligible:
+        if head_dim_padded == 256 and tiled_extent_eligible:
             return (80, 64)
         return (64,)
 
@@ -1946,7 +1943,7 @@ class PersistentSchedulingHeuristics:
         use_tma_qo: bool | None = None,
         use_tma_kv: bool = True,
         stagger_kv: bool = False,
-        compact_kv80: bool = False,
+        active_wgmma_n: int | None = None,
         rescale_o_before_pv: bool = False,
         early_cast_p: bool = False,
     ):
@@ -1957,10 +1954,12 @@ class PersistentSchedulingHeuristics:
         num_buffers_q = cls.num_q_buffers()
         num_mma_warps = 4 * num_mma_groups
         q_stage_capacity = num_mma_groups * num_buffers_q
-        active_wgmma_n = cls.logical_wgmma_n(
-            block_n=block_n,
-            compact_kv80=compact_kv80,
-        )
+        if active_wgmma_n is None:
+            active_wgmma_n = block_n
+        if not 16 <= active_wgmma_n <= block_n or active_wgmma_n % 16:
+            raise ValueError(
+                "ACTIVE_WGMMA_N must be a multiple of 16 in [16, BLOCK_N]"
+            )
         if use_tma_qo is None:
             default = "1" if cls.DEFAULT_USE_TMA_QO else "0"
             use_tma_qo = (
@@ -1993,7 +1992,6 @@ class PersistentSchedulingHeuristics:
             )
             != "0",
             "STAGGER_KV": stagger_kv,
-            "COMPACT_KV80": compact_kv80,
             "ACTIVE_WGMMA_N": active_wgmma_n,
             "RESCALE_O_BEFORE_PV": rescale_o_before_pv,
             "EARLY_CAST_P": early_cast_p,
@@ -2020,7 +2018,7 @@ class PersistentSchedulingHeuristics:
             num_buffers_kv=2,
             stagger_kv=True,
         )
-        # The compact N80 profile has one legal transport/topology after the
+        # The N80 tiled-SMEM profile has one legal transport/topology after the
         # static contract and production pruner are applied: staggered K/V,
         # early FP16 P carry, and the dense-profile transport selector set.
         # Retain only the measured rescale Cartesian dimension.  The previous
@@ -2033,7 +2031,7 @@ class PersistentSchedulingHeuristics:
                     num_buffers_kv=2,
                     use_tma_kv=True,
                     stagger_kv=True,
-                    compact_kv80=True,
+                    active_wgmma_n=80,
                     rescale_o_before_pv=rescale_o_before_pv,
                     early_cast_p=True,
                 )
@@ -2152,14 +2150,7 @@ class PersistentSchedulingHeuristics:
     def config_smem_bytes(config, head_dim: int) -> int:
         block_k = _next_power_of_2(head_dim)
         block_m = config.kwargs["BLOCK_M"]
-        # ACTIVE_WGMMA_N is a compute extent, not a storage extent.  Ordinary
-        # tiles still allocate the full BLOCK_N carrier; only the compact N80
-        # allocator owns physically narrow K/V stages.
-        block_n = (
-            80
-            if config.kwargs.get("COMPACT_KV80", False)
-            else config.kwargs["BLOCK_N"]
-        )
+        block_n = config.kwargs["ACTIVE_WGMMA_N"]
         num_groups = config.kwargs["NUM_MMA_GROUPS"]
         bm_split = block_m // num_groups
         q_elems = config.kwargs["Q_STAGE_CAPACITY"] * bm_split * block_k
@@ -2312,7 +2303,7 @@ class PersistentSchedulingHeuristics:
             and is_causal
             and not (is_local or is_alibi or is_softcap)
         )
-        compact_kv80_policy = (
+        tiled_extent_policy = (
             wide_paged_prefill_packgqa_ws
             and num_heads is not None
             and num_heads_k not in (None, 0)
@@ -2323,7 +2314,7 @@ class PersistentSchedulingHeuristics:
         active_wgmma_n_candidates = set(
             cls.active_wgmma_n_candidates(
                 head_dim,
-                compact_kv80_eligible=compact_kv80_policy,
+                tiled_extent_eligible=tiled_extent_policy,
             )
         )
         wide_paged_nontma = (
@@ -2332,21 +2323,24 @@ class PersistentSchedulingHeuristics:
 
         def selected_shape_config(config):
             stagger_kv = config.kwargs.get("STAGGER_KV", False)
-            compact_kv80 = config.kwargs.get("COMPACT_KV80", False)
+            tiled_extent = (
+                config.kwargs["ACTIVE_WGMMA_N"]
+                != config.kwargs["BLOCK_N"]
+            )
             rescale_o_before_pv = config.kwargs.get(
                 "RESCALE_O_BEFORE_PV", False
             )
             early_cast_p = config.kwargs.get("EARLY_CAST_P", False)
-            if rescale_o_before_pv and not compact_kv80:
+            if rescale_o_before_pv and not tiled_extent:
                 return False
-            if early_cast_p and not compact_kv80:
+            if early_cast_p and not tiled_extent:
                 return False
             if (
-                stagger_kv or compact_kv80 or rescale_o_before_pv
+                stagger_kv or tiled_extent or rescale_o_before_pv
             ) and not wide_paged_prefill_packgqa_ws:
                 return False
-            if compact_kv80 and (
-                not compact_kv80_policy
+            if tiled_extent and (
+                not tiled_extent_policy
                 or not config.kwargs["PAGED_PIPE_ASYNC"]
                 or not config.kwargs["REUSE_Q_SMEM_O"]
                 or not stagger_kv
@@ -2367,11 +2361,11 @@ class PersistentSchedulingHeuristics:
                     and (
                         (
                             config.kwargs["BLOCK_N"] == 64
-                            and not compact_kv80
+                            and not tiled_extent
                         )
                         or (
                             config.kwargs["BLOCK_N"] == 128
-                            and compact_kv80
+                            and tiled_extent
                         )
                     )
                     and config.kwargs["NUM_BUFFERS_KV"] == 2
@@ -2385,7 +2379,7 @@ class PersistentSchedulingHeuristics:
                     and config.kwargs["NUM_MMA_GROUPS"] == 1
                     and not config.kwargs["USE_TMA_QO"]
                     and not stagger_kv
-                    and not compact_kv80
+                    and not tiled_extent
                 )
                 return group2 or group1
             if spec_packgqa_ws:
@@ -2427,7 +2421,8 @@ class PersistentSchedulingHeuristics:
             and cls.config_smem_bytes(config, head_dim)
             <= (
                 225 * 1024
-                if config.kwargs.get("COMPACT_KV80", False)
+                if config.kwargs["ACTIVE_WGMMA_N"]
+                != config.kwargs["BLOCK_N"]
                 else 220 * 1024
             )
         ]
@@ -2437,7 +2432,7 @@ class PersistentSchedulingHeuristics:
             config
             for config in reversed(configs)
             if config.kwargs["USE_TMA_KV"] == use_tma_kv
-            and not config.kwargs.get("COMPACT_KV80", False)
+            and config.kwargs["ACTIVE_WGMMA_N"] == config.kwargs["BLOCK_N"]
             and (
                 wide_paged_prefill_packgqa_ws
                 or not config.kwargs.get("STAGGER_KV", False)

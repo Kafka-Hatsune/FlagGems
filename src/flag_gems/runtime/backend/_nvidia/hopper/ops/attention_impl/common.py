@@ -451,21 +451,21 @@ def _copy_paged_kv_tile_to_pipe(
     HEAD_DIM_PADDED: tl.constexpr,
     PAGED_GATHER_MODE: tl.constexpr = 2,
     BOUNDARY_CHECK: tl.constexpr = True,
-    COMPACT_KV80: tl.constexpr = False,
 ):
     """Publish one paged KV tile through a cp.async-capable TLE pipe."""
 
     slot = writer.acquire(iteration)
-    if COMPACT_KV80:
-        # Twenty N16-by-D64 views exactly cover the logical N80-by-D256 stage.
-        # Keep N16 outermost so one paged-row lookup feeds all four D64 panels.
+    if BLOCK_N & (BLOCK_N - 1):
+        # Non-power-of-two logical stages are exact N16-by-D64 tiled views.
+        # Keep row tiles outermost so one paged-row lookup feeds every D64
+        # panel without exposing the WGMMA carrier tail.
         rows = tl.arange(0, 16)
         local_cols = tl.arange(0, 64)
-        for n_chunk in tl.static_range(0, 5):
-            chunk_offset = n_chunk * 16
-            logical_idx = n_offset + chunk_offset + rows
+        for row_tile in tl.static_range(0, BLOCK_N // 16):
+            row_offset = row_tile * 16
+            logical_idx = n_offset + row_offset + rows
             cache_idx = _paged_blockwise_cache_indices(
-                n_offset + chunk_offset,
+                n_offset + row_offset,
                 rows,
                 k_len,
                 page_table_ptr_b,
@@ -475,8 +475,8 @@ def _copy_paged_kv_tile_to_pipe(
                 PAGED_GATHER_MODE,
                 BOUNDARY_CHECK=BOUNDARY_CHECK,
             )
-            for d_chunk in tl.static_range(0, 4):
-                cols = d_chunk * 64 + local_cols
+            for col_tile in tl.static_range(0, HEAD_DIM_PADDED // 64):
+                cols = col_tile * 64 + local_cols
                 src_ptrs = (
                     src_base
                     + cache_idx[:, None] * row_stride
@@ -496,9 +496,7 @@ def _copy_paged_kv_tile_to_pipe(
                         other=0.0,
                     )
                 tl.store(
-                    tle.gpu.local_ptr(
-                        slot.kv.chunk_view(n_chunk, d_chunk)
-                    ),
+                    tle.gpu.local_ptr(slot.kv.tile_view(row_tile, col_tile)),
                     vals,
                 )
     elif ASYNC_COMMIT:
@@ -565,15 +563,37 @@ def _copy_dense_kv_tile_to_pipe(
     """Publish one contiguous K/V tile through a TLE pipe."""
 
     slot = writer.acquire(iteration)
-    rows = tl.arange(0, BLOCK_N)
-    cols = tl.arange(0, HEAD_DIM_PADDED)
-    logical_rows = row_offset + rows
-    vals = tl.load(
-        src_base + logical_rows[:, None] * row_stride + cols[None, :],
-        mask=(logical_rows[:, None] < row_count) & (cols[None, :] < d),
-        other=0.0,
-    )
-    tl.store(tle.gpu.local_ptr(slot.kv), vals)
+    if BLOCK_N & (BLOCK_N - 1):
+        rows = tl.arange(0, 16)
+        local_cols = tl.arange(0, 64)
+        for row_tile in tl.static_range(0, BLOCK_N // 16):
+            logical_rows = row_offset + row_tile * 16 + rows
+            for col_tile in tl.static_range(0, HEAD_DIM_PADDED // 64):
+                cols = col_tile * 64 + local_cols
+                vals = tl.load(
+                    src_base
+                    + logical_rows[:, None] * row_stride
+                    + cols[None, :],
+                    mask=(logical_rows[:, None] < row_count)
+                    & (cols[None, :] < d),
+                    other=0.0,
+                )
+                tl.store(
+                    tle.gpu.local_ptr(
+                        slot.kv.tile_view(row_tile, col_tile)
+                    ),
+                    vals,
+                )
+    else:
+        rows = tl.arange(0, BLOCK_N)
+        cols = tl.arange(0, HEAD_DIM_PADDED)
+        logical_rows = row_offset + rows
+        vals = tl.load(
+            src_base + logical_rows[:, None] * row_stride + cols[None, :],
+            mask=(logical_rows[:, None] < row_count) & (cols[None, :] < d),
+            other=0.0,
+        )
+        tl.store(tle.gpu.local_ptr(slot.kv), vals)
     writer.commit(iteration)
 
 
@@ -589,12 +609,22 @@ def _copy_dense_kv_tma_tile_to_pipe(
     """Publish one contiguous K/V tile through a TMA descriptor and TLE pipe."""
 
     slot = writer.acquire(iteration)
-    tle.gpu.copy(
-        desc,
-        slot.kv,
-        [BLOCK_N, HEAD_DIM_PADDED],
-        [row_offset, 0],
-    )
+    if BLOCK_N & (BLOCK_N - 1):
+        for row_tile in tl.static_range(0, BLOCK_N // 16):
+            for col_tile in tl.static_range(0, HEAD_DIM_PADDED // 64):
+                tle.gpu.copy(
+                    desc,
+                    slot.kv.tile_view(row_tile, col_tile),
+                    [16, 64],
+                    [row_offset + row_tile * 16, col_tile * 64],
+                )
+    else:
+        tle.gpu.copy(
+            desc,
+            slot.kv,
+            [BLOCK_N, HEAD_DIM_PADDED],
+            [row_offset, 0],
+        )
     writer.commit(iteration)
 
 
@@ -615,12 +645,26 @@ def _copy_paged_kv_tma_tile_to_pipe(
     virtual_page = n_offset // block_size
     page_offset = n_offset % block_size
     physical_page = tl.load(page_table_ptr_b + virtual_page).to(tl.int32)
-    tle.gpu.copy(
-        desc,
-        slot.kv,
-        [1, BLOCK_N, HEAD_DIM_PADDED],
-        [physical_page, page_offset, 0],
-    )
+    if BLOCK_N & (BLOCK_N - 1):
+        for row_tile in tl.static_range(0, BLOCK_N // 16):
+            for col_tile in tl.static_range(0, HEAD_DIM_PADDED // 64):
+                tle.gpu.copy(
+                    desc,
+                    slot.kv.tile_view(row_tile, col_tile),
+                    [1, 16, 64],
+                    [
+                        physical_page,
+                        page_offset + row_tile * 16,
+                        col_tile * 64,
+                    ],
+                )
+    else:
+        tle.gpu.copy(
+            desc,
+            slot.kv,
+            [1, BLOCK_N, HEAD_DIM_PADDED],
+            [physical_page, page_offset, 0],
+        )
     writer.commit(iteration)
 
 
