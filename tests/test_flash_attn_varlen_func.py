@@ -743,9 +743,9 @@ def _plan_signature(plan) -> Tuple[str, int]:
     [
         pytest.param(64, 256, 67, 4, 1536, 8, True, id="d256-mixed"),
         pytest.param(
-            12,
+            13,
             256,
-            12,
+            13,
             1,
             1024,
             8,
@@ -753,9 +753,9 @@ def _plan_signature(plan) -> Tuple[str, int]:
             id="d256-short-single",
         ),
         pytest.param(
-            12,
+            13,
             256,
-            12,
+            13,
             1,
             1536,
             16,
@@ -763,7 +763,7 @@ def _plan_signature(plan) -> Tuple[str, int]:
             id="d256-short-single-default-chunk",
         ),
         pytest.param(
-            12,
+            13,
             256,
             1,
             1,
@@ -860,7 +860,7 @@ def test_flash_attn_varlen_fa3_persistent_autotune_key_buckets() -> None:
     } <= set(tuner.keys)
     assert (
         _fa3_scheduling_module().PersistentSchedulingHeuristics.AUTOTUNE_POLICY_VERSION
-        == 12
+        == 13
     )
 
 
@@ -1850,7 +1850,6 @@ def test_flash_attn_varlen_fa3_d256_prefill_autotune_candidates(
             config.kwargs["USE_TMA_QO"],
             config.kwargs["STAGGER_KV"],
             config.kwargs["ACTIVE_WGMMA_N"],
-            config.kwargs.get("COMPACT_KV80", False),
             config.kwargs.get("RESCALE_O_BEFORE_PV", False),
             config.kwargs.get("EARLY_CAST_P", False),
         )
@@ -1858,11 +1857,11 @@ def test_flash_attn_varlen_fa3_d256_prefill_autotune_candidates(
     }
 
     assert signatures == {
-        (128, 64, 2, True, False, 64, False, False, False),
-        (128, 64, 2, True, True, 64, False, False, False),
-        (128, 128, 2, True, True, 80, True, False, True),
-        (128, 128, 2, True, True, 80, True, True, True),
-        (64, 64, 1, False, False, 64, False, False, False),
+        (128, 64, 2, True, False, 64, False, False),
+        (128, 64, 2, True, True, 64, False, False),
+        (128, 128, 2, True, True, 80, False, True),
+        (128, 128, 2, True, True, 80, True, True),
+        (64, 64, 1, False, False, 64, False, False),
     }
 
 
@@ -1875,22 +1874,22 @@ def test_flash_attn_varlen_fa3_active_wgmma_n_heuristic(
     for name in _FA3_AUTOTUNE_EXPERIMENT_ENV:
         monkeypatch.delenv(name, raising=False)
 
-    assert heuristics.active_wgmma_n_candidates(64, compact_kv80_eligible=False) == (
+    assert heuristics.active_wgmma_n_candidates(64, tiled_extent_eligible=False) == (
         128,
         64,
     )
-    assert heuristics.active_wgmma_n_candidates(128, compact_kv80_eligible=False) == (
+    assert heuristics.active_wgmma_n_candidates(128, tiled_extent_eligible=False) == (
         128,
         64,
     )
-    assert heuristics.active_wgmma_n_candidates(192, compact_kv80_eligible=False) == (
+    assert heuristics.active_wgmma_n_candidates(192, tiled_extent_eligible=False) == (
         64,
     )
-    assert heuristics.active_wgmma_n_candidates(256, compact_kv80_eligible=True) == (
+    assert heuristics.active_wgmma_n_candidates(256, tiled_extent_eligible=True) == (
         80,
         64,
     )
-    assert heuristics.active_wgmma_n_candidates(256, compact_kv80_eligible=False) == (
+    assert heuristics.active_wgmma_n_candidates(256, tiled_extent_eligible=False) == (
         64,
     )
 
@@ -1936,7 +1935,7 @@ def test_flash_attn_varlen_fa3_active_wgmma_n_heuristic(
     for config in heuristics.autotune_configs():
         kwargs = config.kwargs
         active_n = kwargs["ACTIVE_WGMMA_N"]
-        if kwargs.get("COMPACT_KV80", False):
+        if active_n != kwargs["BLOCK_N"]:
             assert active_n == 80
         else:
             assert active_n == kwargs["BLOCK_N"]
@@ -1961,11 +1960,6 @@ def test_flash_attn_varlen_fa3_active_wgmma_n_old_schema(
         heuristics.make_config(block_n=128, num_buffers_kv=2),
         heuristics.make_config(block_n=64, num_buffers_kv=2),
         heuristics.make_config(
-            block_n=128,
-            num_buffers_kv=2,
-            compact_kv80=True,
-        ),
-        heuristics.make_config(
             block_m=64,
             block_n=64,
             num_buffers_kv=2,
@@ -1979,7 +1973,6 @@ def test_flash_attn_varlen_fa3_active_wgmma_n_old_schema(
     assert [config.kwargs["ACTIVE_WGMMA_N"] for config in normalized] == [
         128,
         64,
-        80,
         64,
     ]
 
@@ -2020,9 +2013,6 @@ def test_flash_attn_varlen_fa3_stagger_kv_is_prefill_only() -> None:
             not config.kwargs.get("STAGGER_KV", False) for config in kept
         )
         assert all(
-            not config.kwargs.get("COMPACT_KV80", False) for config in kept
-        )
-        assert all(
             not config.kwargs.get("RESCALE_O_BEFORE_PV", False)
             for config in kept
         )
@@ -2036,7 +2026,7 @@ def test_flash_attn_varlen_fa3_stagger_kv_is_prefill_only() -> None:
 
 
 @pytest.mark.flash_attn_varlen_func
-def test_flash_attn_varlen_fa3_compact_kv80_policy_matrix() -> None:
+def test_flash_attn_varlen_fa3_tiled_extent_policy_matrix() -> None:
     scheduling = _fa3_scheduling_module()
     heuristics = scheduling.PersistentSchedulingHeuristics
     configs = heuristics.autotune_configs()
@@ -2070,10 +2060,10 @@ def test_flash_attn_varlen_fa3_compact_kv80_policy_matrix() -> None:
         kept = heuristics.prune_autotune_configs(
             configs, {}, **(base | positive)
         )
-        compact = [
+        tiled = [
             config
             for config in kept
-            if config.kwargs.get("COMPACT_KV80", False)
+            if config.kwargs["ACTIVE_WGMMA_N"] != config.kwargs["BLOCK_N"]
         ]
         assert {
             (
@@ -2082,7 +2072,7 @@ def test_flash_attn_varlen_fa3_compact_kv80_policy_matrix() -> None:
                 config.kwargs.get("RESCALE_O_BEFORE_PV", False),
                 config.kwargs.get("EARLY_CAST_P", False),
             )
-            for config in compact
+            for config in tiled
         } == {
             (True, 80, False, True),
             (True, 80, True, True),
@@ -2108,9 +2098,6 @@ def test_flash_attn_varlen_fa3_compact_kv80_policy_matrix() -> None:
         kept = heuristics.prune_autotune_configs(
             configs, {}, **(base | override)
         )
-        assert all(
-            not config.kwargs.get("COMPACT_KV80", False) for config in kept
-        ), override
         assert all(
             not config.kwargs.get("RESCALE_O_BEFORE_PV", False)
             for config in kept

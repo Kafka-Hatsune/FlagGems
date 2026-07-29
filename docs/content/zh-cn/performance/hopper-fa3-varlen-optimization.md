@@ -30,18 +30,26 @@ weight: 45
 
 最终实现由三层组成：
 
-1. FlagTree 编译器提供 native N80 WGMMA、compact KV pipe、精确 pointer
-   shuffle lowering 和更窄的 Membar 分析。
+1. FlagTree 编译器提供通用非 2 次幂 logical tiled-SMEM allocation、
+   active-N/active-K WGMMA、精确 pointer shuffle lowering 和 tiled alias
+   Membar 分析。
 2. FlagGems cost model 将 decode、普通 prefill、D256 paged prefill 和
    ragged mixed batch 分流到不同执行计划。
 3. Triton autotune 只在满足静态安全契约的候选中实测，并用完整语义 key
    持久化 winner。
 
-在最终 focused gate 中，四个 prefill/mixed case 相对 vLLM 分别达到
-`95.59% / 92.87% / 93.48% / 96.62%`，几何均值 `94.63%`；decode
-几何均值性能保留为 `99.9966%`。这说明本轮提出的“prefill 和 mixed 至少
-达到 vLLM 90%”已经在该 gate 上达到，但项目要求的逐 case 95% 尚未完全
-达到，B2 和 B5 仍是主要缺口。
+本次通用 allocation 重构后的冷启动受控 24-case H100 gate 中，prefill
+几何值为 vLLM 的 `98.34%`，最差 B1 为 `91.06%`；mixed 几何值为
+`103.18%`，最差 B2 为 `92.10%`，8/11 达到 95%。因此通用 tiled
+allocation、N80 和 dispatch 优化已经缩小差距，但“prefill 和 mixed
+均达到 vLLM 95%”尚未完成。B1/B2 同进程 ABBA 仍证明生产 N80 相对 N64
+分别快 `1.098x`/`1.134x`；它只能证明 N80 方向正确，不能替代与 vLLM
+在同温度窗口的正式比较。
+
+decode 没有进入 tiled-N80 候选；policy 12 与 policy 13 的 10 个 decode
+case 几何性能保留约 `99.72%`，单 case 波动范围约 `-1.29%～+2.04%`。
+因此目前证据支持“没有结构性 decode 回退”，但不把亚百分比温度噪声写成
+严格的逐 case 零回退。
 
 后续 `ACTIVE_WGMMA_N` 泛化提交又完整跑了四组 Qwen3.6 runtime trace：
 25/25 个 prefill case 达到 vLLM 的 90%，四组 prefill/mixed phase 的中位数
@@ -60,47 +68,46 @@ H100 的百分比直接当成 H800 结果。
 
 | Commit | 内容 | 性质 |
 | --- | --- | --- |
-| `746704102` | WGMMA `active_n`/`active_k` carrier extent、accumulator tail 恢复及 verifier/codegen | 通用 WGMMA 能力 |
-| `c814ab090` | 在 WGMMA 指令使用点构造 shared descriptor | descriptor 正确性修复 |
-| `299095b61` | compact KV pipe storage、stage/chunk view 与 Python TLE API | Hopper compact storage |
-| `a4bdfb464` | compact KV stage/chunk 的精确 shared-memory alias 建模 | Membar 分析基础 |
-| `9f2abcc95` | 将精确 paged-pointer broadcast 降为 warp shuffle | 已测性能优化 |
-| `90815bacf` | WGMMA 已完成后的精确 release rendezvous 抑制 | 静态有效，运行时收益待复验 |
-| `ccb24424d` | 将 full-carrier active extent 规范化为普通 WGMMA | 正值 config 与原 codegen 的兼容层 |
-| `6d833c5dc` | 删除独立 TLE TTNG Op，以标准 `WarpGroupDotOp` 和私有属性承载 partial extent | 复用原生 WGMMA pass 生态 |
+| `fc364eba4` | `buffered_tensor_type` 与 `tl.block_type` 解耦；logical allocation、tiled stage/tile view 及 verifier | 通用 TLE buffer/frontend |
+| `eb2e640ab` | 通用 pipe coverage、memory effect、Membar alias 与 warp-specialization token lowering | 通用流水与同步 |
+| `997945d1a` | 从 tiled operand 推导 active WGMMA descriptor、carrier 和 K repetition | NVIDIA Hopper lowering |
 
 ### FlagGems
 
 | Commit | 内容 | 性质 |
 | --- | --- | --- |
-| `dec24aa0` | 合并四组 Qwen3.6 真实运行时 shape | benchmark 数据 |
-| `fd041383` | autotune key 分区与 optional metadata schema 归一化 | 调优基础设施修复 |
-| `f59f5485` | mixed Split-K、D256 paged prefill、compact N80 和 decode guard | 运行时集成优化 |
-| `6d4cb101` | 将固定 N80 泛化为按 head dim 搜索的 `ACTIVE_WGMMA_N` | head-dim/autotune 泛化 |
+| `f730d7da` | attention producer、persistent kernel、SMEM cost model 和 autotune 迁移到 logical tiled allocation | 运行时迁移 |
+| 本文档提交 | frontend/scheduler 回归测试、实验记录和实现说明 | 验证与清理 |
 
 依赖关系如下：
 
 ```text
-FlagTree 746704102 ─> c814ab090 ─> 299095b61 ─> a4bdfb464 ─┐
-                                                           ├─> FlagGems f59f5485 ─> 6d4cb101
-FlagTree 9f2abcc95 ────────────────────────────────────────┘
-
-FlagTree a4bdfb464 + completed-WGMMA analysis ─> 90815bacf
-FlagTree 746704102 ──> FlagTree ccb24424d ──> FlagTree 6d833c5dc
-                                                │
-                                                └─> standard WGMMA pass ecology
-
-FlagGems fd041383 ──> FlagGems f59f5485
-FlagGems dec24aa0 ──> benchmark / pre-tune coverage
+FlagTree fc364eba4
+    ├─ logical shape/storage shape + tiled views
+    v
+FlagTree eb2e640ab
+    ├─ pipe coverage + alias/Membar + warp specialization
+    v
+FlagTree 997945d1a
+    ├─ NVIDIA active WGMMA descriptor/codegen
+    v
+FlagGems f730d7da
+    └─ attention producer、cost model、autotune 与 benchmark
 ```
 
-`f59f5485` 使用了 `tle.gpu.alloc_compact_kv`、WGMMA `active_n=80` 和
-`active_k=80`，因此不能脱离 `746704102`、`c814ab090`、
-`299095b61` 和 `a4bdfb464` 这组基础能力单独运行。
-`6d4cb101` 在此基础上把 QK 的 active extent 变为 config constexpr，
-并依赖 `746704102` 提供的通用 `active_n` verifier/lowering；在当前
-FlagTree HEAD 上，`6d833c5dc` 进一步把该 lowering 的 TTNG carrier 统一为
-标准 `WarpGroupDotOp`。
+旧 `tle.gpu.alloc_compact_kv`、compact buffer 类型、compact IR Op 和
+专用 verifier 已全部删除，不提供兼容 alias。FlagGems 只描述逻辑 shape：
+
+```python
+k_smem = tle.gpu.alloc(
+    [NUM_BUFFERS_KV, ACTIVE_WGMMA_N, HEAD_DIM_PADDED],
+    INPUT_DTYPE,
+)
+```
+
+`f730d7da` 因而依赖上面三个 FlagTree 提交，不能只在上游 Triton 环境中
+单独运行。改动均位于 TLE 和 `third_party/nvidia` 的 `__TLE__` 路径；
+标准 Triton register tensor、标准 `ttg.memdesc` 约束和其他后端行为不变。
 
 ## 从输入 shape 到 kernel 的调用链
 
@@ -124,7 +131,7 @@ launch_fa3
     |
     +-- decode / 近似 decode ----------> direct kernel
     +-- 长且规则的 paged prefill ------> packed persistent kernel
-    |                                      +-- compact N80 candidate
+    |                                      +-- exact tiled N80 candidate
     |                                      +-- legacy N64/N128 candidate
     +-- ragged mixed / 长 K ------------> persistent Split-K + combine
 ```
@@ -182,7 +189,7 @@ Decode 通常满足 `Q=1`，单次工作量小，launch、scheduler ticket、TMA
 - 规则 decode 直接使用 compact direct kernel；
 - “接近填满一个 SM wave”的 uniform decode 也优先 direct，避免 persistent
   scheduler 在已经有足够并行度时增加开销；
-- decode 不进入 compact N80 prefill 配置，也不启用 `STAGGER_KV`、
+- decode 不进入 tiled N80 prefill 配置，也不启用 `STAGGER_KV`、
   `EARLY_CAST_P` 或 `RESCALE_O_BEFORE_PV`。
 
 这不是只靠一个 `Q == 1` 判断。batch、head 数、SM wave 填充度、K 长度和
@@ -199,7 +206,7 @@ Prefill 的 Q 和 K 都长，矩阵乘占主导。D256、paged KV、GQA 场景�
 - persistent kernel 可以把 TMA、WGMMA 和 softmax 放入稳定流水线。
 
 这类 shape 被路由到 `PAGED_D256_PREFILL` profile，再由 autotune 在 legacy
-和 compact 候选中选择。
+和 tiled-N80 候选中选择。
 
 ### Mixed batch
 
@@ -260,19 +267,18 @@ persistent FA3 的性能敏感维度包括：
 - TMA Q/O 与 TMA KV；
 - `STAGGER_KV`；
 - `ACTIVE_WGMMA_N`；
-- `COMPACT_KV80`；
 - `EARLY_CAST_P`；
 - `RESCALE_O_BEFORE_PV`。
 
 这些维度并非对所有 shape 做无约束笛卡尔积。pruner 先用静态安全契约裁剪：
 
-- compact N80 只允许 FP16、D256、paged、causal、GQA；
+- tiled N80 只允许 FP16、D256、paged、causal、GQA；
 - 仅允许 `(page16, GQA4)` 或 `(page32, GQA8)`；
 - 必须是 packed prefill，而不能是 decode、Split-K、local、alibi、
   softcap 或 S auxiliary；
-- compact path 固定双 MMA group、双 KV buffer、TMA Q/O、staggered KV
+- tiled path 固定双 MMA group、双 KV buffer、TMA Q/O、staggered KV
   和 early FP16 P；
-- 实测保留的 compact 搜索维度只有
+- 实测保留的 tiled-N80 搜索维度只有
   `RESCALE_O_BEFORE_PV={false,true}`。
 
 因此“笛卡尔积”用于发现 winner，“cost model + pruner”用于避免让不合法或
@@ -296,12 +302,12 @@ persistent FA3 的性能敏感维度包括：
 
 ### SQLite schema bug
 
-LibTuner 的一个 winner 表只有一套 value columns。legacy config 不包含
-`COMPACT_KV80`、`EARLY_CAST_P` 等 optional metadata；若它先创建表，后来的
-compact winner 就可能无法写入。
+LibTuner 的一个 winner 表只有一套 value columns。N64 config 不包含
+`EARLY_CAST_P` 等 optional metadata；若它先创建表，后来的 N80 winner
+就可能无法写入。
 
 `_normalize_persistent_config_schema()` 会在搜索集合中发现所有实际出现的
-optional fields，并给每个 config 补齐默认值。这样无论 legacy 还是 compact
+optional fields，并给每个 config 补齐默认值。这样无论 N64 还是 N80
 谁先完成调优，持久化 schema 都一致。
 
 调优时还应使用隔离的 `FLAGGEMS_DB_URL`。全局缓存可能包含旧 policy、不同
@@ -331,11 +337,11 @@ qk = tle.gpu.wgmma(
 key，因此不同 head dim 不会错误复用同一 winner；获胜的
 `ACTIVE_WGMMA_N` 则和 `BLOCK_N`、buffer 数等一起写入 value columns。
 
-这次候选集合变化先把 `AUTOTUNE_POLICY_VERSION` 从 10 提升到 11；移除
-`ACTIVE_WGMMA_N=0` 哨兵后又提升到 12，避免旧 winner 跨 config 语义复用。
-对于旧 YAML/SQLite row，`_normalize_persistent_config_schema()` 根据
-`BLOCK_N` 和 `COMPACT_KV80` 补齐正值：ordinary 使用 `BLOCK_N`，compact
-使用 80。
+这次 generic tiled-SMEM 改变了 N80 的 allocation 和 producer/WGMMA
+指令组合，因此把 `AUTOTUNE_POLICY_VERSION` 从 12 提升到 13，避免复用
+旧 physical-N128 backing 测得的 winner。`ACTIVE_WGMMA_N` 没有 0
+哨兵；旧 YAML/SQLite row 缺少该列时只按 `BLOCK_N` 补齐。N80 是新的完整
+config value，不再从 `COMPACT_KV80` 布尔量推导。
 
 ### head dim 启发式与候选生成契约
 
@@ -344,18 +350,18 @@ key，因此不同 head dim 不会错误复用同一 winner；获胜的
 | `Dpad` 和 eligibility | 进入搜索的逻辑 N | storage |
 | --- | --- | --- |
 | `Dpad <= 128` | N128、N64 | ordinary N128、ordinary N64 |
-| `Dpad == 256` 且 compact profile 合法 | N80、N64 | compact N80、ordinary N64 |
+| `Dpad == 256` 且 tiled profile 合法 | N80、N64 | exact tiled N80、ordinary N64 |
 | 其他情况 | N64 | ordinary N64 |
 
 这个选择来自固定 FP16 1P2C payload
 `Dpad * (256 + 8 * N)` bytes：D64/D128 可以容纳 N128；D256 的 ordinary
-N128 超出当前安全预算，而 compact N80 是已经实测的最大窄 tile，N64 保留
-为 no-regression 候选。表中的“compact profile 合法”还包含既有的 FP16、
+N128 超出当前安全预算，而 exact tiled N80 是已经实测的最大窄 tile，N64
+保留为 no-regression 候选。表中的“tiled profile 合法”还包含既有的 FP16、
 D256、paged、causal、PackGQA、page/GQA 等契约，不是只看 `Dpad`。
 这里 D64/D128 的 N128 与 N64 是两个不同的 ordinary 物理 tile，分别满足
 `ACTIVE_WGMMA_N == BLOCK_N`；它们不是“在同一个 N128 backing 中用
 active-N64”。当前唯一允许 active extent 小于物理 carrier 的 production
-配置仍是 compact D256/N80。
+配置仍是 tiled D256/N80。
 
 `ACTIVE_WGMMA_N` 不再使用 0 表示另一个 API overload。每个 config 都携带
 正的逻辑 N，且满足 `16 <= ACTIVE_WGMMA_N <= BLOCK_N`。当前生成器只产生
@@ -366,12 +372,12 @@ kernel、pruner 和 config consumer 中重复检查 `% 16`。
 笛卡尔积。当前合法 config 对由 storage 决定：
 
 - ordinary N64/N128：`ACTIVE_WGMMA_N=BLOCK_N`；
-- compact N80：物理 accumulator carrier 为 N128，
+- tiled N80：物理 accumulator carrier 为 N128，
   `ACTIVE_WGMMA_N=80`，K/V backing 为精确 N80。
 
 因此 head-dim heuristic 先生成完整、合法的 config 对，再由 autotuner 实测
 选择，而不是先生成任意 active N、再在 kernel 内拒绝不一致状态。partial-N80
-仍只在 BM128、1P2C、Q1/KV2 的 compact profile 中出现；decode、Split-K、
+仍只在 BM128、1P2C、Q1/KV2 的 tiled profile 中出现；decode、Split-K、
 1P1C、BM64 或 Q 双缓冲使用 ordinary config，其正值
 `ACTIVE_WGMMA_N` 等于各自的 `BLOCK_N`。逻辑 tile 直接按
 
@@ -379,14 +385,13 @@ kernel、pruner 和 config consumer 中重复检查 `% 16`。
 LOGICAL_BLOCK_N = ACTIVE_WGMMA_N
 ```
 
-计算。因此 producer tile count、offset 和 causal boundary 不再用
-`COMPACT_KV80` 特判 N80。这里必须把“计算 extent”和“存储 extent”分开：
-ordinary config 中 `ACTIVE_WGMMA_N == BLOCK_N`，SMEM cost model 仍按物理
-`BLOCK_N` 计费；只有 `COMPACT_KV80` 的专用 allocator 才按物理 N80
-backing 计费。compact config 中 native N80 由 N128 accumulator carrier
-的前 80 列承载，`[80,128)` 在 softmax 前恢复为 mask tail，而 K/V backing
-本身只存精确的 80 行。将来即使开放 ordinary N96/N112，也不能直接用
-`ACTIVE_WGMMA_N` 缩小 SMEM 估算，除非同时实现对应的窄 storage。
+计算。因此 producer tile count、offset、causal boundary 和 SMEM cost
+全部直接使用同一个正值 `ACTIVE_WGMMA_N`。对于 N80，allocation frontend
+根据 logical shape 自动选择 exact tiled storage；WGMMA accumulator 仍用
+N128 register carrier，前 80 列有效，`[80,128)` 在 softmax 前恢复为
+mask tail。这里 carrier padding 只存在于寄存器/SSA 语义中，K/V shared
+backing 不含 48 行 padding。将来开放 N96/N112 时也走同一 logical
+allocation，无需再增加 shape 专用布尔量或 allocator。
 
 ### 统一调用与 full-N canonicalization
 
@@ -406,7 +411,7 @@ FlagTree 的 TLE lowering 将
 Op，只额外附加 `tle.wgmma_active_n` 或 `tle.wgmma_active_k` 私有属性。
 因此 TTNG 层不再定义 `ttng.tle_warp_group_dot`。这把“config 中总是正值”
 和“full-N 必须保持旧 codegen”分离开：FlagGems 不需要数字哨兵或四处重复
-constexpr 分支，ordinary/decode 仍得到原来的同步分析和 PTX；compact N80
+constexpr 分支，ordinary/decode 仍得到原来的同步分析和 PTX；tiled N80
 则由 NVIDIA-TLE WGMMA lowering 读取属性，生成 partial native opcode。
 编译器回归测试还覆盖 M128 full-N，避免统一接口被 active-N 专用的 M64
 约束误伤。
@@ -420,22 +425,24 @@ canonicalization、commit/wait pipeline 和 LLVM conversion pattern。唯一
 `splitRSDot` 遇到 `tle.wgmma_active_k` 时保持整体。active-N 不改变 K
 repetition，可以正常参与标准 K-split。
 
-### 为什么暂不开放 ordinary N96
+### 编译器支持范围与 production 搜索范围
 
-FlagTree 编译器的普通 `active_n` API 接受 Hopper 支持的 8 对齐 N；
-FlagGems attention 层进一步要求 16 对齐，因为 paged producer、compact
-chunk 和 PV reduction 都以 N16/K16 为流水粒度。即使 compiler 已能生成
-`m64n96k16`，当前 kernel 也不能只改一个 constexpr 就安全启用 N96：
+FlagTree generic tiled allocation 首版接受 FP16/BF16、`rows % 16 == 0`、
+`cols % 64 == 0`、`cols <= 256`。WGMMA/PTX 回归覆盖 active N/K
+`16,32,48,64,80,96,112,128`，因此 N96/N112 已经不再受 storage/view
+能力限制：
 
-- ordinary K/V storage、copy tensor 和 softmax carrier 仍以受支持的物理
-  N64/N128 shape 构造；
-- compact stage/chunk view 只定义了精确 N80 backing；
-- PV 若只归约逻辑 N96，还需要与该 storage 对应的 `active_k=96` contract，
-  当前 production compact active-K 路径只验证并开放了 N80。
+- K/V logical storage 会分别映射成 6/7 个 N16 row tile；
+- QK 使用 `active_n=96/112`；
+- PV 使用同值 `active_k`，分别发出 6/7 个 K16 repetition；
+- accumulator 的物理 carrier 和 tail restore 由 NVIDIA lowering 管理。
 
-所以当前安全集合是 ordinary N64/N128 和 compact N80。推广到 N96/N112
-需要同时补 storage、copy/view、QK tail、softmax 和 PV active-K 的端到端
-契约，不能只依赖硬件 opcode 已存在。
+不过“compiler 能生成”不等于“production 一定应搜索”。当前 cost model
+只保留 N64/N80/N128：它们覆盖了 D256 的已测最优点以及 D64/D128 的
+ordinary no-regression 点。N96/N112 若加入 production，应作为新的
+autotune value 与 page size、GQA、rescale 等一起实测，而不是凭 shared
+容量公式直接假设更快。这样把能力边界与性能策略边界分开：编译器是通用的，
+FlagGems 搜索面仍保持小而有证据。
 
 ### 本轮正确性、ABBA 与 NCU 验证
 
@@ -452,23 +459,23 @@ chunk 和 PV reduction 都以 N16/K16 为流水粒度。即使 compiler 已能�
 
 4/4 case 输出逐位一致，显式 full-carrier active-N 的最大测得开销低于
 2.35%，相对 PyTorch FP32 参考的最大绝对误差不超过
-`0.00146484375`。compact N80
+`0.00146484375`。tiled N80
 另在 small16、small32、B5、B25 和 decode 上通过 5/5 gate：三次重复均
-bitwise stable，compact 与 legacy N64 的最大绝对误差为
+bitwise stable，tiled N80 与 legacy N64 的最大绝对误差为
 `0.00048828125`，small case 相对 PyTorch FP32 的最大绝对误差为
 `0.00096774101`，decode 为 `0.00004330277`。去掉哨兵后的 decode pruner
-仍不保留 compact config，ordinary config 分别携带 N64 或 N128。
+仍不保留 tiled config，ordinary config 分别携带 N64 或 N128。
 
 最终 compiler canonicalization 的检查比延迟 gate 更严格：ordinary
 kernel 的 TTGIR 只有标准 `ttng.warp_group_dot`，且没有 active extent
 属性；其 TTGIR、LLVM IR、PTX 和 cubin 在标准 Op 重构前后逐字节相同。
-compact kernel 也不再包含独立 TLE Op，而是 34 个标准
+tiled N80 kernel 也不再包含独立 TLE Op，而是 34 个标准
 `ttng.warp_group_dot`，其中 6 个携带 `tle.wgmma_active_n=80`、6 个携带
 `tle.wgmma_active_k=80`。最终 PTX 仍有 96 条 `m64n80k16`，PV 仍只发出
 5 个 K16 repetition，说明完整 pass pipeline 没有丢失 partial extent。
 
 标准 pipeline 还为循环内 active op 正常插入
-`ttng.warp_group_dot_commit`。所选 compact kernel 的
+`ttng.warp_group_dot_commit`。所选 tiled kernel 的
 `fence.proxy.async`、WGMMA fence/mma/commit/wait、mbarrier 和
 `membar.cta` 指令数量重构前后不变；PTX diff 只消除了 4 个位于
 `wgmma.wait_group 1` 与 release `mbarrier.arrive` 之间的冗余
@@ -479,12 +486,13 @@ compact kernel 也不再包含独立 TLE Op，而是 34 个标准
 修改前后还使用相同 H100、相同 shape 和三轮 ABBA 快速 gate 做了 focused
 对照：
 
-| Case | before 最优 compact | after 最优 compact | after / before | legacy / 最优 compact：before → after |
+| Case | before 最优 N80 | after 最优 N80 | after / before | N64 / 最优 N80：before → after |
 | --- | ---: | ---: | ---: | ---: |
 | B1 prefill | 4.52024 ms | 4.36138 ms | 0.96486 | 1.08903x → 1.10732x |
 | B5 mixed | 0.39897 ms | 0.38779 ms | 0.97198 | 1.09130x → 1.10404x |
 
-B1 和 B5 的 winner 前后都是 `compact_bn80_s1_e1`；其他 shape 上 rescale
+B1 和 B5 的历史 harness winner 前后都是 `compact_bn80_s1_e1`（该名称仅
+是实验 variant label，当前 API 已无 compact 类型）；其他 shape 上 rescale
 仍应交给 per-shape autotune。
 表中的最后一列读取逐轮 ABBA 的 paired median，而不是用跨候选的全局
 median 相除。
@@ -495,9 +503,9 @@ median 相除。
 最终 `after_final.json` 记录的 FlagGems commit 为 `6d4cb101`，Hopper
 目录 diff 的 SHA-256 是标准空内容摘要，排除了开发中间态污染结果。
 
-NCU 对同一 B1 launch 固定 ordinary N64 和 compact N80 后得到：
+NCU 对同一 B1 launch 固定 ordinary N64 和 exact tiled N80 后得到：
 
-| NCU metric | ordinary N64 | compact N80 |
+| NCU metric | ordinary N64 | exact tiled N80 |
 | --- | ---: | ---: |
 | Duration | 445.92 us | 439.97 us |
 | Dynamic SMEM / block | 197.24 Kbyte | 229.72 Kbyte |
@@ -552,7 +560,7 @@ Split-K/combine 固定开销。它们更适合由 cost model 识别
 改动的 no-regression 结论仍来自前述同实现 before/after gate，因为两类
 对照回答的问题不同。
 
-## 优化四：native compact N80
+## 优化四：通用非 2 次幂 tiled-SMEM
 
 ### 为什么是 N80
 
@@ -560,15 +568,58 @@ Split-K/combine 固定开销。它们更适合由 cost model 识别
 N128 又会为 48 个无效列承担 shared memory、softmax 和 WGMMA carrier
 开销。
 
-compact backing allocation 使用物理 `[40, 16, 64]`：
+调用方现在只写逻辑 allocation：
+
+```python
+k_smem = tle.gpu.alloc([2, 80, 256], tl.float16)
+```
+
+frontend 在编译期推导：
+
+```text
+capacity = 2
+row_tiles = 80 / 16 = 5
+col_tiles = 256 / 64 = 4
+tiles_per_stage = 5 * 4 = 20
+storage = [2 * 20, 16, 64] = [40,16,64]
+```
+
+这是元素一一映射，不是先分配 `[2,128,256]` 再 reshape：
+
+```text
+logical elements = 2 * 80 * 256 = 40,960
+storage elements = 40 * 16 * 64 = 40,960
+```
+
+因此 K 和 V 各自的 backing allocation 都使用物理 `[40,16,64]`：
 
 - 2 个 KV stages；
-- 每个 stage 20 个 `N16 x D64` chunk；
+- 每个 stage 20 个 `N16 x D64` atom；
 - N 方向 5 份，D 方向 4 份；
 - producer 每解析一个 N16 page row，即可填充四个 D64 panel。
 
-TLE API 通过 stage view 和 chunk view 表达这一布局，Membar alias analysis
-仍能证明不同 chunk 的精确区间。
+`slot(stage)` 暴露一个逻辑 `[80,256]` stage，producer tile view 暴露一个
+`[16,64]` atom；两者都只是 root allocation 的 alias，不产生第二份
+shared memory。flat tile 由
+`stage * row_tiles * col_tiles + row_tile * col_tiles + col_tile`
+计算。pipe coverage 用 BitVector 验证一个 stage 的 20 个 atom 恰好各写
+一次，并验证总 copy bytes 等于 `80*256*2=40,960` bytes。Membar 根据
+root、stage 和 tile interval 建模，不再识别固定 `[40,16,64]` 或 20-bit
+mask。
+
+对当前 1P2C、Q 单缓冲、KV 双缓冲 kernel，核心 payload 为：
+
+```text
+Q: 2 consumers * 1 Q stage * [64,256] * 2 bytes = 64 KiB
+K: 2 KV stages * [80,256] * 2 bytes = 80 KiB
+V: 2 KV stages * [80,256] * 2 bytes = 80 KiB
+payload total = 224 KiB
+```
+
+编译 metadata 实测 dynamic SMEM 为 `229,716` bytes；再加 `1,024` bytes
+static SMEM，总计 `230,740` bytes，距离 Hopper 单 block 上限仍有
+`1,708` bytes。多出的部分来自 barrier、pipe state 等控制结构，不是
+N128 carrier padding。
 
 ### active-N 和 active-K
 
@@ -578,6 +629,16 @@ QK 使用 `active_n=80`，生成原生 `m64n80k16`；PV 使用
 
 - 16 条 `HGMMA.64x80x16` 完成 QK；
 - 5 条 `HGMMA.64x256x16` 完成 PV。
+
+这里需要区分两个“物理”概念：
+
+- shared storage physical shape 是 exact `[40,16,64]`，没有 N128；
+- accumulator/descriptor carrier 为了兼容 Triton register layout 可以是
+  N128，但 lowering 只对前 80 列构造 WGMMA，tail 不参与数学计算。
+
+因此 active extent 的目的确实达到了：shared payload 随 N80 缩小，PV
+也从 8 次 K repetition 缩到 5 次；carrier 只承担 pass pipeline 中的类型
+和 accumulator 布局，不会重新分配一块 N128 shared tensor。
 
 raw WGMMA descriptor localization 将 shared byte address 和 descriptor
 immediate 在消费 WGMMA 的 asm block 内组合，修复了旧 BN128/KV1 路径可能
@@ -595,13 +656,13 @@ range。对应实验中 stack frame 从 104 B、spill store 424 B 降到 0，B1 
 动态 spill 从约 40.29M 降到 0。
 
 `RESCALE_O_BEFORE_PV` 不是全局固定值：它在 B2 约有正收益，在 B5 约有负收益，
-所以保留为两个 compact candidate 的唯一实测笛卡尔维度，由 per-shape
+所以保留为两个 tiled-N80 candidate 的唯一实测笛卡尔维度，由 per-shape
 autotune 决定。
 
-H100 同进程正式 ABBA 中，最终 compact candidate 相对 legacy BN64 的
+H100 同进程正式 ABBA 中，最终 tiled-N80 candidate 相对 legacy BN64 的
 paired median speedup 为：
 
-| Case | compact / legacy |
+| Case | tiled N80 / N64 |
 | --- | ---: |
 | B1 | 1.0479x |
 | B2 | 1.1018x |
@@ -673,32 +734,36 @@ rendezvous。
 - explicit commit 计数证明该 group 已完成；
 - K/V 两次 release 的 barrier allocation 和 released fields 都彼此不相交。
 
-同步边界必须区分：
+同步边界必须区分。下面的 owner 指生成该 PTX 的 IR op 或 pass，而不是源码
+中恰好出现它的 Python helper：
 
-| 指令/边 | 作用 | 本优化是否删除 |
-| --- | --- | --- |
-| `wgmma.wait_group` | 等待指定 WGMMA group 完成 | 否 |
-| `bar.sync ...,128` | consumer partition 的保守 rendezvous | 仅精确命中时删除 |
-| `mbarrier.arrive` | 向 producer 发布 stage 可复用 | 否 |
-| `mbarrier.try_wait` | producer/consumer acquire | 否 |
-| `fence.proxy.async` | generic/shared 与 async proxy 排序 | 否 |
+| PTX instruction | purpose | issuing threads | owner op/pass | required? |
+| --- | --- | --- | --- | --- |
+| `wgmma.wait_group.sync.aligned N` | WGMMA async completion：保证被等待 group 的 accumulator/SMEM 读取完成 | 完整 consumer warpgroup | `ttng.warp_group_dot_wait` → WGMMA LLVM lowering | 必须保留 |
+| `bar.sync id,128` | rendezvous：consumer warpgroup 内线程会合；不表示 WGMMA 完成或 stage publication | consumer 的 128 threads | Membar analysis / warp-specialization barrier insertion | 仅在 completion SSA、participation 和 alias 都已精确证明时可删 |
+| `mbarrier.arrive...` | mbarrier publication：consumer 发布 stage 已可被 producer 复用，或 producer 发布 copy 已完成 | elected thread 或规定的 participant set | `tle.gpu.barrier_arrive` / producer-consumer pipe lowering | 必须保留 |
+| `mbarrier.try_wait...` | acquire：等待对应 phase 的 publication 后才访问或覆盖 stage | waiter partition | `tle.gpu.barrier_wait` / pipe lowering | 必须保留 |
+| `cp.async.bulk...mbarrier::complete_tx::bytes` | 发起异步 TMA/cp.async transaction，并将完成字节记入 stage barrier | producer elected lane/warp，取决于 copy 形式 | `tle.gpu.copy` → `ttg.tma_copy`/cp.async lowering | copy 存在时必须保留 |
+| `cp.async.wait_group N` | async copy completion：约束普通 cp.async group 的完成，不等价于 CTA rendezvous | 发起 copy 的 producer warp | async-wait lowering | cp.async 路径必须保留 |
+| `fence.proxy.async.shared::cta` | proxy ordering：generic shared 写与 async/TMA proxy 观察顺序 | 负责 publish 的 producer/consumer threads | proxy fence insertion / TLE pipe lowering | 跨 proxy 可见性需要时必须保留 |
+| `membar.cta` | CTA 内普通 memory ordering；不代替 barrier participation | 相关 partition threads | Membar pass | 仅精确 alias 证明不相交时可删 |
 
 不能用“已经 wait 了”笼统删除后续 barrier。WGMMA completion、线程会合、
 proxy ordering 和 storage-lifetime publication 是四条独立正确性边。
 
-该提交的 focused lit 为 2/2，连同 compact regression 为 4/4。最终静态
-结构中：
+generic tiled alias 初版曾把 storage root 的 rank-3/rank-2 顺序识别错，
+导致 4 个 completed-WGMMA release rendezvous 回来：旧 production baseline
+为 41 条 `bar.sync`，错误版本为 45 条。修复
+`isTiledSMEMStorageRoot` 并按 `(root,stage,tile interval)` 建模后，最终为
+40 条，其中 barrier id 2/3 分别是 10/9 条，与旧版 10/9 一致；额外少的
+1 条来自 generic atom interval 能证明的新 disjoint case，不是扩大
+completed-WGMMA 特判。register、shared、stack/local、WGMMA、cp.async、
+mbarrier 和 proxy fence 没有随此修复变化。
 
-- PTX `bar.sync` 从 45 降到 41，其中 128-thread barrier 从 36 降到 32；
-- SASS `BAR.SYNC` 从 56 降到 52；
-- page16/page32 指令行分别减少 19/20；
-- registers、shared、stack/local、WGMMA、cp.async、mbarrier 和 proxy
-  fence 均保持不变。
-
-small16/small32、B1/B2/B5/B25、decode 和 14 个边界 case 均通过；
-compute-sanitizer memcheck 为 0 error，racecheck 为 0 hazard。当前缺少的是
-可信的单变量 ABBA 性能闭环，因此它属于“正确性与静态结构已证明有效”，
-不能宣称已有确定百分比的运行时加速。
+focused lit 覆盖 tiled view、pipe coverage、active extent、pipeline safety
+与 completed-WGMMA release，共 13/13 通过；small16/small32、B1/B2/B5/B25
+和 decode 正确性均通过。这里的结论是同步结构与 alias 精度正确，不能把
+少一条 barrier 直接换算成固定百分比的运行时加速。
 
 ## 最终性能与 decode 回归门
 
@@ -708,34 +773,68 @@ compute-sanitizer memcheck 为 0 error，racecheck 为 0 hazard。当前缺少�
 vLLM latency / TLE latency * 100%
 ```
 
-### Prefill / mixed
+### 24-case 冷启动受控 gate
 
-| Case | 类型 | vLLM | TLE | 相对性能 |
-| --- | --- | ---: | ---: | ---: |
-| B1 | prefill | 4.3729 ms | 4.5749 ms | 95.5852% |
-| B2 | prefill | 1.4855 ms | 1.5995 ms | 92.8688% |
-| B5 | mixed | 0.4157 ms | 0.4447 ms | 93.4824% |
-| B25 | mixed | 1.6952 ms | 1.7546 ms | 96.6171% |
-| 几何均值 | - | - | - | 94.6261% |
+同一份 shape、同为 CUDA Graph、warmup 20、iteration 200。FlagGems
+从 43°C 开始、60°C 结束；vLLM 从 45°C 开始、69°C 结束，运行期间均未
+触发 thermal throttle。结果为：
 
-### Decode 对历史 FlagGems 基线
-
-| Case | 历史 | 当前 | 性能保留 | latency 变化 |
+| Phase | case 数 | 几何均值 | 最差 | ≥95% |
 | --- | ---: | ---: | ---: | ---: |
-| batch512, K32 | 0.02985 ms | 0.02896 ms | 103.0610% | -2.9701% |
-| long, page16 | 0.06581 ms | 0.06644 ms | 99.0525% | +0.9565% |
-| long, page32 | 0.09273 ms | 0.09467 ms | 97.9480% | +2.0950% |
-| 几何均值 | - | - | 99.9966% | +0.0034% |
+| prefill | 3 | 98.34% | 91.06% | 2/3 |
+| mixed | 11 | 103.18% | 92.10% | 8/11 |
+| decode（相对 vLLM） | 10 | 148.87% | 84.52% | 8/10 |
 
-严格按“任何 decode case 都不能变慢”，两个 long-decode case 仍有
-0.96% 和 2.10% 的小幅回退；按预设 5% 波动门和几何均值，decode 基本持平。
-因此不能把当前状态表述成“严格零回退”。
+decode 表中的最差值不是本次改造引起的回退：该路径没有 N80 config，且同一
+FlagGems 实现 policy 12→13 的几何性能保留约 99.72%。它只说明某个既有
+decode shape 本来就不如 vLLM，不应把“相对 vLLM <95%”和“本次回退”
+混为一谈。
 
-## 为什么 B2/B5 还没有达到 95%
+低于 95% 的主要长路径绝对值如下：
 
-B1/B5 NCU 中，TLE 与 vLLM 的 HGMMA 动态数量完全相同，occupancy 也都约
-18.75%。L2/DRAM 流量接近，因此剩余差距不是 Tensor Core 工作量、occupancy
-或显存带宽。
+| Case | FlagGems | vLLM | vLLM / FlagGems |
+| --- | ---: | ---: | ---: |
+| B1 long prefill | 4.7281 ms | 4.3052 ms | 91.06% |
+| B2 ragged mixed | 1.5902 ms | 1.4646 ms | 92.10% |
+| B5 mixed | 0.4358 ms | 0.4061 ms | 93.19% |
+
+### 临界 case 的 ABBA
+
+早期跨进程 gate 曾使 GPU 达到 84°C，并累计 `SW Thermal Slowdown`
+约 19.8 秒，因此该轮 95% 结论作废。作为 N64/N80 内部选择证据，B1/B2
+另使用同进程 CUDA Graph ABBA：
+
+| Case | winner | winner median | paired N64/N80 speedup |
+| --- | --- | ---: | ---: |
+| B1 long prefill | N80, stagger, early-cast | 4.928 ms | 1.0977x |
+| B2 mixed | N80, stagger, early-cast | 1.607 ms | 1.1338x |
+
+B2 曾有另一温度窗口的 vLLM 绝对值 1.575 ms，不能与这份 ABBA 的
+FlagGems 数值拼接成正式百分比。本文以冷启动受控 gate 的 92.10% 为准，
+不用挑选最好的一轮覆盖它。
+
+## 为什么 B1/B2/B5 还没有达到 95%
+
+通用重构后的 B1 NCU 因旧 policy-12 DB 命中了 N64，可用于解释 N64
+为什么仍落后于 vLLM N80，而不能冒充 N80 profile：
+
+| Metric | FlagGems N64 | vLLM N80 |
+| --- | ---: | ---: |
+| duration（NCU base clock） | 4.98 ms | 4.21 ms |
+| registers/thread | 168 | 168 |
+| achieved occupancy | 18.75% | 18.75% |
+| executed instructions | 1.016B | 0.708B |
+| chip instructions | 1.160B | 1.027B |
+| eligible warps/cycle | 0.78 | 0.65 |
+| compute SOL | 67.9% | 78.9% |
+| memory SOL | 65.3% | 59.8% |
+| barrier stall/issue | 0.362 | 0.342 |
+| long-scoreboard stall/issue | 0.923 | 0.925 |
+
+两边 global/L2 sectors 已接近，occupancy 相同，而且 FlagGems eligible
+warps 反而更多；所以 N64 的主要问题不是等待不足、barrier 或显存请求数，
+而是更多 tile 带来的控制、softmax 和 address instructions。N80 的价值
+正是少做约 20% logical KV tile，而不是提高理论 occupancy。
 
 相对 vLLM，TLE 每个 QK tile 稳定多出约：
 
@@ -752,8 +851,10 @@ uniform pipe active 约为 vLLM 的 2.62x/2.65x。这说明优先级应放在
 softmax carrier、descriptor/address formation 和 page-table state，而不是
 继续增加 WGMMA 并行度。
 
-B2/B5 的缺口也与 shape 特征吻合：
+B1/B2/B5 的缺口也与 shape 特征吻合：
 
+- B1 是规则长 prefill，矩阵乘已被 N80 压缩，但 per-tile softmax carrier
+  和 descriptor/address 指令仍比 vLLM 多；
 - B2 的 batch 内 Q/K 极不均匀，ragged dispatch 已减少无效 tile，但短序列
   和边界 tile 的固定开销占比更高；
 - B5 是 mixed batch，矩阵乘总量较小，page lookup、uniform address 和
@@ -769,8 +870,9 @@ B2/B5 的缺口也与 shape 特征吻合：
 
 - `DEFER_ROW_SUM`：ABBA 约为 0.997x～1.003x，属于噪声；
 - active-N80 wait compaction：默认关闭，B1/B5 无实质收益；
-- `REUSE_KV_PAGE_STATE`：TritonGPU conversion 出现 unresolved
-  materialization，最终重构未完成编译；
+- shared-ring `REUSE_KV_PAGE_STATE`：最终可编译且 small16/small32/B1/B2
+  正确，但 24-case 中 B1 `4.7281→4.8781 ms`、B2
+  `1.5902→1.6021 ms`、B5 `0.4358→0.4378 ms`，因此完整撤回；
 - direct `BLOCK_M` 实验旋钮：只服务于已拒绝的扫描，没有 production
   consumer；
 - N64+N16 模拟 N80 和 direct pointer layout：没有形成稳定 winner；
@@ -795,18 +897,24 @@ B2/B5 的缺口也与 shape 特征吻合：
 
 ### 2. Page16 K/V page-state 复用
 
-当前 compact producer 每个 N80 tile 为 K 读取 5 个 page entry，staggered
+当前 tiled producer 每个 N80 tile 为 K 读取 5 个 page entry，staggered
 V 又读取 5 个；vLLM 热循环只读取 1 次并保留 page/page-offset 状态。
 
-合理迭代顺序：
+已经排除“用 `[NUM_BUFFERS_KV,8]` shared ring 在 K/V 间传递 page id”
+的直接方案：它虽然只增加 64 B SMEM、保持 168 registers 和 0 spill，
+但 shared round trip 与 acquire 前的状态物化依赖超过了省下的 5 次读取。
 
-1. 先把状态跨 stagger loop carry，使 10 次降到 5 次；
-2. 再用 5-lane 或 8-lane carrier 并行读取并 shuffle，使 5 次降到 1 次。
+若继续研究，合理迭代顺序是：
 
-前一版失败实现不能复用，应重新从 loop-carried state 类型和 helper lowering
-契约设计。
+1. 让 producer loop 以 register/SSA tuple carry K 的 5 个 page id，避免
+   shared round trip；
+2. 让 paged copy helper 原生消费通用 page-id vector；
+3. 再用 5-lane 或 8-lane carrier 并行读取并 shuffle，使 5 次降到 1 次。
 
-### 3. Compact WGMMA descriptor 分组预编码
+前一版 shared-ring 实现不能复用，应重新从 loop-carried state 类型和
+helper lowering 契约设计。
+
+### 3. Tiled WGMMA descriptor 分组预编码
 
 当前每条 WGMMA 都可能重复 raw address 的 `shr/and/add`。可为四个 D64
 panel 共用一个 encoded stage base，再用整数 offset 派生 descriptor。
@@ -820,26 +928,30 @@ panel 共用一个 encoded stage base，再用整数 offset 派生 descriptor。
 
 ## 验证与复现
 
-本次提交前的 clean-tree 验证：
+本次提交的 focused 验证：
 
-- FlagTree `triton-opt` rebuild：通过；
-- descriptor、active extent、compact KV、pointer shuffle、Membar：
-  18/18 lit 通过；
-- compact TLE frontend：9/9 和 6/6 pytest 通过；
+- FlagTree `libtriton.so` 与工具增量 rebuild：通过；
+- tiled view/pipe/Membar、active extent 与 pipeline safety：
+  13/13 lit 通过；
+- generic tiled-SMEM frontend：55/55 pytest 通过；
 - FlagGems 变更模块 `py_compile`：通过；
-- 15 个新增调度/调优测试展开为 37/37 pytest 通过；
+- scheduler/autotune focused tests：7/7 pytest 通过；
+- production attention small16/small32/decode correctness：通过；
+- active N/K 16..128（16 的倍数）runtime/PTX smoke：通过；
 - rejected marker scan 和 `git diff --check`：通过。
 
 详细命令记录位于：
 
 ```text
-/home/lutao/zhiyuan/small_exps/fa3_commit_validation_20260729/README.md
+/home/lutao/zhiyuan/small_exps/tle_generic_tiled_smem_20260729/README.md
 ```
 
 性能和 NCU 证据位于：
 
 ```text
 /home/lutao/zhiyuan/small_exps/fa3_active_wgmma_n_heuristic_20260729/
+/home/lutao/zhiyuan/small_exps/tle_generic_tiled_smem_20260729/
+/home/lutao/zhiyuan/small_exps/fa3_paged_state_reuse_20260729/
 /home/lutao/zhiyuan/small_exps/fa3_paged_ptr_warp_shuffle_20260728/
 /home/lutao/zhiyuan/small_exps/fa3_vllm_residual_gap_audit_20260728/
 /home/lutao/zhiyuan/small_exps/fa3_autotune_cache_schema_20260728/
