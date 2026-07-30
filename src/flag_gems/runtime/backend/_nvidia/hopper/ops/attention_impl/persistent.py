@@ -988,23 +988,6 @@ def _load_paged_k_for_warp_mma(
 
 
 @triton.jit
-def _mask_wgmma_n_carrier(
-    qk,
-    BLOCK_N: tl.constexpr,
-    ACTIVE_WGMMA_N: tl.constexpr,
-):
-    if ACTIVE_WGMMA_N < BLOCK_N:
-        physical_cols = tl.arange(0, BLOCK_N)
-        return tl.where(
-            physical_cols[None, :] < ACTIVE_WGMMA_N,
-            qk,
-            float("-inf"),
-        )
-    else:
-        return qk
-
-
-@triton.jit
 def _flash_varlen_fwd_v3_tle_persistent_consumer(
     q_ptr,
     k_ptr,
@@ -1290,11 +1273,6 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                     IS_ALIBI=is_alibi,
                     alibi_slope=alibi_slope,
                 )
-                qk = _mask_wgmma_n_carrier(
-                    qk,
-                    BLOCK_N,
-                    ACTIVE_WGMMA_N,
-                )
                 if is_causal and not is_local:
                     if n_block < causal_full_block_max:
                         alpha, p, rowmax, rowsum = _softmax_online_deferred(
@@ -1410,7 +1388,6 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                                 p.to(INPUT_DTYPE),
                                 v_tile,
                                 acc,
-                                active_k=ACTIVE_WGMMA_N,
                             )
                             qk = tle.gpu.wgmma_wait(1, qk)
                             k_reader.release(accum_cnt_kv)
@@ -1428,11 +1405,6 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                             IS_CAUSAL=True,
                             IS_ALIBI=is_alibi,
                             alibi_slope=alibi_slope,
-                        )
-                        qk = _mask_wgmma_n_carrier(
-                            qk,
-                            BLOCK_N,
-                            ACTIVE_WGMMA_N,
                         )
                         alpha, p, rowmax, rowsum = _softmax_online_deferred(
                             qk,
@@ -1514,7 +1486,6 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                                 p.to(INPUT_DTYPE),
                                 v_tile,
                                 acc,
-                                active_k=ACTIVE_WGMMA_N,
                             )
                             qk = tle.gpu.wgmma_wait(1, qk)
                             k_reader.release(accum_cnt_kv)
@@ -1532,11 +1503,6 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                             IS_CAUSAL=True,
                             IS_ALIBI=is_alibi,
                             alibi_slope=alibi_slope,
-                        )
-                        qk = _mask_wgmma_n_carrier(
-                            qk,
-                            BLOCK_N,
-                            ACTIVE_WGMMA_N,
                         )
                         qk = _apply_mask_v3(
                             qk,
@@ -1623,7 +1589,6 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                                 p.to(INPUT_DTYPE),
                                 v_tile,
                                 acc,
-                                active_k=ACTIVE_WGMMA_N,
                             )
                             qk = tle.gpu.wgmma_wait(1, qk)
                             k_reader.release(accum_cnt_kv)
@@ -1641,11 +1606,6 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                             IS_CAUSAL=is_causal,
                             IS_ALIBI=is_alibi,
                             alibi_slope=alibi_slope,
-                        )
-                        qk = _mask_wgmma_n_carrier(
-                            qk,
-                            BLOCK_N,
-                            ACTIVE_WGMMA_N,
                         )
                         if is_causal and not is_local:
                             if n_block + 1 < n_block_max:
@@ -1728,7 +1688,6 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                         p.to(INPUT_DTYPE),
                         v_tile,
                         acc,
-                        active_k=ACTIVE_WGMMA_N,
                     )
                     acc = tle.gpu.wgmma_wait(1, acc)
                 # Dense output and the register-store fallback no longer need
