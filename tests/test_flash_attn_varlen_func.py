@@ -860,7 +860,7 @@ def test_flash_attn_varlen_fa3_persistent_autotune_key_buckets() -> None:
     } <= set(tuner.keys)
     assert (
         _fa3_scheduling_module().PersistentSchedulingHeuristics.AUTOTUNE_POLICY_VERSION
-        == 13
+        == 15
     )
 
 
@@ -1860,7 +1860,6 @@ def test_flash_attn_varlen_fa3_d256_prefill_autotune_candidates(
         (128, 64, 2, True, False, 64, False, False),
         (128, 64, 2, True, True, 64, False, False),
         (128, 128, 2, True, True, 80, False, True),
-        (128, 128, 2, True, True, 80, True, True),
         (64, 64, 1, False, False, 64, False, False),
     }
 
@@ -2075,7 +2074,6 @@ def test_flash_attn_varlen_fa3_tiled_extent_policy_matrix() -> None:
             for config in tiled
         } == {
             (True, 80, False, True),
-            (True, 80, True, True),
         }
 
     negative_overrides = (

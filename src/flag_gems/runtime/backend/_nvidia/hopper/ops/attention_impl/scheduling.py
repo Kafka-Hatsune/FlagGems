@@ -1817,7 +1817,12 @@ class PersistentSchedulingHeuristics:
     # Generic tiled-SMEM changes both the physical allocation and generated
     # producer/WGMMA instruction mix for ACTIVE_WGMMA_N candidates.  Keep
     # persisted pre-tiled timings from selecting an obsolete N64 result.
-    AUTOTUNE_POLICY_VERSION = 13
+    # Logical-shape lowering changed the N80 softmax instruction stream and
+    # invalidates persisted N64 winners measured with the manual carrier
+    # mask.  ABBA measurements across the B1/B2/B5/B25 gate cases also show
+    # that rescaling O before PV is uniformly slower for the N80 profile, so
+    # version 15 removes that losing search candidate.
+    AUTOTUNE_POLICY_VERSION = 15
     DEFAULT_BLOCK_M = 128
     DEFAULT_NUM_MMA_GROUPS = 2
     DEFAULT_NUM_Q_BUFFERS = 1
@@ -2021,21 +2026,21 @@ class PersistentSchedulingHeuristics:
         # The N80 tiled-SMEM profile has one legal transport/topology after the
         # static contract and production pruner are applied: staggered K/V,
         # early FP16 P carry, and the dense-profile transport selector set.
-        # Retain only the measured rescale Cartesian dimension.  The previous
-        # twelve surface configs collapsed to these two candidates after
-        # pruning and only inflated first-use search and cache signatures.
-        for rescale_o_before_pv in (False, True):
-            configs.append(
-                cls.make_config(
-                    block_n=128,
-                    num_buffers_kv=2,
-                    use_tma_kv=True,
-                    stagger_kv=True,
-                    active_wgmma_n=80,
-                    rescale_o_before_pv=rescale_o_before_pv,
-                    early_cast_p=True,
-                )
+        # ABBA measurements across the prefill/mixed gate cases consistently
+        # favor carrying O unscaled until after PV.  Keep only that winner:
+        # the previous rescale dimension increased first-use search cost and
+        # could select the slower candidate under noisy autotune timing.
+        configs.append(
+            cls.make_config(
+                block_n=128,
+                num_buffers_kv=2,
+                use_tma_kv=True,
+                stagger_kv=True,
+                active_wgmma_n=80,
+                rescale_o_before_pv=False,
+                early_cast_p=True,
             )
+        )
         forced_mma_groups = os.getenv("FLAG_GEMS_FA3_TLE_EXPERIMENT_MMA_GROUPS")
         decode_tma_default = "1" if cls.DEFAULT_DECODE_USE_TMA_QO else "0"
         decode_tma_qo = (
