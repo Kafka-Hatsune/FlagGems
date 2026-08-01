@@ -209,7 +209,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
     Q_PIPE_ASYNC: tl.constexpr,
     USE_TMA_KV: tl.constexpr,
     PAGED_KV_NON_TMA: tl.constexpr,
-    PAGED_PIPE_ASYNC: tl.constexpr,
     PAGED_GATHER_MODE: tl.constexpr,
     STAGGER_KV: tl.constexpr,
     PACK_GQA: tl.constexpr,
@@ -349,39 +348,83 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             block_shape=[BM_SPLIT, HEAD_DIM_PADDED],
                         )
                 if is_paged and (not PAGED_KV_NON_TMA):
-                    k_desc = tl.make_tensor_descriptor(
-                        base=k_base,
-                        shape=[bk, block_size, d],
-                        strides=[
-                            page_stride_rows * k_row_stride,
-                            k_row_stride,
-                            1,
-                        ],
-                        block_shape=[1, ACTIVE_WGMMA_N, HEAD_DIM_PADDED],
-                    )
-                    v_desc = tl.make_tensor_descriptor(
-                        base=v_base,
-                        shape=[bk, block_size, d],
-                        strides=[
-                            page_stride_rows * v_row_stride,
-                            v_row_stride,
-                            1,
-                        ],
-                        block_shape=[1, ACTIVE_WGMMA_N, HEAD_DIM_PADDED],
-                    )
+                    if ACTIVE_WGMMA_N & (ACTIVE_WGMMA_N - 1):
+                        k_desc = tl.make_tensor_descriptor(
+                            base=k_base,
+                            shape=[bk, block_size, d],
+                            strides=[
+                                page_stride_rows * k_row_stride,
+                                k_row_stride,
+                                1,
+                            ],
+                            block_shape=[1, 16, 64],
+                        )
+                        v_desc = tl.make_tensor_descriptor(
+                            base=v_base,
+                            shape=[bk, block_size, d],
+                            strides=[
+                                page_stride_rows * v_row_stride,
+                                v_row_stride,
+                                1,
+                            ],
+                            block_shape=[1, 16, 64],
+                        )
+                    else:
+                        k_desc = tl.make_tensor_descriptor(
+                            base=k_base,
+                            shape=[bk, block_size, d],
+                            strides=[
+                                page_stride_rows * k_row_stride,
+                                k_row_stride,
+                                1,
+                            ],
+                            block_shape=[
+                                1,
+                                ACTIVE_WGMMA_N,
+                                HEAD_DIM_PADDED,
+                            ],
+                        )
+                        v_desc = tl.make_tensor_descriptor(
+                            base=v_base,
+                            shape=[bk, block_size, d],
+                            strides=[
+                                page_stride_rows * v_row_stride,
+                                v_row_stride,
+                                1,
+                            ],
+                            block_shape=[
+                                1,
+                                ACTIVE_WGMMA_N,
+                                HEAD_DIM_PADDED,
+                            ],
+                        )
                 elif (not is_paged) and USE_TMA_KV:
-                    k_desc = tl.make_tensor_descriptor(
-                        base=k_base,
-                        shape=[k_len, d],
-                        strides=[k_row_stride, 1],
-                        block_shape=[ACTIVE_WGMMA_N, HEAD_DIM_PADDED],
-                    )
-                    v_desc = tl.make_tensor_descriptor(
-                        base=v_base,
-                        shape=[k_len, d],
-                        strides=[v_row_stride, 1],
-                        block_shape=[ACTIVE_WGMMA_N, HEAD_DIM_PADDED],
-                    )
+                    if ACTIVE_WGMMA_N & (ACTIVE_WGMMA_N - 1):
+                        k_desc = tl.make_tensor_descriptor(
+                            base=k_base,
+                            shape=[k_len, d],
+                            strides=[k_row_stride, 1],
+                            block_shape=[16, 64],
+                        )
+                        v_desc = tl.make_tensor_descriptor(
+                            base=v_base,
+                            shape=[k_len, d],
+                            strides=[v_row_stride, 1],
+                            block_shape=[16, 64],
+                        )
+                    else:
+                        k_desc = tl.make_tensor_descriptor(
+                            base=k_base,
+                            shape=[k_len, d],
+                            strides=[k_row_stride, 1],
+                            block_shape=[ACTIVE_WGMMA_N, HEAD_DIM_PADDED],
+                        )
+                        v_desc = tl.make_tensor_descriptor(
+                            base=v_base,
+                            shape=[k_len, d],
+                            strides=[v_row_stride, 1],
+                            block_shape=[ACTIVE_WGMMA_N, HEAD_DIM_PADDED],
+                        )
 
                 q_buf, q_phase_idx = _buf_phase_tle(tile_count, NUM_BUFFERS_Q)
                 q0_idx = q_buf
@@ -488,7 +531,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                         _copy_paged_kv_tile_to_pipe(
                             k_writer,
                             accum_cnt_kv,
-                            PAGED_PIPE_ASYNC,
                             k_base,
                             k_row_stride,
                             page_table_ptr_b,
@@ -611,7 +653,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                         _copy_paged_kv_tile_to_pipe(
                             v_writer,
                             accum_cnt_kv,
-                            PAGED_PIPE_ASYNC,
                             v_base,
                             v_row_stride,
                             page_table_ptr_b,
@@ -671,7 +712,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             _copy_paged_kv_tile_to_pipe(
                                 k_writer,
                                 accum_cnt_kv,
-                                PAGED_PIPE_ASYNC,
                                 k_base,
                                 k_row_stride,
                                 page_table_ptr_b,
@@ -693,7 +733,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                         _copy_paged_kv_tile_to_pipe(
                             v_writer,
                             v_iteration,
-                            PAGED_PIPE_ASYNC,
                             v_base,
                             v_row_stride,
                             page_table_ptr_b,
@@ -716,7 +755,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             _copy_paged_kv_tile_to_pipe(
                                 k_writer,
                                 accum_cnt_kv,
-                                PAGED_PIPE_ASYNC,
                                 k_base,
                                 k_row_stride,
                                 page_table_ptr_b,
@@ -738,7 +776,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                         _copy_paged_kv_tile_to_pipe(
                             v_writer,
                             v_iteration,
-                            PAGED_PIPE_ASYNC,
                             v_base,
                             v_row_stride,
                             page_table_ptr_b,
@@ -759,7 +796,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                     _copy_paged_kv_tile_to_pipe(
                         v_writer,
                         accum_cnt_kv - 1,
-                        PAGED_PIPE_ASYNC,
                         v_base,
                         v_row_stride,
                         page_table_ptr_b,
@@ -785,7 +821,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             _copy_paged_kv_tile_to_pipe(
                                 k_writer,
                                 accum_cnt_kv,
-                                PAGED_PIPE_ASYNC,
                                 k_base,
                                 k_row_stride,
                                 page_table_ptr_b,
@@ -836,7 +871,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                         _copy_paged_kv_tile_to_pipe(
                             v_writer,
                             accum_cnt_kv,
-                            PAGED_PIPE_ASYNC,
                             v_base,
                             v_row_stride,
                             page_table_ptr_b,
@@ -1248,7 +1282,6 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                         k_tile,
                         out_dtype=tl.float32,
                         trans_b=True,
-                        active_n=ACTIVE_WGMMA_N,
                     )
                 if NUM_MMA_GROUPS == 2:
                     if cid == 0:
@@ -1364,7 +1397,6 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                                 k_tile,
                                 out_dtype=tl.float32,
                                 trans_b=True,
-                                active_n=ACTIVE_WGMMA_N,
                             )
                         if NUM_MMA_GROUPS == 2:
                             if cid == 0:
@@ -1462,7 +1494,6 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                                 k_tile,
                                 out_dtype=tl.float32,
                                 trans_b=True,
-                                active_n=ACTIVE_WGMMA_N,
                             )
                         if NUM_MMA_GROUPS == 2:
                             if cid == 0:
@@ -1565,7 +1596,6 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                                 k_tile,
                                 out_dtype=tl.float32,
                                 trans_b=True,
-                                active_n=ACTIVE_WGMMA_N,
                             )
                         if NUM_MMA_GROUPS == 2:
                             if cid == 0:
@@ -2031,7 +2061,6 @@ def flash_varlen_fwd_v3_tle_kernel(
     REUSE_Q_SMEM_O: tl.constexpr,
     USE_TMA_KV: tl.constexpr,
     PAGED_KV_NON_TMA: tl.constexpr,
-    PAGED_PIPE_ASYNC: tl.constexpr,
     PACK_GQA: tl.constexpr,
     RAGGED_SCHEDULER: tl.constexpr,
     HEADS_IN_L2: tl.constexpr,
@@ -2047,6 +2076,8 @@ def flash_varlen_fwd_v3_tle_kernel(
     STAGGER_KV: tl.constexpr = False,
     RESCALE_O_BEFORE_PV: tl.constexpr = False,
     EARLY_CAST_P: tl.constexpr = False,
+    # Deprecated no-op retained only to accept persisted pre-v16 configs.
+    PAGED_PIPE_ASYNC: tl.constexpr = True,
 ):
     BM_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
     HEAD_DIM_PADDED: tl.constexpr = BLOCK_K
@@ -2278,7 +2309,6 @@ def flash_varlen_fwd_v3_tle_kernel(
                         Q_PIPE_ASYNC_EFFECTIVE,
                         USE_TMA_KV,
                         PAGED_KV_NON_TMA_EFFECTIVE,
-                        PAGED_PIPE_ASYNC,
                         PAGED_GATHER_MODE,
                         STAGGER_KV,
                         PACK_GQA,
@@ -2512,7 +2542,6 @@ def flash_varlen_fwd_v3_tle_kernel(
                         Q_PIPE_ASYNC_EFFECTIVE,
                         USE_TMA_KV,
                         PAGED_KV_NON_TMA_EFFECTIVE,
-                        PAGED_PIPE_ASYNC,
                         PAGED_GATHER_MODE,
                         STAGGER_KV,
                         PACK_GQA,
