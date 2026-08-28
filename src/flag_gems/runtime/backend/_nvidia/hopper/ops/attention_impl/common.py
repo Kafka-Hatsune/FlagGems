@@ -538,16 +538,12 @@ def _copy_paged_kv_tile_to_pipe(
     iteration,
     src_base,
     row_stride,
-    page_table_ptr_b,
     n_offset,
     k_len,
     d: tl.constexpr,
-    block_size: tl.constexpr,
-    page_stride_rows,
     cache_state,
     BLOCK_N: tl.constexpr,
     HEAD_DIM_PADDED: tl.constexpr,
-    PAGED_GATHER_MODE: tl.constexpr = 2,
     BOUNDARY_CHECK: tl.constexpr = True,
 ):
     """Publish any paged KV tile through a cp.async-capable TLE pipe."""
@@ -717,80 +713,7 @@ def _copy_packed_gqa_tile_to_smem(
         [BLOCK_ROWS, HEAD_DIM_PADDED],
         mask=mask,
         other=0.0,
-        # api args,
     )
-
-
-@triton.jit
-def _copy_dense_q_tile_to_pipe(
-    writer,
-    iteration,
-    src_base,
-    row_stride,
-    row_offset,
-    row_count,
-    d: tl.constexpr,
-    BLOCK_ROWS: tl.constexpr,
-    HEAD_DIM_PADDED: tl.constexpr,
-):
-    """Acquire, copy, and publish one contiguous query tile asynchronously."""
-
-    slot = writer.acquire(iteration)
-    rows = tl.arange(0, BLOCK_ROWS)
-    cols = tl.arange(0, HEAD_DIM_PADDED)
-    logical_rows = row_offset + rows
-    src_ptrs = src_base + logical_rows[:, None] * row_stride + cols[None, :]
-    mask = (logical_rows[:, None] < row_count) & (cols[None, :] < d)
-    tle.gpu.copy(
-        src_ptrs,
-        slot.q,
-        [BLOCK_ROWS, HEAD_DIM_PADDED],
-        mask=mask,
-        other=0.0,
-    )
-    writer.commit(iteration)
-
-
-@triton.jit
-def _copy_packed_gqa_q_tile_to_pipe(
-    writer,
-    iteration,
-    q_ptr,
-    q_offset,
-    q_row_stride,
-    q_head_stride,
-    kv_head,
-    packed_row_offset,
-    q_len,
-    d: tl.constexpr,
-    GQA_RATIO: tl.constexpr,
-    BLOCK_ROWS: tl.constexpr,
-    HEAD_DIM_PADDED: tl.constexpr,
-):
-    """Acquire, pack, and publish one GQA query tile asynchronously."""
-
-    slot = writer.acquire(iteration)
-    rows = tl.arange(0, BLOCK_ROWS)
-    cols = tl.arange(0, HEAD_DIM_PADDED)
-    packed_rows = packed_row_offset + rows
-    query_rows = packed_rows // GQA_RATIO
-    query_heads = kv_head * GQA_RATIO + packed_rows % GQA_RATIO
-    src_ptrs = (
-        q_ptr
-        + q_offset
-        + query_rows[:, None] * q_row_stride
-        + query_heads[:, None] * q_head_stride
-        + cols[None, :]
-    )
-    mask = (packed_rows[:, None] < q_len * GQA_RATIO) & (cols[None, :] < d)
-    tle.gpu.copy(
-        src_ptrs,
-        slot.q,
-        [BLOCK_ROWS, HEAD_DIM_PADDED],
-        mask=mask,
-        other=0.0,
-    )
-    writer.commit(iteration)
 
 
 @triton.jit

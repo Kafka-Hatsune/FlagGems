@@ -31,9 +31,7 @@ from .common import (
     _apply_softcap_v3,
     _buf_phase_tle,
     _copy_dense_kv_tma_tile_to_pipe,
-    _copy_dense_q_tile_to_pipe,
     _copy_dense_tile_to_smem,
-    _copy_packed_gqa_q_tile_to_pipe,
     _copy_packed_gqa_tile_to_smem,
     _copy_paged_kv_tile_to_pipe,
     _copy_paged_kv_tma_tile_to_pipe,
@@ -434,15 +432,15 @@ def _flash_varlen_fwd_v3_tle_persistent_producer_body(
                             barrier=q_fulls[q0_idx],
                         )
                 elif NUM_MMA_GROUPS == 1 and Q_PIPE_ASYNC:
+                    q_slot = q_writer0.acquire(tile_count)
                     if PACK_GQA:
-                        _copy_packed_gqa_q_tile_to_pipe(
-                            q_writer0,
-                            tile_count,
+                        _copy_packed_gqa_tile_to_smem(
                             q_ptr,
                             q_offset,
                             q_row_stride,
                             q_head_stride,
                             kv_head,
+                            q_slot.q,
                             m_block * BLOCK_M,
                             q_len,
                             d,
@@ -451,17 +449,17 @@ def _flash_varlen_fwd_v3_tle_persistent_producer_body(
                             HEAD_DIM_PADDED,
                         )
                     else:
-                        _copy_dense_q_tile_to_pipe(
-                            q_writer0,
-                            tile_count,
+                        _copy_dense_tile_to_smem(
                             q_base,
                             q_row_stride,
+                            q_slot.q,
                             m_block * BLOCK_M,
                             q_len,
                             d,
                             BM_SPLIT,
                             HEAD_DIM_PADDED,
                         )
+                    q_writer0.commit(tile_count)
                 elif PACK_GQA:
                     tle.gpu.barrier_wait(q_empties[q0_idx], phaseIdx=q_phase_idx)
                     _copy_packed_gqa_tile_to_smem(
@@ -512,16 +510,12 @@ def _flash_varlen_fwd_v3_tle_persistent_producer_body(
                             accum_cnt_kv,
                             k_base,
                             k_row_stride,
-                            page_table_ptr_b,
                             kv_offset,
                             k_len,
                             d,
-                            block_size,
-                            page_stride_rows,
                             cache_state,
                             ACTIVE_WGMMA_N,
                             HEAD_DIM_PADDED,
-                            PAGED_GATHER_MODE,
                         )
                     previous_cache_state = cache_state
                 elif BM_SPLIT != 16:
@@ -624,16 +618,12 @@ def _flash_varlen_fwd_v3_tle_persistent_producer_body(
                             accum_cnt_kv,
                             v_base,
                             v_row_stride,
-                            page_table_ptr_b,
                             kv_offset,
                             k_len,
                             d,
-                            block_size,
-                            page_stride_rows,
                             cache_state,
                             ACTIVE_WGMMA_N,
                             HEAD_DIM_PADDED,
-                            PAGED_GATHER_MODE,
                         )
                 elif is_paged:
                     _copy_paged_kv_tma_tile_to_pipe(
@@ -681,16 +671,12 @@ def _flash_varlen_fwd_v3_tle_persistent_producer_body(
                                 accum_cnt_kv,
                                 k_base,
                                 k_row_stride,
-                                page_table_ptr_b,
                                 kv_offset,
                                 k_len,
                                 d,
-                                block_size,
-                                page_stride_rows,
                                 cache_state,
                                 ACTIVE_WGMMA_N,
                                 HEAD_DIM_PADDED,
-                                PAGED_GATHER_MODE,
                                 False,
                             )
                         v_iteration = accum_cnt_kv
@@ -706,16 +692,12 @@ def _flash_varlen_fwd_v3_tle_persistent_producer_body(
                             v_iteration,
                             v_base,
                             v_row_stride,
-                            page_table_ptr_b,
                             v_offset,
                             k_len,
                             d,
-                            block_size,
-                            page_stride_rows,
                             v_cache_state,
                             ACTIVE_WGMMA_N,
                             HEAD_DIM_PADDED,
-                            PAGED_GATHER_MODE,
                             False,
                         )
                         previous_cache_state = cache_state
@@ -739,16 +721,12 @@ def _flash_varlen_fwd_v3_tle_persistent_producer_body(
                                 accum_cnt_kv,
                                 k_base,
                                 k_row_stride,
-                                page_table_ptr_b,
                                 kv_offset,
                                 k_len,
                                 d,
-                                block_size,
-                                page_stride_rows,
                                 cache_state,
                                 ACTIVE_WGMMA_N,
                                 HEAD_DIM_PADDED,
-                                PAGED_GATHER_MODE,
                                 True,
                             )
                         v_iteration = accum_cnt_kv
@@ -764,16 +742,12 @@ def _flash_varlen_fwd_v3_tle_persistent_producer_body(
                             v_iteration,
                             v_base,
                             v_row_stride,
-                            page_table_ptr_b,
                             v_offset,
                             k_len,
                             d,
-                            block_size,
-                            page_stride_rows,
                             v_cache_state,
                             ACTIVE_WGMMA_N,
                             HEAD_DIM_PADDED,
-                            PAGED_GATHER_MODE,
                             True,
                         )
                         previous_cache_state = cache_state
@@ -786,16 +760,12 @@ def _flash_varlen_fwd_v3_tle_persistent_producer_body(
                         accum_cnt_kv - 1,
                         v_base,
                         v_row_stride,
-                        page_table_ptr_b,
                         (n_block_max - 1) * ACTIVE_WGMMA_N,
                         k_len,
                         d,
-                        block_size,
-                        page_stride_rows,
                         previous_cache_state,
                         ACTIVE_WGMMA_N,
                         HEAD_DIM_PADDED,
-                        PAGED_GATHER_MODE,
                         True,
                     )
 
@@ -821,16 +791,12 @@ def _flash_varlen_fwd_v3_tle_persistent_producer_body(
                                 accum_cnt_kv,
                                 k_base,
                                 k_row_stride,
-                                page_table_ptr_b,
                                 kv_offset,
                                 k_len,
                                 d,
-                                block_size,
-                                page_stride_rows,
                                 cache_state,
                                 ACTIVE_WGMMA_N,
                                 HEAD_DIM_PADDED,
-                                PAGED_GATHER_MODE,
                             )
                     elif BM_SPLIT != 16:
                         if is_paged:
@@ -860,16 +826,12 @@ def _flash_varlen_fwd_v3_tle_persistent_producer_body(
                             accum_cnt_kv,
                             v_base,
                             v_row_stride,
-                            page_table_ptr_b,
                             kv_offset,
                             k_len,
                             d,
-                            block_size,
-                            page_stride_rows,
                             cache_state,
                             ACTIVE_WGMMA_N,
                             HEAD_DIM_PADDED,
-                            PAGED_GATHER_MODE,
                         )
                     elif is_paged:
                         _copy_paged_kv_tma_tile_to_pipe(
