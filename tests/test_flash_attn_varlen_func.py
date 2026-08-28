@@ -860,12 +860,12 @@ def test_flash_attn_varlen_fa3_persistent_autotune_key_buckets() -> None:
     } <= set(tuner.keys)
     assert (
         _fa3_scheduling_module().PersistentSchedulingHeuristics.AUTOTUNE_POLICY_VERSION
-        == 15
+        == 17
     )
 
 
 @pytest.mark.flash_attn_varlen_func
-def test_flash_attn_varlen_fa3_dense_tma_profile_partitions_aligned_key() -> None:
+def test_flash_attn_varlen_fa3_dense_producer_is_tma_only() -> None:
     scheduling = _fa3_scheduling_module()
     heuristics = scheduling.PersistentSchedulingHeuristics
 
@@ -896,9 +896,8 @@ def test_flash_attn_varlen_fa3_dense_tma_profile_partitions_aligned_key() -> Non
     )
 
     assert q255_tma is True
-    assert q256_tma is False
-    # The aligned raw lengths collide, so the derived profile must remain an
-    # exact autotune-key component.
+    assert q256_tma is True
+    # The retained dense producer no longer selects a pointer-copy profile.
     persistent = import_module(
         f"{flag_gems.flash_attn_varlen_func.__module__.split('.ops.', 1)[0]}"
         ".ops.attention_impl.persistent"
@@ -989,6 +988,7 @@ def test_flash_attn_varlen_fa3_uniform_short_query_uses_exact_split_work(
 
 
 @pytest.mark.flash_attn_varlen_func
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
     (
         "batch_size,max_seqlen_q,total_q,num_heads,num_heads_k,block_size,"
@@ -1077,6 +1077,7 @@ def test_flash_attn_varlen_fa3_uniform_short_query_uses_exact_split_work(
 )
 def test_flash_attn_varlen_fa3_single_long_ragged_split_work(
     monkeypatch,
+    dtype: torch.dtype,
     batch_size: int,
     max_seqlen_q: int,
     total_q: int,
@@ -1101,7 +1102,7 @@ def test_flash_attn_varlen_fa3_single_long_ragged_split_work(
     try:
         plan = scheduler.build(
             SimpleNamespace(
-                q=SimpleNamespace(dtype=torch.float16, element_size=lambda: 2),
+                q=SimpleNamespace(dtype=dtype, element_size=lambda: 2),
                 batch_size=batch_size,
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=65560,
@@ -1131,6 +1132,52 @@ def test_flash_attn_varlen_fa3_single_long_ragged_split_work(
     assert plan.paged_gather_mode == int(
         getattr(scheduling.PagedGatherMode, expected_gather)
     )
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_flash_attn_varlen_fa3_d256_q12_uses_compact_split_chunk(
+    monkeypatch,
+    dtype: torch.dtype,
+) -> None:
+    scheduling = _fa3_scheduling_module()
+    scheduler = scheduling.FA3Scheduler
+
+    monkeypatch.setenv("FLAG_GEMS_FA3_TLE_RAGGED_GQA_PACK", "auto")
+    monkeypatch.setenv("FLAG_GEMS_FA3_TLE_EXPERIMENT_DYNAMIC_SPLIT", "1")
+    monkeypatch.setenv("FLAG_GEMS_FA3_TLE_PAGED_KV_TMA_EXPERIMENT", "0")
+    scheduler.clear_config_cache()
+    try:
+        plan = scheduler.build(
+            SimpleNamespace(
+                q=SimpleNamespace(dtype=dtype, element_size=lambda: 2),
+                batch_size=1,
+                max_seqlen_q=12,
+                max_seqlen_k=32780,
+                total_q=12,
+                num_heads=4,
+                num_heads_k=1,
+                head_dim=256,
+                has_cache_kv=True,
+                is_paged=True,
+                block_size=16,
+                qo_tma_aligned=True,
+                kv_tma_aligned=True,
+                arch=90,
+                num_sms=114,
+                alibi_slopes=None,
+                window=SimpleNamespace(causal=True, local=False),
+                is_softcap=False,
+                seqused_k=object(),
+                max_num_splits=32,
+            )
+        )
+    finally:
+        scheduler.clear_config_cache()
+
+    assert plan.kernel_name == "persistent_splitkv_s32"
+    assert plan.persistent_num_splits == 32
+    assert plan.explicit_split_k_chunk == 8 * 128
 
 
 @pytest.mark.flash_attn_varlen_func
@@ -1690,12 +1737,12 @@ def test_flash_attn_varlen_fa3_h800_near_full_uniform_decode_uses_direct(
             torch.bfloat16,
             [1024],
             1024,
-            "direct",
-            False,
-            "AUTO",
-            "EXPLICIT",
+            "long_paged_prefill",
+            True,
+            "BLOCKWISE",
+            "L2_AUTO",
             "prefill",
-            id="bf16-negative-control",
+            id="bf16-measured-profile",
         ),
     ],
 )
@@ -1781,10 +1828,8 @@ def test_flash_attn_varlen_fa3_d256_prefill_cost_model(
     )
     assert not plan.persistent_split_kv
     assert plan.persistent_num_splits == 0
-    assert plan.paged_d256_prefill_profile is (dtype == torch.float16)
-    assert (
-        "kernel_profile=h100_paged_d256_prefill" in plan.reason
-    ) is (dtype == torch.float16)
+    assert plan.paged_d256_prefill_profile
+    assert "kernel_profile=h100_paged_d256_prefill" in plan.reason
     torch.testing.assert_close(output, ref_output, atol=2e-2, rtol=1e-2)
 
 
@@ -1855,13 +1900,42 @@ def test_flash_attn_varlen_fa3_d256_prefill_autotune_candidates(
         )
         for config in configs
     }
+    compact_n = heuristics.max_active_wgmma_n_for_1p2c(256)
 
     assert signatures == {
         (128, 64, 2, True, False, 64, False, False),
         (128, 64, 2, True, True, 64, False, False),
-        (128, 128, 2, True, True, 80, False, True),
+        (128, 128, 2, True, True, compact_n, False, True),
         (64, 64, 1, False, False, 64, False, False),
     }
+
+
+@pytest.mark.flash_attn_varlen_func
+def test_flash_attn_varlen_fa3_stable_autotune_tie_break() -> None:
+    scheduling = _fa3_scheduling_module()
+    heuristics = scheduling.PersistentSchedulingHeuristics
+    configs = heuristics.autotune_configs()
+    compact = next(
+        config for config in configs if config.kwargs["ACTIVE_WGMMA_N"] == 80
+    )
+    legacy = next(
+        config
+        for config in configs
+        if config.kwargs["ACTIVE_WGMMA_N"] == 64
+        and config.kwargs.get("STAGGER_KV", False)
+    )
+
+    noisy_tie = {
+        legacy: (1.00, 0.99, 1.15),
+        compact: (1.02, 1.01, 1.03),
+    }
+    assert heuristics.select_stable_config(noisy_tie) is compact
+
+    clear_legacy_win = {
+        legacy: (0.95, 0.94, 0.96),
+        compact: (1.02, 1.01, 1.03),
+    }
+    assert heuristics.select_stable_config(clear_legacy_win) is legacy
 
 
 @pytest.mark.flash_attn_varlen_func
@@ -1873,6 +1947,8 @@ def test_flash_attn_varlen_fa3_active_wgmma_n_heuristic(
     for name in _FA3_AUTOTUNE_EXPERIMENT_ENV:
         monkeypatch.delenv(name, raising=False)
 
+    compact_n = heuristics.max_active_wgmma_n_for_1p2c(256)
+    assert compact_n == 80
     assert heuristics.active_wgmma_n_candidates(64, tiled_extent_eligible=False) == (
         128,
         64,
@@ -1885,7 +1961,7 @@ def test_flash_attn_varlen_fa3_active_wgmma_n_heuristic(
         64,
     )
     assert heuristics.active_wgmma_n_candidates(256, tiled_extent_eligible=True) == (
-        80,
+        compact_n,
         64,
     )
     assert heuristics.active_wgmma_n_candidates(256, tiled_extent_eligible=False) == (
@@ -1935,7 +2011,7 @@ def test_flash_attn_varlen_fa3_active_wgmma_n_heuristic(
         kwargs = config.kwargs
         active_n = kwargs["ACTIVE_WGMMA_N"]
         if active_n != kwargs["BLOCK_N"]:
-            assert active_n == 80
+            assert active_n == compact_n
         else:
             assert active_n == kwargs["BLOCK_N"]
 
@@ -2052,10 +2128,7 @@ def test_flash_attn_varlen_fa3_tiled_extent_policy_matrix() -> None:
         "PAGED_PREFILL_PROFILE": True,
     }
 
-    for positive in (
-        {},
-        {"h": 8, "hk": 1, "block_size": 32},
-    ):
+    for positive in ({},):
         kept = heuristics.prune_autotune_configs(
             configs, {}, **(base | positive)
         )
@@ -2078,6 +2151,7 @@ def test_flash_attn_varlen_fa3_tiled_extent_policy_matrix() -> None:
 
     negative_overrides = (
         {"h": 8, "hk": 1},
+        {"h": 8, "hk": 1, "block_size": 32},
         {"block_size": 32},
         {"block_size": 64},
         {"is_seqused_k": False},
@@ -2093,8 +2167,9 @@ def test_flash_attn_varlen_fa3_tiled_extent_policy_matrix() -> None:
         {"PAGED_PREFILL_PROFILE": False},
     )
     for override in negative_overrides:
+        case = base | override
         kept = heuristics.prune_autotune_configs(
-            configs, {}, **(base | override)
+            configs, {}, **case
         )
         assert all(
             not config.kwargs.get("RESCALE_O_BEFORE_PV", False)
@@ -2106,6 +2181,12 @@ def test_flash_attn_varlen_fa3_tiled_extent_policy_matrix() -> None:
         assert all(
             config.kwargs["ACTIVE_WGMMA_N"] != 80 for config in kept
         ), override
+        if case["is_paged"] and case["PAGED_KV_NON_TMA"]:
+            page_size = case["block_size"]
+            assert all(
+                config.kwargs["ACTIVE_WGMMA_N"] % page_size == 0
+                for config in kept
+            ), override
 
 
 @pytest.mark.flash_attn_varlen_func

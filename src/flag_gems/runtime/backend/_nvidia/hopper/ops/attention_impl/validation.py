@@ -387,8 +387,12 @@ def _validate_argument_relationships(
         raise RuntimeError(
             "paged KV requires seqused_k and one block-table row per sequence"
         )
-    if is_paged and k.size(1) <= 0:
-        raise RuntimeError("paged KV requires a positive page size")
+    if is_paged:
+        block_size = k.size(1)
+        if block_size < 16 or block_size & (block_size - 1):
+            raise RuntimeError(
+                "paged KV block_size must be a power of two and at least 16"
+            )
     return num_heads, num_heads_k
 
 

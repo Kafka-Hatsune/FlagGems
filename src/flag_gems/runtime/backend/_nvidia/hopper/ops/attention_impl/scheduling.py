@@ -281,7 +281,7 @@ class FA3RouteFeatures:
 class FA3RouteCostModel:
     """Measured route rules plus a compatibility fallback for unseen shapes."""
 
-    VERSION = "sm90_coarse_buckets_v8"
+    VERSION = "sm90_coarse_buckets_v9"
     DENSE_WORK_CROSSOVER = 1 << 26
 
     @staticmethod
@@ -355,7 +355,7 @@ class FA3RouteCostModel:
         compact_paged = is_paged and block_size in _COMPACT_PAGED_PROFILE_SIZES
         measured_d256_prefill = (
             arch == 90
-            and dtype == torch.float16
+            and dtype in (torch.float16, torch.bfloat16)
             and has_cache_kv
             and is_paged
             and input_bucket.workload
@@ -1042,7 +1042,7 @@ class FA3Scheduler:
         )
         measured_wide_prefill_candidate = (
             arch == 90
-            and dtype == torch.float16
+            and dtype in (torch.float16, torch.bfloat16)
             and has_cache_kv
             and is_paged
             and bucket.workload
@@ -1186,12 +1186,7 @@ class FA3Scheduler:
             dynamic_scheduler = not static_explicit_split
 
         paged_gather_mode = int(config.paged_gather)
-        if is_paged and (block_size & (block_size - 1)) != 0:
-            # Blockwise relies on power-of-two page/tile divisibility.  Resolve
-            # unsupported page sizes on the host so no validity check reaches
-            # the Triton kernel.
-            paged_gather_mode = int(PagedGatherMode.LEGACY)
-        elif (
+        if (
             paged_gather_mode == int(PagedGatherMode.AUTO)
             and decision.family is KernelFamily.DIRECT
             and is_paged
@@ -1512,7 +1507,7 @@ class FA3Scheduler:
             and single_long_ragged_query
             and bucket.workload is FA3Workload.SHORT_QUERY
             and inputs.arch == 90
-            and inputs.q.dtype == torch.float16
+            and inputs.q.dtype in (torch.float16, torch.bfloat16)
             and inputs.head_dim == 256
             and (inputs.block_size, gqa_ratio) == (32, 8)
             and inputs.window.causal
@@ -1531,7 +1526,7 @@ class FA3Scheduler:
             and plan.persistent_num_splits == 32
             and bucket.population is QueryPopulation.SINGLE
             and bucket.workload is FA3Workload.SHORT_QUERY
-            and inputs.q.dtype == torch.float16
+            and inputs.q.dtype in (torch.float16, torch.bfloat16)
             and inputs.head_dim == 256
             and inputs.block_size == 16
             and gqa_ratio == 4
@@ -1817,19 +1812,22 @@ class PersistentSchedulingHeuristics:
     # Generic tiled-SMEM changes both the physical allocation and generated
     # producer/WGMMA instruction mix for ACTIVE_WGMMA_N candidates.  Keep
     # persisted pre-tiled timings from selecting an obsolete N64 result.
-    # Logical-shape lowering changed the N80 softmax instruction stream and
-    # invalidates persisted N64 winners measured with the manual carrier
+    # Logical-shape lowering changed the compact-N softmax instruction stream
+    # and invalidates persisted N64 winners measured with the manual carrier
     # mask.  ABBA measurements across the B1/B2/B5/B25 gate cases also show
-    # that rescaling O before PV is uniformly slower for the N80 profile, so
-    # version 15 removes that losing search candidate.
-    AUTOTUNE_POLICY_VERSION = 15
+    # that rescaling O before PV is uniformly slower for the compact profile,
+    # so version 15 removes that losing search candidate.  Version 16 removes
+    # the obsolete paged-pipe switch now that every exact tiled stage uses the
+    # same atom-copy producer representation.  Version 17 uses quantile-aware
+    # selection and a compact-N tie break instead of persisting a noisy p50
+    # winner for the spill-sensitive D256 path.
+    AUTOTUNE_POLICY_VERSION = 17
     DEFAULT_BLOCK_M = 128
     DEFAULT_NUM_MMA_GROUPS = 2
     DEFAULT_NUM_Q_BUFFERS = 1
     DEFAULT_USE_TMA_QO = True
     DEFAULT_REUSE_Q_SMEM_O = True
     DEFAULT_Q_PIPE_ASYNC = True
-    DEFAULT_PAGED_PIPE_ASYNC = True
     DEFAULT_DECODE_USE_TMA_QO = False
     DEFAULT_WARP_MMA = False
     DEFAULT_FORCED_BLOCK_M = 0
@@ -1837,9 +1835,47 @@ class PersistentSchedulingHeuristics:
     DEFAULT_FORCED_BLOCK_N = 0
     LPT_HEURISTIC_BLOCK_N = 128
     LPT_L2_BYTES = 32 * 1024 * 1024
-    DENSE_POINTER_MAX_K = 128
-    DENSE_POINTER_MAX_D = 64
-    DENSE_POINTER_MIN_TILES = 768
+    COMPACT_1P2C_SMEM_BUDGET_BYTES = 225 * 1024
+    MAX_ACTIVE_WGMMA_N = 128
+    LEGACY_ACTIVE_WGMMA_N = 64
+    COMPACT_N_P50_TIE_FRACTION = 0.03
+    COMPACT_N_ROBUST_TIE_FRACTION = 0.05
+    AUTOTUNE_SPREAD_WEIGHT = 0.25
+
+    @classmethod
+    def select_stable_config(cls, timings):
+        """Select a quantile-stable winner with a generic compact-N tie break."""
+
+        def scores(config):
+            samples = timings[config]
+            p50 = float(samples[0])
+            p20 = float(samples[1])
+            p80 = float(samples[2])
+            robust = p50 + cls.AUTOTUNE_SPREAD_WEIGHT * max(p80 - p20, 0.0)
+            return p50, robust
+
+        configs = tuple(timings)
+        fastest_p50 = min(scores(config)[0] for config in configs)
+        robust_best = min(configs, key=lambda config: scores(config)[1])
+        robust_floor = scores(robust_best)[1]
+        compact_ties = [
+            config
+            for config in configs
+            if config.kwargs["ACTIVE_WGMMA_N"] > cls.LEGACY_ACTIVE_WGMMA_N
+            and scores(config)[0]
+            <= fastest_p50 * (1.0 + cls.COMPACT_N_P50_TIE_FRACTION)
+            and scores(config)[1]
+            <= robust_floor * (1.0 + cls.COMPACT_N_ROBUST_TIE_FRACTION)
+        ]
+        if compact_ties:
+            return min(
+                compact_ties,
+                key=lambda config: (
+                    scores(config)[1],
+                    -config.kwargs["ACTIVE_WGMMA_N"],
+                ),
+            )
+        return robust_best
 
     @staticmethod
     def combine_launch_plan(
@@ -1915,8 +1951,22 @@ class PersistentSchedulingHeuristics:
             raise ValueError("FLAG_GEMS_FA3_TLE_EXPERIMENT_Q_BUFFERS must be 1 or 2")
         return value
 
-    @staticmethod
+    @classmethod
+    def max_active_wgmma_n_for_1p2c(cls, head_dim: int) -> int:
+        """Return the largest 16-aligned logical N within the 1P2C budget."""
+
+        head_dim_padded = CommonSchedulingHeuristics.padded_head_dim(head_dim)
+        # Q1 with two M64 consumer groups contributes Dpad*256 bytes.  K/V
+        # double buffering contributes Dpad*8*N bytes.
+        max_n = (
+            cls.COMPACT_1P2C_SMEM_BUDGET_BYTES // head_dim_padded - 256
+        ) // 8
+        max_n = min(cls.MAX_ACTIVE_WGMMA_N, max_n)
+        return max(16, max_n // 16 * 16)
+
+    @classmethod
     def active_wgmma_n_candidates(
+        cls,
         head_dim: int,
         *,
         tiled_extent_eligible: bool,
@@ -1924,18 +1974,20 @@ class PersistentSchedulingHeuristics:
         """Return the head-dimension-aware 1P2C active-N search space.
 
         The 1P2C shared-memory payload is
-        ``Dpad * (256 + 8 * N)`` bytes for FP16 with Q1/KV2.  N128 fits
-        comfortably through Dpad=128.  At Dpad=256, N80 is the largest
-        measured compact carrier below Hopper's per-CTA limit; N64 remains
-        in the search as the no-regression legacy candidate.
+        ``Dpad * (256 + 8 * N)`` bytes for FP16 with Q1/KV2.  The compact
+        candidate is derived from the per-CTA budget rather than tied to a
+        particular N.  N64 remains as the measured no-regression candidate.
         """
 
-        head_dim_padded = CommonSchedulingHeuristics.padded_head_dim(head_dim)
-        if head_dim_padded <= 128:
-            return (128, 64)
-        if head_dim_padded == 256 and tiled_extent_eligible:
-            return (80, 64)
-        return (64,)
+        compact_n = cls.max_active_wgmma_n_for_1p2c(head_dim)
+        if compact_n == cls.MAX_ACTIVE_WGMMA_N:
+            return (cls.MAX_ACTIVE_WGMMA_N, cls.LEGACY_ACTIVE_WGMMA_N)
+        if (
+            tiled_extent_eligible
+            and compact_n > cls.LEGACY_ACTIVE_WGMMA_N
+        ):
+            return (compact_n, cls.LEGACY_ACTIVE_WGMMA_N)
+        return (cls.LEGACY_ACTIVE_WGMMA_N,)
 
     @classmethod
     def make_config(
@@ -1972,7 +2024,6 @@ class PersistentSchedulingHeuristics:
             )
         reuse_default = "1" if cls.DEFAULT_REUSE_Q_SMEM_O else "0"
         q_pipe_default = "1" if cls.DEFAULT_Q_PIPE_ASYNC else "0"
-        pipe_default = "1" if cls.DEFAULT_PAGED_PIPE_ASYNC else "0"
         config_kwargs = {
             "BLOCK_M": block_m,
             "BLOCK_N": block_n,
@@ -1992,10 +2043,6 @@ class PersistentSchedulingHeuristics:
             )
             == "1",
             "USE_TMA_KV": use_tma_kv,
-            "PAGED_PIPE_ASYNC": os.getenv(
-                "FLAG_GEMS_FA3_TLE_EXPERIMENT_PIPE_ASYNC", pipe_default
-            )
-            != "0",
             "STAGGER_KV": stagger_kv,
             "ACTIVE_WGMMA_N": active_wgmma_n,
             "RESCALE_O_BEFORE_PV": rescale_o_before_pv,
@@ -2023,24 +2070,22 @@ class PersistentSchedulingHeuristics:
             num_buffers_kv=2,
             stagger_kv=True,
         )
-        # The N80 tiled-SMEM profile has one legal transport/topology after the
-        # static contract and production pruner are applied: staggered K/V,
-        # early FP16 P carry, and the dense-profile transport selector set.
-        # ABBA measurements across the prefill/mixed gate cases consistently
-        # favor carrying O unscaled until after PV.  Keep only that winner:
-        # the previous rescale dimension increased first-use search cost and
-        # could select the slower candidate under noisy autotune timing.
-        configs.append(
-            cls.make_config(
-                block_n=128,
-                num_buffers_kv=2,
-                use_tma_kv=True,
-                stagger_kv=True,
-                active_wgmma_n=80,
-                rescale_o_before_pv=False,
-                early_cast_p=True,
+        # The compact D256 candidate has one legal transport/topology after
+        # the static contract and production pruner are applied: staggered
+        # K/V, early FP16 P carry, and dense-profile transport selection.
+        compact_active_n = cls.max_active_wgmma_n_for_1p2c(256)
+        if compact_active_n < cls.MAX_ACTIVE_WGMMA_N:
+            configs.append(
+                cls.make_config(
+                    block_n=cls.MAX_ACTIVE_WGMMA_N,
+                    num_buffers_kv=2,
+                    use_tma_kv=True,
+                    stagger_kv=True,
+                    active_wgmma_n=compact_active_n,
+                    rescale_o_before_pv=False,
+                    early_cast_p=True,
+                )
             )
-        )
         forced_mma_groups = os.getenv("FLAG_GEMS_FA3_TLE_EXPERIMENT_MMA_GROUPS")
         decode_tma_default = "1" if cls.DEFAULT_DECODE_USE_TMA_QO else "0"
         decode_tma_qo = (
@@ -2182,46 +2227,9 @@ class PersistentSchedulingHeuristics:
         ragged_scheduler,
         split_kv,
     ) -> bool:
-        """Select dense K/V transport; True keeps the descriptor/TMA path."""
+        """Keep the retained dense producer on its descriptor/TMA path."""
 
-        if is_paged:
-            return True
-        required_shape = (
-            batch_size,
-            num_heads,
-            num_heads_k,
-            head_dim,
-            max_seqlen_q,
-            max_seqlen_k,
-            total_q,
-        )
-        if any(value is None for value in required_shape):
-            return True
-        if (
-            is_causal
-            or is_local
-            or is_alibi
-            or is_softcap
-            or ragged_scheduler
-            or split_kv
-            or total_q != batch_size * max_seqlen_q
-            or max_seqlen_q % cls.DEFAULT_BLOCK_M != 0
-            or head_dim > cls.DENSE_POINTER_MAX_D
-            or max_seqlen_k > cls.DENSE_POINTER_MAX_K
-        ):
-            return True
-
-        if pack_gqa:
-            gqa_ratio = num_heads // num_heads_k
-            effective_q = max_seqlen_q * gqa_ratio
-            effective_heads = num_heads_k
-        else:
-            effective_q = max_seqlen_q
-            effective_heads = num_heads
-        persistent_tiles = (
-            batch_size * effective_heads * _ceil_div(effective_q, cls.DEFAULT_BLOCK_M)
-        )
-        return persistent_tiles < cls.DENSE_POINTER_MIN_TILES
+        return True
 
     @classmethod
     def prune_autotune_configs(cls, configs, nargs, **kwargs):
@@ -2326,6 +2334,22 @@ class PersistentSchedulingHeuristics:
             is_paged and paged_kv_non_tma and not pack_gqa and head_dim > 128
         )
 
+        def page_extent_compatible(config):
+            return (
+                not is_paged
+                or not paged_kv_non_tma
+                or config.kwargs["ACTIVE_WGMMA_N"] % block_size == 0
+            )
+
+        def smem_compatible(config):
+            budget = (
+                225 * 1024
+                if config.kwargs["ACTIVE_WGMMA_N"]
+                != config.kwargs["BLOCK_N"]
+                else 220 * 1024
+            )
+            return cls.config_smem_bytes(config, head_dim) <= budget
+
         def selected_shape_config(config):
             stagger_kv = config.kwargs.get("STAGGER_KV", False)
             tiled_extent = (
@@ -2346,7 +2370,6 @@ class PersistentSchedulingHeuristics:
                 return False
             if tiled_extent and (
                 not tiled_extent_policy
-                or not config.kwargs["PAGED_PIPE_ASYNC"]
                 or not config.kwargs["REUSE_Q_SMEM_O"]
                 or not stagger_kv
                 or not early_cast_p
@@ -2401,6 +2424,7 @@ class PersistentSchedulingHeuristics:
             config
             for config in configs
             if selected_shape_config(config)
+            and page_extent_compatible(config)
             and config.kwargs["USE_TMA_KV"] == use_tma_kv
             and not (
                 config.kwargs["NUM_MMA_GROUPS"] == 2
@@ -2423,13 +2447,7 @@ class PersistentSchedulingHeuristics:
                 or paged_kv_non_tma
                 or block_size % config.kwargs["BLOCK_N"] == 0
             )
-            and cls.config_smem_bytes(config, head_dim)
-            <= (
-                225 * 1024
-                if config.kwargs["ACTIVE_WGMMA_N"]
-                != config.kwargs["BLOCK_N"]
-                else 220 * 1024
-            )
+            and smem_compatible(config)
         ]
         if kept:
             return kept
@@ -2437,13 +2455,22 @@ class PersistentSchedulingHeuristics:
             config
             for config in reversed(configs)
             if config.kwargs["USE_TMA_KV"] == use_tma_kv
+            and page_extent_compatible(config)
+            and smem_compatible(config)
             and config.kwargs["ACTIVE_WGMMA_N"] == config.kwargs["BLOCK_N"]
             and (
                 wide_paged_prefill_packgqa_ws
                 or not config.kwargs.get("STAGGER_KV", False)
             )
         ]
-        return fallback[:1] or [configs[-1]]
+        if fallback:
+            return fallback[:1]
+        if is_paged and paged_kv_non_tma:
+            raise ValueError(
+                "paged non-TMA has no legal ACTIVE_WGMMA_N: it must be "
+                "divisible by block_size and fit the shared-memory budget"
+            )
+        return [configs[-1]]
 
     @classmethod
     def launch_plan(

@@ -84,6 +84,8 @@ def _log_dispatch(
 def launch_fa3(
     inputs: PreparedFA3Inputs,
     plan: FA3ExecutionPlan,
+    *,
+    exact_paged_kv_tiles: bool = False,
 ):
     """Materialize and execute a concrete FA3 plan.
 
@@ -246,6 +248,7 @@ def launch_fa3(
                 pack_gqa=plan.pack_gqa,
                 paged_gather_mode=plan.paged_gather_mode,
                 paged_kv_non_tma=plan.paged_kv_non_tma,
+                exact_paged_kv_tiles=False,
                 ragged_scheduler=True,
                 is_paged=is_paged,
                 is_causal=is_causal,
@@ -316,6 +319,7 @@ def launch_fa3(
                 pack_gqa=plan.pack_gqa,
                 paged_gather_mode=plan.paged_gather_mode,
                 paged_kv_non_tma=plan.paged_kv_non_tma,
+                exact_paged_kv_tiles=exact_paged_kv_tiles,
                 ragged_scheduler=plan.ragged_scheduler,
                 is_paged=is_paged,
                 is_causal=is_causal,
