@@ -1597,10 +1597,10 @@ def test_flash_attn_varlen_fa3_adaptive_wide_mixed_split(monkeypatch) -> None:
 @pytest.mark.flash_attn_varlen_func
 @pytest.mark.skipif(not HOPPER_AVAILABLE, reason="FA3 requires an NVIDIA Hopper GPU")
 @torch.inference_mode()
-def test_flash_attn_varlen_fa3_h800_near_full_uniform_decode_uses_direct(
+def test_flash_attn_varlen_fa3_h800_uniform_decode_uses_quarter_wave_rule(
     monkeypatch,
 ) -> None:
-    """A 128/132-SM direct wave must not manufacture Split-KV work."""
+    """Use direct once four packed decode waves can cover the device."""
 
     scheduling = _fa3_scheduling_module()
     FA3Scheduler = scheduling.FA3Scheduler
@@ -1632,7 +1632,7 @@ def test_flash_attn_varlen_fa3_h800_near_full_uniform_decode_uses_direct(
         block_tables,
         scale,
     ) = _make_fa3_wide_split_case(
-        [1] * 128,
+        [1] * 33,
         1,
         torch.float16,
         block_size=16,
@@ -1663,7 +1663,7 @@ def test_flash_attn_varlen_fa3_h800_near_full_uniform_decode_uses_direct(
             below_threshold_block_tables,
             below_threshold_scale,
         ) = _make_fa3_wide_split_case(
-            [1] * 118,
+            [1] * 32,
             1,
             torch.float16,
             block_size=16,

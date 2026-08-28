@@ -25,6 +25,7 @@ import os
 from dataclasses import dataclass, replace
 from enum import Enum, IntEnum
 from functools import lru_cache
+from types import SimpleNamespace
 from typing import Any, TypeVar
 
 import torch
@@ -622,6 +623,7 @@ class FA3Scheduler:
     WIDE_SPLIT_BLOCK_M = 64
     MIN_SPLIT_WAVE_FILL_NUMERATOR = 9
     MIN_SPLIT_WAVE_FILL_DENOMINATOR = 10
+    D256_DIRECT_WAVE_MULTIPLIER = 4
 
     @classmethod
     def _has_minimum_wave_fill(cls, work_items: int, num_sms: int) -> bool:
@@ -793,6 +795,8 @@ class FA3Scheduler:
     def clear_config_cache() -> None:
         FA3Scheduler.load_config.cache_clear()
         FA3Scheduler.route.cache_clear()
+        FA3Scheduler._uses_default_d256_route_config.cache_clear()
+        FA3Scheduler._build_default_d256_cached.cache_clear()
 
     @staticmethod
     def paged_gather_name(mode: PagedGatherMode | int) -> str:
@@ -1342,6 +1346,124 @@ class FA3Scheduler:
             return int(PagedGatherMode.LEGACY)
         return mode
 
+    @staticmethod
+    @lru_cache(maxsize=16)
+    def _uses_default_d256_route_config(config: RouteConfig) -> bool:
+        """Whether the measured paged-D256 fast path owns this configuration."""
+
+        return (
+            config.decode_strategy is KernelFamily.AUTO
+            and config.pack_gqa is Toggle.AUTO
+            and config.paged_prefill_route is PagedPrefillRoute.AUTO
+            and config.paged_prefill_min_q is None
+            and config.paged_prefill_min_avg_q == 128
+            and config.paged_gather is PagedGatherMode.AUTO
+            and not config.wide_pack_gqa
+            and not config.force_paged_kv_tma
+            and config.ragged_scheduler == "auto"
+            and config.heads_in_l2 == HeadsInL2Policy(HeadsInL2Mode.AUTO)
+            and config.dynamic_scheduler == "auto"
+            and config.dynamic_split
+            and not config.log_plan
+        )
+
+    @classmethod
+    def _is_default_d256_fast_path(
+        cls,
+        inputs: PreparedFA3Inputs,
+        config: RouteConfig,
+    ) -> bool:
+        """Recognize the measured paged-D256 region without reading K lengths."""
+
+        num_heads_k = inputs.num_heads_k
+        gqa_ratio = inputs.num_heads // num_heads_k
+        return (
+            cls._uses_default_d256_route_config(config)
+            and os.getenv("FLAG_GEMS_FA3_TLE_EXPERIMENT_BLOCK_M", "0") == "0"
+            and inputs.arch == 90
+            and inputs.q.dtype in (torch.float16, torch.bfloat16)
+            and inputs.has_cache_kv
+            and inputs.is_paged
+            and inputs.head_dim == 256
+            and (inputs.block_size, gqa_ratio) in {(16, 4), (32, 8)}
+            # D256 single-token causal attention is normalized to a mask-free
+            # window by input preparation; it still belongs to this route.
+            and (inputs.window.causal or inputs.max_seqlen_q == 1)
+            and not inputs.window.local
+            and inputs.alibi_slopes is None
+            and not inputs.is_softcap
+            and getattr(inputs, "s_aux", None) is None
+            and inputs.qo_tma_aligned
+        )
+
+    @classmethod
+    @lru_cache(maxsize=1024)
+    def _build_default_d256_cached(
+        cls,
+        config: RouteConfig,
+        dtype: Any,
+        batch_size: int,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        total_q: int,
+        num_heads: int,
+        num_heads_k: int,
+        block_size: int,
+        num_sms: int,
+        is_causal: bool,
+        kv_tma_aligned: bool,
+        max_num_splits: int,
+    ) -> FA3ExecutionPlan:
+        """Cache the complete plan for the dominant scalar-only D256 route key."""
+
+        gqa_ratio = num_heads // num_heads_k
+        uniform_token_query = (
+            batch_size > 1 and max_seqlen_q == 1 and total_q == batch_size
+        )
+        split_base_work = batch_size * num_heads_k
+        direct_token_query = uniform_token_query and (
+            (block_size, gqa_ratio) == (32, 8)
+            or (
+                (block_size, gqa_ratio) == (16, 4)
+                # A measured direct launch is competitive once four waves of
+                # its packed CTA work can cover the device.  Below this point,
+                # preserve adaptive Split-KV parallelism.
+                and split_base_work * cls.D256_DIRECT_WAVE_MULTIPLIER >= num_sms
+            )
+        )
+        route_config = (
+            replace(config, decode_strategy=KernelFamily.DIRECT)
+            if direct_token_query
+            else config
+        )
+        # The generic builder consumes only host scalar facts.  Reconstructing
+        # this lightweight view on a cache miss avoids retaining user tensors in
+        # the plan cache while keeping every non-token route exactly identical.
+        route_inputs = SimpleNamespace(
+            q=SimpleNamespace(dtype=dtype, element_size=lambda: 2),
+            batch_size=batch_size,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            total_q=total_q,
+            num_heads=num_heads,
+            num_heads_k=num_heads_k,
+            head_dim=256,
+            has_cache_kv=True,
+            is_paged=True,
+            block_size=block_size,
+            qo_tma_aligned=True,
+            kv_tma_aligned=kv_tma_aligned,
+            arch=90,
+            num_sms=num_sms,
+            alibi_slopes=None,
+            window=SimpleNamespace(causal=is_causal, local=False),
+            is_softcap=False,
+            s_aux=None,
+            seqused_k=True,
+            max_num_splits=max_num_splits,
+        )
+        return cls._build_uncached(route_inputs, route_config)
+
     @classmethod
     def build(
         cls,
@@ -1352,6 +1474,32 @@ class FA3Scheduler:
 
         if config is None:
             config = cls.load_config()
+        if cls._is_default_d256_fast_path(inputs, config):
+            return cls._build_default_d256_cached(
+                config,
+                inputs.q.dtype,
+                inputs.batch_size,
+                inputs.max_seqlen_q,
+                inputs.max_seqlen_k,
+                inputs.total_q,
+                inputs.num_heads,
+                inputs.num_heads_k,
+                inputs.block_size,
+                inputs.num_sms,
+                inputs.window.causal,
+                inputs.kv_tma_aligned,
+                inputs.max_num_splits,
+            )
+        return cls._build_uncached(inputs, config)
+
+    @classmethod
+    def _build_uncached(
+        cls,
+        inputs: PreparedFA3Inputs,
+        config: RouteConfig,
+    ) -> FA3ExecutionPlan:
+        """Build the general plan for inputs outside the cached D256 region."""
+
         bucket = cls.analyze_inputs(inputs, config)
         gqa_ratio = inputs.num_heads // inputs.num_heads_k
         forced_split_block_m = int(

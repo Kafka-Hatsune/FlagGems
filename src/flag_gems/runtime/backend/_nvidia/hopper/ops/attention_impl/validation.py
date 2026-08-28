@@ -478,7 +478,15 @@ def _tma_strides_are_aligned(tensor: torch.Tensor) -> bool:
     return _tma_stride_signature_is_aligned(tensor.element_size(), tensor.stride())
 
 
-def _fa3_runtime_error(device=None) -> str | None:
+@lru_cache(maxsize=16)
+def _fa3_device_properties(device: torch.device):
+    """Cache process-stable CUDA properties used by every FA3 invocation."""
+
+    return torch.cuda.get_device_properties(device)
+
+
+@lru_cache(maxsize=16)
+def _fa3_runtime_error_for_device(device: torch.device) -> str | None:
     missing = _missing_fa3_primitives()
     if missing:
         return (
@@ -487,11 +495,21 @@ def _fa3_runtime_error(device=None) -> str | None:
         )
     if (
         not torch.cuda.is_available()
-        or (device is not None and torch.device(device).type != "cuda")
-        or torch.cuda.get_device_capability(device)[0] != 9
+        or device.type != "cuda"
+        or _fa3_device_properties(device).major != 9
     ):
         return "fa_version=3 requires an available NVIDIA Hopper (SM90) device"
     return None
+
+
+def _fa3_runtime_error(device=None) -> str | None:
+    if device is None:
+        if not torch.cuda.is_available():
+            return "fa_version=3 requires an available NVIDIA Hopper (SM90) device"
+        device = torch.device("cuda", torch.cuda.current_device())
+    else:
+        device = torch.device(device)
+    return _fa3_runtime_error_for_device(device)
 
 
 def is_fa3_supported(device=None) -> bool:
@@ -668,7 +686,7 @@ def prepare_fa3_inputs(
         adjusted_softcap = 0.0
         adjusted_scale_softmax = scale
 
-    device_properties = torch.cuda.get_device_properties(q.device)
+    device_properties = _fa3_device_properties(q.device)
     arch = device_properties.major * 10 + device_properties.minor
     qo_tma_aligned = _tma_strides_are_aligned(q) and (
         out is None or _tma_strides_are_aligned(out)
