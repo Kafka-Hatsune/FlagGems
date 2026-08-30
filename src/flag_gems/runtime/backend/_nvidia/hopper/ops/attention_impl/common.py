@@ -220,36 +220,57 @@ def _paged_tile_cache_state(
         and (block_size & (block_size - 1)) == 0,
         "paged KV block_size must be a power of two and at least 16",
     )
-    tl.static_assert(
-        BLOCK_N % block_size == 0,
-        "paged KV BLOCK_N must be divisible by block_size",
-    )
     page_stride_rows = page_stride_rows.to(tl.int64)
     cache_bases = tl.tuple(())
-    NUM_PAGE_ENTRIES: tl.constexpr = BLOCK_N // block_size
-    first_page = n_start // block_size
     FRAGMENTS_PER_PAGE: tl.constexpr = block_size // FRAGMENT_N
-    page_blocks = tl.tuple(())
-    for page_entry in tl.static_range(0, NUM_PAGE_ENTRIES):
-        page_logical_start = n_start + page_entry * block_size
-        if BOUNDARY_CHECK:
-            page_block = tl.load(
-                page_table_ptr + first_page + page_entry,
-                mask=page_logical_start < max_virtual_index,
-                other=0,
-            ).to(tl.int32)
-        else:
-            page_block = tl.load(
-                page_table_ptr + first_page + page_entry
-            ).to(tl.int32)
-        page_blocks += (page_block,)
+    if BLOCK_N % block_size == 0:
+        # Power-of-two extents start on a page boundary.  Load each page-table
+        # entry once and reuse it for all N16 fragments inside that page.
+        NUM_PAGE_ENTRIES: tl.constexpr = BLOCK_N // block_size
+        first_page = n_start // block_size
+        page_blocks = tl.tuple(())
+        for page_entry in tl.static_range(0, NUM_PAGE_ENTRIES):
+            page_logical_start = n_start + page_entry * block_size
+            if BOUNDARY_CHECK:
+                page_block = tl.load(
+                    page_table_ptr + first_page + page_entry,
+                    mask=page_logical_start < max_virtual_index,
+                    other=0,
+                ).to(tl.int32)
+            else:
+                page_block = tl.load(
+                    page_table_ptr + first_page + page_entry
+                ).to(tl.int32)
+            page_blocks += (page_block,)
 
-    for fragment in tl.static_range(0, NUM_FRAGMENTS):
-        fragment_page = page_blocks[fragment // FRAGMENTS_PER_PAGE]
-        cache_bases += (
-            fragment_page * page_stride_rows
-            + fragment % FRAGMENTS_PER_PAGE * FRAGMENT_N,
-        )
+        for fragment in tl.static_range(0, NUM_FRAGMENTS):
+            fragment_page = page_blocks[fragment // FRAGMENTS_PER_PAGE]
+            cache_bases += (
+                fragment_page * page_stride_rows
+                + fragment % FRAGMENTS_PER_PAGE * FRAGMENT_N,
+            )
+    else:
+        # Compact logical extents such as N80 can start halfway through a
+        # page32 block on alternating iterations.  Every N16 fragment remains
+        # page-contained, so resolve its own page and in-page offset without
+        # imposing ACTIVE_WGMMA_N % block_size == 0.
+        for fragment in tl.static_range(0, NUM_FRAGMENTS):
+            fragment_logical_start = n_start + fragment * FRAGMENT_N
+            fragment_page = fragment_logical_start // block_size
+            if BOUNDARY_CHECK:
+                page_block = tl.load(
+                    page_table_ptr + fragment_page,
+                    mask=fragment_logical_start < max_virtual_index,
+                    other=0,
+                ).to(tl.int32)
+            else:
+                page_block = tl.load(
+                    page_table_ptr + fragment_page
+                ).to(tl.int32)
+            cache_bases += (
+                page_block * page_stride_rows
+                + fragment_logical_start % block_size,
+            )
     return cache_bases
 
 

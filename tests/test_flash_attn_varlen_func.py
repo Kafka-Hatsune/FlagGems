@@ -1135,6 +1135,64 @@ def test_flash_attn_varlen_fa3_single_long_ragged_split_work(
 
 
 @pytest.mark.flash_attn_varlen_func
+@pytest.mark.parametrize(
+    "num_sms,ragged_mode,expected_ragged",
+    [
+        pytest.param(132, "auto", False, id="h800-auto-padded"),
+        pytest.param(114, "auto", True, id="h100-auto-ragged"),
+        pytest.param(132, "ragged", True, id="h800-explicit-ragged"),
+    ],
+)
+def test_flash_attn_varlen_fa3_dominant_long_prefill_ragged_route(
+    monkeypatch,
+    num_sms: int,
+    ragged_mode: str,
+    expected_ragged: bool,
+) -> None:
+    scheduling = _fa3_scheduling_module()
+    scheduler = scheduling.FA3Scheduler
+
+    monkeypatch.setenv("FLAG_GEMS_FA3_TLE_RAGGED_GQA_PACK", "auto")
+    monkeypatch.setenv("FLAG_GEMS_FA3_TLE_MIXED_EXPERIMENT", ragged_mode)
+    monkeypatch.setenv("FLAG_GEMS_FA3_TLE_PAGED_KV_TMA_EXPERIMENT", "0")
+    scheduler.clear_config_cache()
+    try:
+        plan = scheduler.build(
+            SimpleNamespace(
+                q=SimpleNamespace(dtype=torch.float16, element_size=lambda: 2),
+                batch_size=2,
+                max_seqlen_q=16373,
+                max_seqlen_k=32779,
+                total_q=16384,
+                num_heads=4,
+                num_heads_k=1,
+                head_dim=256,
+                has_cache_kv=True,
+                is_paged=True,
+                block_size=16,
+                qo_tma_aligned=True,
+                kv_tma_aligned=True,
+                arch=90,
+                num_sms=num_sms,
+                alibi_slopes=None,
+                window=SimpleNamespace(causal=True, local=False),
+                is_softcap=False,
+                seqused_k=object(),
+                max_num_splits=0,
+            )
+        )
+    finally:
+        scheduler.clear_config_cache()
+
+    assert plan.ragged_scheduler is expected_ragged
+    assert plan.kernel_name == (
+        "long_paged_prefill_ragged"
+        if expected_ragged
+        else "long_paged_prefill"
+    )
+
+
+@pytest.mark.flash_attn_varlen_func
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_flash_attn_varlen_fa3_d256_q12_uses_compact_split_chunk(
     monkeypatch,
@@ -2053,14 +2111,14 @@ def test_flash_attn_varlen_fa3_active_wgmma_n_old_schema(
 
 
 @pytest.mark.flash_attn_varlen_func
-def test_flash_attn_varlen_fa3_stagger_kv_is_prefill_only() -> None:
+def test_flash_attn_varlen_fa3_stagger_kv_is_prefill_or_wide_split() -> None:
     scheduling = _fa3_scheduling_module()
     heuristics = scheduling.PersistentSchedulingHeuristics
     configs = heuristics.autotune_configs()
 
-    for seqlen_q, split_kv, prefill_profile in (
-        (1, False, False),
-        (64, True, True),
+    for seqlen_q, split_kv, prefill_profile, allows_stagger in (
+        (1, False, False, False),
+        (64, True, True, True),
     ):
         kept = heuristics.prune_autotune_configs(
             configs,
@@ -2084,9 +2142,9 @@ def test_flash_attn_varlen_fa3_stagger_kv_is_prefill_only() -> None:
             SPLIT_KV=split_kv,
             PAGED_PREFILL_PROFILE=prefill_profile,
         )
-        assert all(
-            not config.kwargs.get("STAGGER_KV", False) for config in kept
-        )
+        assert any(
+            config.kwargs.get("STAGGER_KV", False) for config in kept
+        ) is allows_stagger
         assert all(
             not config.kwargs.get("RESCALE_O_BEFORE_PV", False)
             for config in kept

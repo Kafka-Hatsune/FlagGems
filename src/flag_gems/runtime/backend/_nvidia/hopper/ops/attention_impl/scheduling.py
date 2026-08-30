@@ -1389,6 +1389,37 @@ class FA3Scheduler:
             and inputs.total_q
             == inputs.max_seqlen_q + inputs.batch_size - 1
         )
+        dominant_long_ragged_query = (
+            bucket.population
+            in {QueryPopulation.RAGGED, QueryPopulation.MIXED}
+            and inputs.batch_size > 1
+            and inputs.max_seqlen_q > 1
+            and inputs.total_q - inputs.max_seqlen_q
+            <= 16 * (inputs.batch_size - 1)
+        )
+        prefer_padded_dominant_long_prefill = (
+            config.ragged_scheduler == "auto"
+            and dominant_long_ragged_query
+            and bucket.workload is FA3Workload.PREFILL
+            and inputs.batch_size <= 3
+            and inputs.arch == 90
+            and inputs.num_sms >= 128
+            and inputs.q.dtype in (torch.float16, torch.bfloat16)
+            and inputs.is_paged
+            and inputs.head_dim == 256
+            and (inputs.block_size, gqa_ratio) in {(16, 4), (32, 8)}
+            and inputs.window.causal
+            and inputs.alibi_slopes is None
+            and not (inputs.window.local or inputs.is_softcap)
+        )
+        # On 128+ SM Hopper parts, dominant-long prefill batches pay more for
+        # the ragged mapper than they save in rectangular launch slots.
+        # Preserve explicit user overrides and keep the H100 (114 SM) route.
+        route_config = (
+            replace(config, ragged_scheduler="off")
+            if prefer_padded_dominant_long_prefill
+            else config
+        )
         if bucket.population is QueryPopulation.UNIFORM:
             # Uniform lengths are known exactly from host metadata.  The
             # compact ``ceil(total)+B-1`` upper bound can be almost 2x too
@@ -1439,7 +1470,7 @@ class FA3Scheduler:
             and cls._has_minimum_wave_fill(packed_padded_work, inputs.num_sms)
         )
         route_kwargs = dict(
-            config=config,
+            config=route_config,
             bucket=bucket,
             arch=inputs.arch,
             dtype=inputs.q.dtype,
@@ -1839,8 +1870,9 @@ class PersistentSchedulingHeuristics:
     # the obsolete paged-pipe switch now that every exact tiled stage uses the
     # same atom-copy producer representation.  Version 17 uses quantile-aware
     # selection and a compact-N tie break instead of persisting a noisy p50
-    # winner for the spill-sensitive D256 path.
-    AUTOTUNE_POLICY_VERSION = 17
+    # winner for the spill-sensitive D256 path.  Version 18 expands the
+    # explicit wide Split-KV search space.
+    AUTOTUNE_POLICY_VERSION = 18
     DEFAULT_BLOCK_M = 128
     DEFAULT_NUM_MMA_GROUPS = 2
     DEFAULT_NUM_Q_BUFFERS = 1
@@ -2385,7 +2417,9 @@ class PersistentSchedulingHeuristics:
                 return False
             if (
                 stagger_kv or tiled_extent or rescale_o_before_pv
-            ) and not wide_paged_prefill_packgqa_ws:
+            ) and not (
+                wide_paged_prefill_packgqa_ws or explicit_wide_split_ws
+            ):
                 return False
             if tiled_extent and (
                 not tiled_extent_policy
@@ -2394,7 +2428,7 @@ class PersistentSchedulingHeuristics:
                 or not early_cast_p
             ):
                 return False
-            if decode_packgqa_ws or explicit_wide_split_ws or wide_paged_nontma:
+            if decode_packgqa_ws or wide_paged_nontma:
                 return (
                     config.kwargs["BLOCK_M"] == 64
                     and config.kwargs["BLOCK_N"] == 64
@@ -2402,6 +2436,23 @@ class PersistentSchedulingHeuristics:
                     and config.kwargs["NUM_MMA_GROUPS"] == 1
                     and not config.kwargs["USE_TMA_QO"]
                 )
+            if explicit_wide_split_ws:
+                group2 = (
+                    config.kwargs["BLOCK_M"] == 128
+                    and config.kwargs["BLOCK_N"] == 64
+                    and config.kwargs["NUM_BUFFERS_KV"] == 2
+                    and config.kwargs["NUM_MMA_GROUPS"] == 2
+                    and config.kwargs["USE_TMA_QO"]
+                )
+                group1 = (
+                    config.kwargs["BLOCK_M"] == 64
+                    and config.kwargs["BLOCK_N"] == 64
+                    and config.kwargs["NUM_BUFFERS_KV"] == 2
+                    and config.kwargs["NUM_MMA_GROUPS"] == 1
+                    and not config.kwargs["USE_TMA_QO"]
+                    and not stagger_kv
+                )
+                return group2 or group1
             if wide_paged_prefill_packgqa_ws:
                 group2 = (
                     config.kwargs["BLOCK_M"] == 128
