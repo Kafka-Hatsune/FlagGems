@@ -134,7 +134,7 @@ def _combine_persistent_split_kv_kernel(
         mask=valid_rows[:, None] & (cols[None, :] < head_dim),
     )
     if STORE_LSE:
-        lse = tl.where(invalid, float("inf"), lse_max + tl.log(weight_sum))
+        lse = tl.where(invalid, float("-inf"), lse_max + tl.log(weight_sum))
         tl.store(
             softmax_lse_ptr + hid * total_q + global_rows,
             lse,

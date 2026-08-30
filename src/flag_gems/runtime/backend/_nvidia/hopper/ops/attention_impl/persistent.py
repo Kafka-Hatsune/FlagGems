@@ -1957,7 +1957,7 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                 if SPLIT_KV or STORE_LSE:
                     lse = tl.where(
                         invalid,
-                        float("-inf") if SPLIT_KV or is_s_aux else float("inf"),
+                        float("-inf"),
                         rowmax * scale_softmax + tl.log(rowsum),
                     )
                 tile_count += 1
@@ -1966,7 +1966,7 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                 if SPLIT_KV or STORE_LSE:
                     lse = tl.full(
                         [BM_SPLIT],
-                        float("-inf") if SPLIT_KV else float("inf"),
+                        float("-inf"),
                         dtype=tl.float32,
                     )
                     if is_s_aux:
@@ -2091,7 +2091,12 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                         BM_SPLIT,
                         HEAD_DIM_PADDED,
                     )
-            elif USE_TMA_QO:
+            elif USE_TMA_QO and HEAD_DIM_PADDED < 256:
+                # TensorDescriptor.store(register_tensor) materializes an
+                # implicit BM_SPLIT x D shared staging tile.  At padded D256
+                # that adds 32 KiB per consumer and can exceed Hopper's CTA
+                # shared-memory limit.  Wide unpacked output uses the existing
+                # register-to-global fallback below while retaining TMA Q.
                 o_desc.store(
                     [
                         lse_offset + m_block * BLOCK_M + cid * BM_SPLIT,
