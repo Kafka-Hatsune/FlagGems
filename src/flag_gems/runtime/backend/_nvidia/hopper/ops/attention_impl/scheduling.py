@@ -251,15 +251,15 @@ class FA3InputBucket:
     population: QueryPopulation
     profile: FA3InputProfile
     alignment: TMAAlignment
-    padded_unpacked_wave: TileWave
-    padded_packed_wave: TileWave
-    ragged_unpacked_wave: TileWave
-    ragged_packed_wave: TileWave
+    padded_unpacked_waves: tuple[TileWave, TileWave]
+    padded_packed_waves: tuple[TileWave, TileWave]
+    ragged_unpacked_waves: tuple[TileWave, TileWave]
+    ragged_packed_waves: tuple[TileWave, TileWave]
 
-    def select_wave(self, *, packed: bool, ragged: bool) -> TileWave:
+    def select_waves(self, *, packed: bool, ragged: bool) -> tuple[TileWave, TileWave]:
         if ragged:
-            return self.ragged_packed_wave if packed else self.ragged_unpacked_wave
-        return self.padded_packed_wave if packed else self.padded_unpacked_wave
+            return self.ragged_packed_waves if packed else self.ragged_unpacked_waves
+        return self.padded_packed_waves if packed else self.padded_unpacked_waves
 
 
 @dataclass(frozen=True, slots=True)
@@ -620,6 +620,8 @@ class FA3Scheduler:
     MAX_DYNAMIC_SPLITS = 3
     MIN_EXPLICIT_SPLIT_K = 12 * 128
     WIDE_SPLIT_BLOCK_M = 64
+    TILE_WAVE_BLOCK_M = 128
+    FINE_GRAINED_BLOCK_M = 64
     MIN_SPLIT_WAVE_FILL_NUMERATOR = 9
     MIN_SPLIT_WAVE_FILL_DENOMINATOR = 10
 
@@ -926,15 +928,6 @@ class FA3Scheduler:
             padded_q=padded_q,
         )
 
-        padded_unpacked_tiles = ((max_q + 127) // 128) * batch_size * num_heads
-        padded_packed_tiles = (
-            ((max_q * gqa_ratio + 127) // 128) * batch_size * packed_heads
-        )
-        ragged_unpacked_tiles = ((total_q + 127) // 128 + batch_size - 1) * num_heads
-        ragged_packed_tiles = (
-            (total_q * gqa_ratio + 127) // 128 + batch_size - 1
-        ) * packed_heads
-
         min_prefill_q = config.paged_prefill_min_q
         if min_prefill_q is None:
             min_prefill_q = cls.DEFAULT_PAGED_PREFILL_MIN_Q
@@ -963,6 +956,18 @@ class FA3Scheduler:
         )
         tile_wave = cls._tile_wave
         num_sms = inputs.num_sms
+
+        def tile_waves(
+            query_rows: int, head_groups: int, ragged_extra: int = 0
+        ) -> tuple[TileWave, TileWave]:
+            return tuple(
+                tile_wave(
+                    (_ceil_div(query_rows, block_m) + ragged_extra) * head_groups,
+                    num_sms,
+                )
+                for block_m in (cls.TILE_WAVE_BLOCK_M, cls.FINE_GRAINED_BLOCK_M)
+            )
+
         return FA3InputBucket(
             workload=workload,
             population=population,
@@ -974,10 +979,14 @@ class FA3Scheduler:
                     TMAAlignment.QO_ONLY if inputs.qo_tma_aligned else TMAAlignment.NONE
                 )
             ),
-            padded_unpacked_wave=tile_wave(padded_unpacked_tiles, num_sms),
-            padded_packed_wave=tile_wave(padded_packed_tiles, num_sms),
-            ragged_unpacked_wave=tile_wave(ragged_unpacked_tiles, num_sms),
-            ragged_packed_wave=tile_wave(ragged_packed_tiles, num_sms),
+            padded_unpacked_waves=tile_waves(max_q, batch_size * num_heads),
+            padded_packed_waves=tile_waves(
+                max_q * gqa_ratio, batch_size * packed_heads
+            ),
+            ragged_unpacked_waves=tile_waves(total_q, num_heads, batch_size - 1),
+            ragged_packed_waves=tile_waves(
+                total_q * gqa_ratio, packed_heads, batch_size - 1
+            ),
         )
 
     @classmethod
@@ -1080,7 +1089,9 @@ class FA3Scheduler:
             auto_candidate=bucket.population is QueryPopulation.RAGGED,
         )
 
-        tile_wave = bucket.select_wave(packed=pack_gqa, ragged=ragged_scheduler)
+        tile_wave, fine_tile_wave = bucket.select_waves(
+            packed=pack_gqa, ragged=ragged_scheduler
+        )
         paged_prefill_candidate = (
             has_cache_kv and is_paged and bucket.workload is FA3Workload.PREFILL
         )
@@ -1172,6 +1183,12 @@ class FA3Scheduler:
             causal=is_causal,
             local=is_local,
             tile_wave=tile_wave,
+            # Packed D256 prefill admits BM64 as well as the default BM128.
+            # Use its real wave count so devices with more SMs do not suppress
+            # work stealing solely because the BM128 candidate is under-wave.
+            fine_grained_over=(
+                measured_wide_prefill_pack and fine_tile_wave is TileWave.OVER
+            ),
         )
         if persistent_split_kv:
             # A single compact query population has uniform split work and the
@@ -1312,6 +1329,7 @@ class FA3Scheduler:
         causal: bool,
         local: bool,
         tile_wave: TileWave,
+        fine_grained_over: bool = False,
     ) -> bool:
         if mode not in {"off", "auto", "on"}:
             raise RuntimeError(
@@ -1319,9 +1337,10 @@ class FA3Scheduler:
             )
         if mode == "off":
             return False
+        scheduler_has_multiple_waves = tile_wave is TileWave.OVER or fine_grained_over
         if mode == "on":
-            return tile_wave is TileWave.OVER
-        return (causal or local) and tile_wave is TileWave.OVER
+            return scheduler_has_multiple_waves
+        return (causal or local) and scheduler_has_multiple_waves
 
     @staticmethod
     def select_persistent_paged_gather(
