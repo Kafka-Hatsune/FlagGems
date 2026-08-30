@@ -860,7 +860,7 @@ def test_flash_attn_varlen_fa3_persistent_autotune_key_buckets() -> None:
     } <= set(tuner.keys)
     assert (
         _fa3_scheduling_module().PersistentSchedulingHeuristics.AUTOTUNE_POLICY_VERSION
-        == 17
+        == 20
     )
 
 
@@ -2128,7 +2128,10 @@ def test_flash_attn_varlen_fa3_tiled_extent_policy_matrix() -> None:
         "PAGED_PREFILL_PROFILE": True,
     }
 
-    for positive in ({},):
+    for positive in (
+        {},
+        {"h": 8, "hk": 1, "block_size": 32},
+    ):
         kept = heuristics.prune_autotune_configs(
             configs, {}, **(base | positive)
         )
@@ -2151,7 +2154,6 @@ def test_flash_attn_varlen_fa3_tiled_extent_policy_matrix() -> None:
 
     negative_overrides = (
         {"h": 8, "hk": 1},
-        {"h": 8, "hk": 1, "block_size": 32},
         {"block_size": 32},
         {"block_size": 64},
         {"is_seqused_k": False},
@@ -2408,3 +2410,168 @@ def test_flash_attn_varlen_fa3_s_aux_empty_kv(
     assert torch.count_nonzero(output).item() == 0
     expected_lse = s_aux.float().unsqueeze(1).expand(-1, query_len)
     torch.testing.assert_close(lse, expected_lse, atol=1e-4, rtol=0)
+
+
+@pytest.mark.flash_attn_varlen_func
+def test_flash_attn_varlen_fa3_smem_model_includes_tma_epilogue() -> None:
+    scheduling = _fa3_scheduling_module()
+    heuristics = scheduling.PersistentSchedulingHeuristics
+    d128 = heuristics.make_config(
+        block_m=128,
+        block_n=128,
+        num_buffers_kv=2,
+        num_mma_groups=2,
+        use_tma_qo=True,
+    )
+    d256 = heuristics.make_config(
+        block_m=128,
+        block_n=64,
+        num_buffers_kv=2,
+        num_mma_groups=2,
+        use_tma_qo=True,
+    )
+
+    # D128 unpacked TMA O has 160 KiB explicit Q/K/V plus a 32 KiB
+    # descriptor-store staging tile. Packed GQA reuses Q SMEM instead.
+    assert heuristics.config_smem_bytes(d128, 128, pack_gqa=False) == 192 * 1024
+    assert heuristics.config_smem_bytes(d128, 128, pack_gqa=True) == 160 * 1024
+    # Wide unpacked output takes the register-to-global path and therefore
+    # needs only the explicit 192 KiB Q/K/V payload.
+    assert heuristics.config_smem_bytes(d256, 256, pack_gqa=False) == 192 * 1024
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(not HOPPER_AVAILABLE, reason="FA3 requires an NVIDIA Hopper GPU")
+@torch.inference_mode()
+def test_flash_attn_varlen_fa3_dense_rejects_seqused_k() -> None:
+    q = torch.randn(2, 4, 128, dtype=torch.float16, device=device)
+    k = torch.randn(2, 1, 128, dtype=torch.float16, device=device)
+    v = torch.randn_like(k)
+    cu_seqlens_q = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
+    seqused_k = torch.tensor([1, 1], dtype=torch.int32, device=device)
+
+    with pytest.raises(
+        RuntimeError,
+        match="dense varlen KV requires cu_seqlens_k",
+    ):
+        flag_gems.flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=seqused_k,
+            max_seqlen_q=1,
+            max_seqlen_k=1,
+            causal=True,
+            fa_version=3,
+        )
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(not HOPPER_AVAILABLE, reason="FA3 requires an NVIDIA Hopper GPU")
+@pytest.mark.parametrize(
+    "route,kv_storage_len,split_count,expected_kernel",
+    [
+        pytest.param("direct", 1, 1, "direct_packed_gqa", id="direct"),
+        pytest.param("long", 1, 1, "long_paged_prefill", id="persistent-long"),
+        pytest.param(
+            "long", 2048, 2, "persistent_splitkv_s2", id="persistent-split"
+        ),
+    ],
+)
+@torch.inference_mode()
+def test_flash_attn_varlen_fa3_empty_kv_lse_is_negative_inf(
+    monkeypatch,
+    route: str,
+    kv_storage_len: int,
+    split_count: int,
+    expected_kernel: str,
+) -> None:
+    FA3Scheduler, plans = _capture_fa3_plans(monkeypatch)
+    (
+        query,
+        key_cache,
+        value_cache,
+        cu_query_lens,
+        seqused_k,
+        block_tables,
+        _,
+        scale,
+    ) = _make_fa3_s_aux_case(query_len=2, kv_len=kv_storage_len)
+    seqused_k.zero_()
+
+    monkeypatch.setenv("FLAG_GEMS_FA3_TLE_DECODE_STRATEGY", route)
+    monkeypatch.setenv("FLAG_GEMS_FA3_TLE_RAGGED_GQA_PACK", "on")
+    monkeypatch.setenv("FLAG_GEMS_FA3_TLE_MIXED_EXPERIMENT", "off")
+    monkeypatch.setenv("FLAG_GEMS_FA3_TLE_DYNAMIC_SCHEDULER", "off")
+    monkeypatch.setenv("FLAG_GEMS_FA3_TLE_EXPERIMENT_DYNAMIC_SPLIT", "1")
+    FA3Scheduler.clear_config_cache()
+    try:
+        output, lse = flag_gems.flash_attn_varlen_func(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=seqused_k,
+            max_seqlen_q=2,
+            max_seqlen_k=kv_storage_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=(-1, -1),
+            block_table=block_tables,
+            return_softmax_lse=True,
+            num_splits=split_count,
+            fa_version=3,
+        )
+    finally:
+        FA3Scheduler.clear_config_cache()
+
+    assert [_plan_signature(plan) for plan in plans] == [
+        (expected_kernel, split_count)
+    ]
+    assert torch.count_nonzero(output).item() == 0
+    assert torch.isneginf(lse).all()
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(not HOPPER_AVAILABLE, reason="FA3 requires an NVIDIA Hopper GPU")
+@torch.inference_mode()
+def test_flash_attn_varlen_fa3_dense_d256_avoids_epilogue_smem_oor(
+    monkeypatch,
+) -> None:
+    q_lens = [5, 80, 129]
+    k_lens = [2, 79, 193]
+    q = torch.randn(sum(q_lens), 4, 256, dtype=torch.float16, device=device)
+    k = torch.randn(sum(k_lens), 1, 256, dtype=torch.float16, device=device)
+    v = torch.randn_like(k)
+    cu_seqlens_q = torch.tensor(
+        [0] + q_lens, dtype=torch.int32, device=device
+    ).cumsum(0, dtype=torch.int32)
+    cu_seqlens_k = torch.tensor(
+        [0] + k_lens, dtype=torch.int32, device=device
+    ).cumsum(0, dtype=torch.int32)
+
+    monkeypatch.setenv("FLAG_GEMS_FA3_TLE_MIXED_EXPERIMENT", "off")
+    monkeypatch.setenv("FLAG_GEMS_FA3_TLE_DYNAMIC_SCHEDULER", "off")
+    scheduling = _fa3_scheduling_module()
+    scheduling.FA3Scheduler.clear_config_cache()
+    try:
+        output, lse = flag_gems.flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max(q_lens),
+            max_seqlen_k=max(k_lens),
+            causal=True,
+            return_softmax_lse=True,
+            num_splits=1,
+            fa_version=3,
+        )
+    finally:
+        scheduling.FA3Scheduler.clear_config_cache()
+
+    assert torch.isfinite(output).all()
+    assert not torch.isnan(lse).any()
+    assert torch.isneginf(lse).any()

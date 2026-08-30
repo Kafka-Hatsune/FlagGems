@@ -517,7 +517,7 @@ def flash_varlen_fwd_v3_tle_direct_kernel(
         if STORE_LSE:
             lse = tl.where(
                 invalid,
-                float("-inf") if is_s_aux else float("inf"),
+                float("-inf"),
                 rowmax * scale_softmax + tl.log(rowsum),
             )
             lse_ptr = softmax_lse_ptr + query_head * total_q + lse_offset + row_idx_q

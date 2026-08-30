@@ -249,7 +249,7 @@ def launch_fa3(
                 paged_gather_mode=plan.paged_gather_mode,
                 paged_kv_non_tma=plan.paged_kv_non_tma,
                 exact_paged_kv_tiles=False,
-                ragged_scheduler=True,
+                ragged_scheduler=plan.ragged_scheduler,
                 is_paged=is_paged,
                 is_causal=is_causal,
                 is_local=is_local,

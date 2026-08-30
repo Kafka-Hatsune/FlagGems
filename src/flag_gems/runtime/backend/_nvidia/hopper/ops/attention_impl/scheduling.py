@@ -1987,8 +1987,14 @@ class PersistentSchedulingHeuristics:
     # the obsolete paged-pipe switch now that every exact tiled stage uses the
     # same atom-copy producer representation.  Version 17 uses quantile-aware
     # selection and a compact-N tie break instead of persisting a noisy p50
-    # winner for the spill-sensitive D256 path.
-    AUTOTUNE_POLICY_VERSION = 17
+    # winner for the spill-sensitive D256 path.  Version 18 expands the
+    # explicit wide Split-KV search space.
+    # Version 20 invalidates compact active-N timings recorded while N80 was
+    # lowered as five N16 WGMMA fragments.  Panel-major exact SMEM now emits
+    # one native N80 instruction and its fragment page-state supports page32
+    # crossings, so reusing the old candidate set would preserve a stale N64
+    # winner after the compiler fix.
+    AUTOTUNE_POLICY_VERSION = 20
     DEFAULT_BLOCK_M = 128
     DEFAULT_NUM_MMA_GROUPS = 2
     DEFAULT_NUM_Q_BUFFERS = 1
@@ -2364,7 +2370,9 @@ class PersistentSchedulingHeuristics:
         return configs
 
     @staticmethod
-    def config_smem_bytes(config, head_dim: int) -> int:
+    def config_smem_bytes(
+        config, head_dim: int, *, pack_gqa: bool = False
+    ) -> int:
         block_k = _next_power_of_2(head_dim)
         block_m = config.kwargs["BLOCK_M"]
         block_n = config.kwargs["ACTIVE_WGMMA_N"]
@@ -2372,7 +2380,19 @@ class PersistentSchedulingHeuristics:
         bm_split = block_m // num_groups
         q_elems = config.kwargs["Q_STAGE_CAPACITY"] * bm_split * block_k
         kv_elems = 2 * config.kwargs["NUM_BUFFERS_KV"] * block_n * block_k
-        return (q_elems + kv_elems) * 2
+        # TensorDescriptor.store(register_tensor) uses an implicit shared
+        # staging tile for each consumer.  Packed GQA explicitly reuses Q
+        # SMEM, while wide unpacked D256 takes the direct global-store path.
+        implicit_o_elems = 0
+        if (
+            config.kwargs["USE_TMA_QO"]
+            and block_k < 256
+            and not (
+                pack_gqa and config.kwargs.get("REUSE_Q_SMEM_O", False)
+            )
+        ):
+            implicit_o_elems = num_groups * bm_split * block_k
+        return (q_elems + kv_elems + implicit_o_elems) * 2
 
     @classmethod
     def use_dense_kv_tma(
@@ -2506,6 +2526,10 @@ class PersistentSchedulingHeuristics:
                 not is_paged
                 or not paged_kv_non_tma
                 or config.kwargs["ACTIVE_WGMMA_N"] % block_size == 0
+                or (
+                    tiled_extent_policy
+                    and config.kwargs["ACTIVE_WGMMA_N"] != config.kwargs["BLOCK_N"]
+                )
             )
 
         def smem_compatible(config):
@@ -2515,7 +2539,10 @@ class PersistentSchedulingHeuristics:
                 != config.kwargs["BLOCK_N"]
                 else 220 * 1024
             )
-            return cls.config_smem_bytes(config, head_dim) <= budget
+            return (
+                cls.config_smem_bytes(config, head_dim, pack_gqa=pack_gqa)
+                <= budget
+            )
 
         def selected_shape_config(config):
             stagger_kv = config.kwargs.get("STAGGER_KV", False)

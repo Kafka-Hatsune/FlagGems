@@ -377,16 +377,28 @@ def _validate_argument_relationships(
             "alibi_slopes must be last-dimension-contiguous fp32 with shape "
             "(num_heads,) or (batch_size, num_heads) on the Q device"
         )
-    if (cu_seqlens_k is None) == (seqused_k is None):
-        raise RuntimeError("exactly one of cu_seqlens_k and seqused_k is required")
-    if cu_seqlens_k is not None and cu_seqlens_k.shape != (batch_size + 1,):
-        raise RuntimeError("cu_seqlens_k must match cu_seqlens_q's batch layout")
-    if seqused_k is not None and seqused_k.shape != (batch_size,):
-        raise RuntimeError("seqused_k must be a contiguous int32 Q-device batch vector")
-    if is_paged and (seqused_k is None or block_table.size(0) != batch_size):
-        raise RuntimeError(
-            "paged KV requires seqused_k and one block-table row per sequence"
-        )
+    if is_paged:
+        if (
+            seqused_k is None
+            or cu_seqlens_k is not None
+            or block_table.size(0) != batch_size
+        ):
+            raise RuntimeError(
+                "paged KV requires seqused_k, no cu_seqlens_k, and one "
+                "block-table row per sequence"
+            )
+        if seqused_k.shape != (batch_size,):
+            raise RuntimeError(
+                "seqused_k must be a contiguous int32 Q-device batch vector"
+            )
+    else:
+        if cu_seqlens_k is None or seqused_k is not None:
+            raise RuntimeError(
+                "dense varlen KV requires cu_seqlens_k and does not accept "
+                "seqused_k"
+            )
+        if cu_seqlens_k.shape != (batch_size + 1,):
+            raise RuntimeError("cu_seqlens_k must match cu_seqlens_q's batch layout")
     if is_paged:
         block_size = k.size(1)
         if block_size < 16 or block_size & (block_size - 1):
