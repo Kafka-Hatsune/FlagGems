@@ -1877,7 +1877,10 @@ class PersistentSchedulingHeuristics:
     # one native N80 instruction and its fragment page-state supports page32
     # crossings, so reusing the old candidate set would preserve a stale N64
     # winner after the compiler fix.
-    AUTOTUNE_POLICY_VERSION = 20
+    # Version 21 admits native-N80 for the explicit wide Split-KV schedule.
+    # Invalidate cached group-2 winners so the newly legal candidate is
+    # measured instead of silently retaining an older N64/N128 choice.
+    AUTOTUNE_POLICY_VERSION = 21
     DEFAULT_BLOCK_M = 128
     DEFAULT_NUM_MMA_GROUPS = 2
     DEFAULT_NUM_Q_BUFFERS = 1
@@ -2386,8 +2389,11 @@ class PersistentSchedulingHeuristics:
             and is_causal
             and not (is_local or is_alibi or is_softcap)
         )
+        tiled_extent_profile = (
+            wide_paged_prefill_packgqa_ws or explicit_wide_split_ws
+        )
         tiled_extent_policy = (
-            wide_paged_prefill_packgqa_ws
+            tiled_extent_profile
             and num_heads is not None
             and num_heads_k not in (None, 0)
             and (block_size, num_heads // num_heads_k) in {(16, 4), (32, 8)}
@@ -2465,7 +2471,16 @@ class PersistentSchedulingHeuristics:
             if explicit_wide_split_ws:
                 group2 = (
                     config.kwargs["BLOCK_M"] == 128
-                    and config.kwargs["BLOCK_N"] == 64
+                    and (
+                        (
+                            config.kwargs["BLOCK_N"] == 64
+                            and not tiled_extent
+                        )
+                        or (
+                            config.kwargs["BLOCK_N"] == 128
+                            and tiled_extent
+                        )
+                    )
                     and config.kwargs["NUM_BUFFERS_KV"] == 2
                     and config.kwargs["NUM_MMA_GROUPS"] == 2
                     and config.kwargs["USE_TMA_QO"]
@@ -2477,6 +2492,7 @@ class PersistentSchedulingHeuristics:
                     and config.kwargs["NUM_MMA_GROUPS"] == 1
                     and not config.kwargs["USE_TMA_QO"]
                     and not stagger_kv
+                    and not tiled_extent
                 )
                 return group2 or group1
             if wide_paged_prefill_packgqa_ws:

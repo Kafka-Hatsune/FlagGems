@@ -860,7 +860,7 @@ def test_flash_attn_varlen_fa3_persistent_autotune_key_buckets() -> None:
     } <= set(tuner.keys)
     assert (
         _fa3_scheduling_module().PersistentSchedulingHeuristics.AUTOTUNE_POLICY_VERSION
-        == 20
+        == 21
     )
 
 
@@ -2189,6 +2189,11 @@ def test_flash_attn_varlen_fa3_tiled_extent_policy_matrix() -> None:
     for positive in (
         {},
         {"h": 8, "hk": 1, "block_size": 32},
+        {
+            "SPLIT_KV": True,
+            "PAGED_PREFILL_PROFILE": False,
+            "RAGGED_SCHEDULER": True,
+        },
     ):
         kept = heuristics.prune_autotune_configs(
             configs, {}, **(base | positive)
@@ -2223,7 +2228,6 @@ def test_flash_attn_varlen_fa3_tiled_extent_policy_matrix() -> None:
         {"is_paged": False},
         {"PAGED_KV_NON_TMA": False},
         {"PACK_GQA": False},
-        {"SPLIT_KV": True},
         {"PAGED_PREFILL_PROFILE": False},
     )
     for override in negative_overrides:

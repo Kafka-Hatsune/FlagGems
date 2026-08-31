@@ -577,20 +577,30 @@ def _copy_paged_kv_tile_to_pipe(
     cols = tl.arange(0, HEAD_DIM_PADDED)
     fragment = rows // FRAGMENT_N
     row_in_fragment = rows % FRAGMENT_N
-    cache_idx = rows.to(tl.int64) * 0
-    for fragment_idx in tl.static_range(0, NUM_FRAGMENTS):
+
+    # Seed the first logical fragment directly and select only the remaining
+    # ones.  Carrier rows beyond BLOCK_N intentionally keep this address as a
+    # don't-care value: logical-domain planning never extracts or lowers them.
+    cache_idx = cache_state[0] + row_in_fragment
+    for fragment_idx in tl.static_range(1, NUM_FRAGMENTS):
         cache_idx = tl.where(
             fragment == fragment_idx,
             cache_state[fragment_idx] + row_in_fragment,
             cache_idx,
         )
+
     logical_idx = n_offset + rows
     src_ptrs = src_base + cache_idx[:, None] * row_stride + cols[None, :]
-    copy_mask = rows[:, None] < BLOCK_N
     if BOUNDARY_CHECK:
-        copy_mask &= logical_idx[:, None] < k_len
+        copy_mask = logical_idx[:, None] < k_len
+    else:
+        copy_mask = None
     if d != HEAD_DIM_PADDED:
-        copy_mask &= cols[None, :] < d
+        col_mask = cols[None, :] < d
+        if BOUNDARY_CHECK:
+            copy_mask &= col_mask
+        else:
+            copy_mask = col_mask
     tle.gpu.copy(
         src_ptrs,
         slot.kv,
