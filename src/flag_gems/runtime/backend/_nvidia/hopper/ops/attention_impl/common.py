@@ -220,36 +220,57 @@ def _paged_tile_cache_state(
         and (block_size & (block_size - 1)) == 0,
         "paged KV block_size must be a power of two and at least 16",
     )
-    tl.static_assert(
-        BLOCK_N % block_size == 0,
-        "paged KV BLOCK_N must be divisible by block_size",
-    )
     page_stride_rows = page_stride_rows.to(tl.int64)
     cache_bases = tl.tuple(())
-    NUM_PAGE_ENTRIES: tl.constexpr = BLOCK_N // block_size
-    first_page = n_start // block_size
     FRAGMENTS_PER_PAGE: tl.constexpr = block_size // FRAGMENT_N
-    page_blocks = tl.tuple(())
-    for page_entry in tl.static_range(0, NUM_PAGE_ENTRIES):
-        page_logical_start = n_start + page_entry * block_size
-        if BOUNDARY_CHECK:
-            page_block = tl.load(
-                page_table_ptr + first_page + page_entry,
-                mask=page_logical_start < max_virtual_index,
-                other=0,
-            ).to(tl.int32)
-        else:
-            page_block = tl.load(
-                page_table_ptr + first_page + page_entry
-            ).to(tl.int32)
-        page_blocks += (page_block,)
+    if BLOCK_N % block_size == 0:
+        # Power-of-two extents start on a page boundary.  Load each page-table
+        # entry once and reuse it for all N16 fragments inside that page.
+        NUM_PAGE_ENTRIES: tl.constexpr = BLOCK_N // block_size
+        first_page = n_start // block_size
+        page_blocks = tl.tuple(())
+        for page_entry in tl.static_range(0, NUM_PAGE_ENTRIES):
+            page_logical_start = n_start + page_entry * block_size
+            if BOUNDARY_CHECK:
+                page_block = tl.load(
+                    page_table_ptr + first_page + page_entry,
+                    mask=page_logical_start < max_virtual_index,
+                    other=0,
+                ).to(tl.int32)
+            else:
+                page_block = tl.load(
+                    page_table_ptr + first_page + page_entry
+                ).to(tl.int32)
+            page_blocks += (page_block,)
 
-    for fragment in tl.static_range(0, NUM_FRAGMENTS):
-        fragment_page = page_blocks[fragment // FRAGMENTS_PER_PAGE]
-        cache_bases += (
-            fragment_page * page_stride_rows
-            + fragment % FRAGMENTS_PER_PAGE * FRAGMENT_N,
-        )
+        for fragment in tl.static_range(0, NUM_FRAGMENTS):
+            fragment_page = page_blocks[fragment // FRAGMENTS_PER_PAGE]
+            cache_bases += (
+                fragment_page * page_stride_rows
+                + fragment % FRAGMENTS_PER_PAGE * FRAGMENT_N,
+            )
+    else:
+        # Compact logical extents such as N80 can start halfway through a
+        # page32 block on alternating iterations.  Every N16 fragment remains
+        # page-contained, so resolve its own page and in-page offset without
+        # imposing ACTIVE_WGMMA_N % block_size == 0.
+        for fragment in tl.static_range(0, NUM_FRAGMENTS):
+            fragment_logical_start = n_start + fragment * FRAGMENT_N
+            fragment_page = fragment_logical_start // block_size
+            if BOUNDARY_CHECK:
+                page_block = tl.load(
+                    page_table_ptr + fragment_page,
+                    mask=fragment_logical_start < max_virtual_index,
+                    other=0,
+                ).to(tl.int32)
+            else:
+                page_block = tl.load(
+                    page_table_ptr + fragment_page
+                ).to(tl.int32)
+            cache_bases += (
+                page_block * page_stride_rows
+                + fragment_logical_start % block_size,
+            )
     return cache_bases
 
 
@@ -538,16 +559,12 @@ def _copy_paged_kv_tile_to_pipe(
     iteration,
     src_base,
     row_stride,
-    page_table_ptr_b,
     n_offset,
     k_len,
     d: tl.constexpr,
-    block_size: tl.constexpr,
-    page_stride_rows,
     cache_state,
     BLOCK_N: tl.constexpr,
     HEAD_DIM_PADDED: tl.constexpr,
-    PAGED_GATHER_MODE: tl.constexpr = 2,
     BOUNDARY_CHECK: tl.constexpr = True,
 ):
     """Publish any paged KV tile through a cp.async-capable TLE pipe."""
@@ -560,20 +577,30 @@ def _copy_paged_kv_tile_to_pipe(
     cols = tl.arange(0, HEAD_DIM_PADDED)
     fragment = rows // FRAGMENT_N
     row_in_fragment = rows % FRAGMENT_N
-    cache_idx = rows.to(tl.int64) * 0
-    for fragment_idx in tl.static_range(0, NUM_FRAGMENTS):
+
+    # Seed the first logical fragment directly and select only the remaining
+    # ones.  Carrier rows beyond BLOCK_N intentionally keep this address as a
+    # don't-care value: logical-domain planning never extracts or lowers them.
+    cache_idx = cache_state[0] + row_in_fragment
+    for fragment_idx in tl.static_range(1, NUM_FRAGMENTS):
         cache_idx = tl.where(
             fragment == fragment_idx,
             cache_state[fragment_idx] + row_in_fragment,
             cache_idx,
         )
+
     logical_idx = n_offset + rows
     src_ptrs = src_base + cache_idx[:, None] * row_stride + cols[None, :]
-    copy_mask = rows[:, None] < BLOCK_N
     if BOUNDARY_CHECK:
-        copy_mask &= logical_idx[:, None] < k_len
+        copy_mask = logical_idx[:, None] < k_len
+    else:
+        copy_mask = None
     if d != HEAD_DIM_PADDED:
-        copy_mask &= cols[None, :] < d
+        col_mask = cols[None, :] < d
+        if BOUNDARY_CHECK:
+            copy_mask &= col_mask
+        else:
+            copy_mask = col_mask
     tle.gpu.copy(
         src_ptrs,
         slot.kv,
@@ -717,80 +744,7 @@ def _copy_packed_gqa_tile_to_smem(
         [BLOCK_ROWS, HEAD_DIM_PADDED],
         mask=mask,
         other=0.0,
-        # api args,
     )
-
-
-@triton.jit
-def _copy_dense_q_tile_to_pipe(
-    writer,
-    iteration,
-    src_base,
-    row_stride,
-    row_offset,
-    row_count,
-    d: tl.constexpr,
-    BLOCK_ROWS: tl.constexpr,
-    HEAD_DIM_PADDED: tl.constexpr,
-):
-    """Acquire, copy, and publish one contiguous query tile asynchronously."""
-
-    slot = writer.acquire(iteration)
-    rows = tl.arange(0, BLOCK_ROWS)
-    cols = tl.arange(0, HEAD_DIM_PADDED)
-    logical_rows = row_offset + rows
-    src_ptrs = src_base + logical_rows[:, None] * row_stride + cols[None, :]
-    mask = (logical_rows[:, None] < row_count) & (cols[None, :] < d)
-    tle.gpu.copy(
-        src_ptrs,
-        slot.q,
-        [BLOCK_ROWS, HEAD_DIM_PADDED],
-        mask=mask,
-        other=0.0,
-    )
-    writer.commit(iteration)
-
-
-@triton.jit
-def _copy_packed_gqa_q_tile_to_pipe(
-    writer,
-    iteration,
-    q_ptr,
-    q_offset,
-    q_row_stride,
-    q_head_stride,
-    kv_head,
-    packed_row_offset,
-    q_len,
-    d: tl.constexpr,
-    GQA_RATIO: tl.constexpr,
-    BLOCK_ROWS: tl.constexpr,
-    HEAD_DIM_PADDED: tl.constexpr,
-):
-    """Acquire, pack, and publish one GQA query tile asynchronously."""
-
-    slot = writer.acquire(iteration)
-    rows = tl.arange(0, BLOCK_ROWS)
-    cols = tl.arange(0, HEAD_DIM_PADDED)
-    packed_rows = packed_row_offset + rows
-    query_rows = packed_rows // GQA_RATIO
-    query_heads = kv_head * GQA_RATIO + packed_rows % GQA_RATIO
-    src_ptrs = (
-        q_ptr
-        + q_offset
-        + query_rows[:, None] * q_row_stride
-        + query_heads[:, None] * q_head_stride
-        + cols[None, :]
-    )
-    mask = (packed_rows[:, None] < q_len * GQA_RATIO) & (cols[None, :] < d)
-    tle.gpu.copy(
-        src_ptrs,
-        slot.q,
-        [BLOCK_ROWS, HEAD_DIM_PADDED],
-        mask=mask,
-        other=0.0,
-    )
-    writer.commit(iteration)
 
 
 @triton.jit
