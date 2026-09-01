@@ -984,61 +984,74 @@ class LibTuner(triton.runtime.Autotuner):
             config_key = self.get_key(_args)
             benchmark_key = self.get_benchmark_key(_args)
             if bypass_config_cache or config_key not in self.cache:
-                cache: BenchmarkCache = libcache[
-                    self.benchmark_table_name, benchmark_key
-                ]
                 # prune configs
-                used_cached_result = False
-                pruned_configs = self.prune_configs(kwargs)
-                bench_start = time.time()
-
-                def bench(config: triton.Config) -> List[float]:
-                    ret = cache.get(config)
-                    if ret is None:
-                        ret = self._bench(*args, config=config, **kwargs)
-                        # Some Triton backends (e.g. tsingmicro with
-                        # use_cuda_graph=True) return a scalar float from
-                        # _bench instead of the standard (p50, p20, p80) tuple.
-                        # Normalize to a 3-element tuple for compatibility with
-                        # SQLPersistantModel.put_benchmark and other consumers.
-                        if isinstance(ret, (int, float)):
-                            ret = (ret, ret, ret)
-                        if ret and all(math.isfinite(float(value)) for value in ret):
-                            self.benchmark_success_count += 1
-                        cache[config] = tuple(ret)
-                    else:
-                        self.benchmark_cache_hit_count += 1
-                    return list(ret)
-
-                if exhaustive_collection:
-                    best_config, timings = LibTuner.get("default").policy(
-                        self,
-                        bench,
-                        pruned_configs,
-                        args,
-                        kwargs,
-                    )
-                else:
-                    best_config, timings = self.policy(
-                        bench,
-                        pruned_configs,
-                        args,
-                        kwargs,
-                    )
-                bench_end = time.time()
-                self.bench_time = bench_end - bench_start
-                if not bypass_config_cache:
-                    self.cache[config_key] = best_config
+                pruned_configs = list(self.prune_configs(kwargs))
+                if not bypass_config_cache and len(pruned_configs) == 1:
+                    # A structural pruner has already made the choice.  Avoid
+                    # constructing a BenchmarkCache or timing a candidate that
+                    # has no competitor, while still populating ConfigCache so
+                    # later launches follow the normal cache-hit path.
+                    config = pruned_configs[0]
+                    self.cache[config_key] = config
                     config = self.cache[config_key]
+                    self.bench_time = 0.0
+                    self.configs_timings = {}
                 else:
-                    config = best_config
+                    cache: BenchmarkCache = libcache[
+                        self.benchmark_table_name, benchmark_key
+                    ]
+                    used_cached_result = False
+                    bench_start = time.time()
+
+                    def bench(config: triton.Config) -> List[float]:
+                        ret = cache.get(config)
+                        if ret is None:
+                            ret = self._bench(*args, config=config, **kwargs)
+                            # Some Triton backends (e.g. tsingmicro with
+                            # use_cuda_graph=True) return a scalar float from
+                            # _bench instead of the standard (p50, p20, p80) tuple.
+                            # Normalize to a 3-element tuple for compatibility with
+                            # SQLPersistantModel.put_benchmark and other consumers.
+                            if isinstance(ret, (int, float)):
+                                ret = (ret, ret, ret)
+                            if ret and all(
+                                math.isfinite(float(value)) for value in ret
+                            ):
+                                self.benchmark_success_count += 1
+                            cache[config] = tuple(ret)
+                        else:
+                            self.benchmark_cache_hit_count += 1
+                        return list(ret)
+
+                    if exhaustive_collection:
+                        best_config, timings = LibTuner.get("default").policy(
+                            self,
+                            bench,
+                            pruned_configs,
+                            args,
+                            kwargs,
+                        )
+                    else:
+                        best_config, timings = self.policy(
+                            bench,
+                            pruned_configs,
+                            args,
+                            kwargs,
+                        )
+                    bench_end = time.time()
+                    self.bench_time = bench_end - bench_start
+                    if not bypass_config_cache:
+                        self.cache[config_key] = best_config
+                        config = self.cache[config_key]
+                    else:
+                        config = best_config
+                    self.configs_timings = timings
                 full_nargs = {
                     **self.nargs,
                     **kwargs,
                     **config.all_kwargs(),
                 }
                 self.pre_hook(full_nargs, reset_only=True)
-                self.configs_timings = timings
             else:
                 config = self.cache[config_key]
             if config.pre_hook is None:

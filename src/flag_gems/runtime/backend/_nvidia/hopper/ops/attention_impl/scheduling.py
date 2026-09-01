@@ -1887,6 +1887,7 @@ class DirectSchedulingHeuristics:
         paged_kv_non_tma = kwargs.get(
             "PAGED_KV_NON_TMA", nargs.get("PAGED_KV_NON_TMA", True)
         )
+        pack_gqa = kwargs.get("PACK_GQA", nargs.get("PACK_GQA", False))
         block_size = kwargs.get("block_size", nargs.get("block_size", 1))
 
         # Cold-cache autotuning favors BM64/BN64 for this serving regime, but
@@ -1914,6 +1915,33 @@ class DirectSchedulingHeuristics:
                 if config.kwargs == {"BLOCK_M": 32, "BLOCK_N": 128}
                 and config.num_warps == 4
                 and config.num_stages == 2
+            ]
+            if measured:
+                return measured
+
+        # Cross-device exhaustive measurements agree on a complementary mapping
+        # for compact-page D256 packed decode: page32 favors 4 warps while page16
+        # favors 8 warps.  Every BN128 and every extra pipeline stage was strictly
+        # dominated on both H100 and H800.  Selecting the measured winner by page
+        # size also avoids a noisy two-way cold tune that can choose the slower
+        # steady-state configuration.
+        paged_d256_packed_decode = (
+            shape_bucket == cls.PAGED_DECODE_BUCKET
+            and is_paged
+            and paged_kv_non_tma
+            and pack_gqa
+            and head_dim == 256
+            and max_seqlen_q == 1
+            and block_size in (16, 32)
+        )
+        if paged_d256_packed_decode:
+            measured_num_warps = 8 if block_size == 16 else 4
+            measured = [
+                config
+                for config in configs
+                if config.kwargs == {"BLOCK_M": 16, "BLOCK_N": 64}
+                and config.num_warps == measured_num_warps
+                and config.num_stages == 1
             ]
             if measured:
                 return measured

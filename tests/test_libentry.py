@@ -1137,6 +1137,46 @@ def test_benchmark_success_count_tracks_finite_uncached_benchmarks(monkeypatch):
     assert tuner._last_benchmark_meta == {}
     assert tuner._run_mode is LibTunerRunMode.NORMAL
 
+    # A multi-config tuner whose structural pruner leaves one candidate should
+    # select and cache it without touching BenchmarkCache or the policy.
+    tuner.configs = configs
+    tuner.prune_configs = lambda _kwargs: [configs[1]]
+    config_cache.values.clear()
+    config_cache.reset_access_counts()
+    policy_calls = tuner.policy_call_count
+
+    class UnexpectedLibCache:
+        def __getitem__(self, _key):
+            raise AssertionError("singleton-pruned normal run must not benchmark")
+
+    monkeypatch.setattr(libentry_mod, "libcache", UnexpectedLibCache())
+    LibTuner.run(tuner, 32)
+    assert tuner.best_config is configs[1]
+    assert tuner.bench_time == 0.0
+    assert tuner.configs_timings == {}
+    assert tuner.benchmark_success_count == 0
+    assert tuner.benchmark_cache_hit_count == 0
+    assert tuner.policy_call_count == policy_calls
+    assert config_cache.values == {(32,): configs[1]}
+
+    # Explicit collection modes intentionally retain their old semantics: even
+    # one pruned candidate is measured and recorded as an offline label.
+    benchmark_cache.values.clear()
+    config_cache.reset_access_counts()
+    monkeypatch.setattr(libentry_mod, "libcache", FakeLibCache())
+    with LibTuner.use_run_mode(tuner, LibTunerRunMode.EXHAUSTIVE_COLLECTION):
+        LibTuner.run(tuner, 32)
+    assert tuner.best_config is configs[1]
+    assert tuner.benchmark_success_count == 1
+    assert tuner.benchmark_cache_hit_count == 0
+    assert len(tuner.configs_timings) == 1
+    assert config_cache.values == {(32,): configs[1]}
+    assert (
+        config_cache.contains_count,
+        config_cache.getitem_count,
+        config_cache.setitem_count,
+    ) == (0, 0, 0)
+
 
 def test_benchmark_key_preserves_raw_shape_and_scopes_timing_protocol(monkeypatch):
     """Keep ConfigCache bucketing while separating exact benchmark labels."""

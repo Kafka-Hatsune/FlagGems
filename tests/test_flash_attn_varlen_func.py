@@ -735,6 +735,63 @@ def _plan_signature(plan) -> Tuple[str, int]:
 
 
 @pytest.mark.flash_attn_varlen_func
+def test_flash_attn_varlen_fa3_d256_packed_decode_autotune_candidates(
+    monkeypatch,
+) -> None:
+    scheduling = _fa3_scheduling_module()
+    heuristics = scheduling.DirectSchedulingHeuristics
+    for name in (
+        "FLAG_GEMS_FA3_TLE_EXPERIMENT_DIRECT_BLOCK_N",
+        "FLAG_GEMS_FA3_TLE_EXPERIMENT_DIRECT_NUM_WARPS",
+        "FLAG_GEMS_FA3_TLE_EXPERIMENT_DIRECT_NUM_STAGES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    configs = heuristics.autotune_configs()
+    base = {
+        "d": 256,
+        "b": 40,
+        "h": 8,
+        "hk": 2,
+        "h_hk_ratio": 4,
+        "seqlen_q": 1,
+        "seqlen_k": 32,
+        "total_q": 40,
+        "is_paged": True,
+        "block_size": 16,
+        "DIRECT_SHAPE_BUCKET": heuristics.PAGED_DECODE_BUCKET,
+        "PAGED_KV_NON_TMA": True,
+        "PACK_GQA": True,
+        "RAGGED_SCHEDULER": False,
+    }
+    for block_size, expected_num_warps in ((16, 8), (32, 4)):
+        kept = heuristics.prune_autotune_configs(
+            configs, {}, **(base | {"block_size": block_size})
+        )
+        assert [
+            (
+                config.kwargs["BLOCK_M"],
+                config.kwargs["BLOCK_N"],
+                config.num_warps,
+                config.num_stages,
+            )
+            for config in kept
+        ] == [(16, 64, expected_num_warps, 1)]
+
+    # The measured reduction is deliberately scoped to packed, non-TMA D256
+    # decode with the compact page sizes used by the serving path.
+    for override in (
+        {"PACK_GQA": False},
+        {"d": 128},
+        {"block_size": 64},
+    ):
+        unscoped = heuristics.prune_autotune_configs(
+            configs, {}, **(base | override)
+        )
+        assert len(unscoped) > 2, override
+
+
+@pytest.mark.flash_attn_varlen_func
 @pytest.mark.parametrize(
     (
         "max_seqlen_q,head_dim,total_q,batch_size,explicit_split_k_chunk,"
