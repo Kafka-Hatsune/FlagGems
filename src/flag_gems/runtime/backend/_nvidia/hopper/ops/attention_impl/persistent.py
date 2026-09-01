@@ -35,7 +35,6 @@ from .common import (
     _copy_packed_gqa_tile_to_smem,
     _copy_paged_kv_tile_to_pipe,
     _copy_paged_kv_tma_tile_to_pipe,
-    _fence_async_shared_cta,
     _make_dense_kv_descriptor,
     _make_paged_kv_descriptor,
     _merge_attention_sink,
@@ -48,7 +47,7 @@ from .common import (
     _split_n_block_range,
     _store_packed_gqa_tile_from_regs,
 )
-from .scheduling import CommonSchedulingHeuristics, PersistentSchedulingHeuristics
+from .kernel_config import CommonSchedulingHeuristics, PersistentSchedulingHeuristics
 from .validation import tle
 
 _prune_persistent_configs = PersistentSchedulingHeuristics.prune_autotune_configs
@@ -150,18 +149,6 @@ def _persistent_configs():
     )
 
 
-@libentry()
-@triton.jit
-def _reset_scheduler_counter_kernel(counter_ptr):
-    """Reset the persistent scheduler ticket on the current stream."""
-
-    tl.store(counter_ptr, 0)
-
-
-def _reset_scheduler_counter(counter):
-    _reset_scheduler_counter_kernel[(1,)](counter, num_warps=1)
-
-
 @triton.jit
 def _flash_varlen_fwd_v3_tle_persistent_producer_body(
     q_ptr,
@@ -243,7 +230,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer_body(
             hid,
             split_id,
             split_count,
-            total_split_tiles,
             work_valid,
         ) = _ragged_persistent_split_tile_coords(
             tile_idx,
@@ -475,7 +461,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer_body(
                         BM_SPLIT,
                         HEAD_DIM_PADDED,
                     )
-                    _fence_async_shared_cta()
                     tle.gpu.barrier_arrive(q_fulls_manual[q0_idx], phaseIdx=q_phase_idx)
                 else:
                     tle.gpu.barrier_wait(q_empties[q0_idx], phaseIdx=q_phase_idx)
@@ -489,7 +474,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer_body(
                         BM_SPLIT,
                         HEAD_DIM_PADDED,
                     )
-                    _fence_async_shared_cta()
                     tle.gpu.barrier_arrive(q_fulls_manual[q0_idx], phaseIdx=q_phase_idx)
 
                 kv_offset = n_block_min * ACTIVE_WGMMA_N
@@ -589,7 +573,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer_body(
                             BM_SPLIT,
                             HEAD_DIM_PADDED,
                         )
-                        _fence_async_shared_cta()
                         tle.gpu.barrier_arrive(
                             q_fulls_manual[q1_idx], phaseIdx=q_phase_idx
                         )
@@ -605,7 +588,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer_body(
                             BM_SPLIT,
                             HEAD_DIM_PADDED,
                         )
-                        _fence_async_shared_cta()
                         tle.gpu.barrier_arrive(
                             q_fulls_manual[q1_idx], phaseIdx=q_phase_idx
                         )
@@ -866,12 +848,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer_body(
                 scope="gpu",
             )
             claimed = tl.sum(tl.where(scheduler_lane == 0, claimed, 0), axis=0)
-            if SPLIT_KV:
-                # The metadata semaphore persists across CUDA Graph replay.
-                # Exactly one claim is made per compact work item, so reducing
-                # the monotonic ticket modulo the compact work count removes a
-                # separate memset launch from every attention invocation.
-                claimed %= total_split_tiles
             tile_idx = claimed + num_progs
             tle.gpu.barrier_wait(scheduler_empty)
             tl.store(tle.gpu.local_ptr(scheduler_state, (0,)), tile_idx)
@@ -885,7 +861,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer_body(
                 hid,
                 split_id,
                 split_count,
-                total_split_tiles,
                 work_valid,
             ) = _ragged_persistent_split_tile_coords(
                 tile_idx,
@@ -1323,7 +1298,6 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
             hid,
             split_id,
             split_count,
-            _,
             work_valid,
         ) = _ragged_persistent_split_tile_coords(
             tile_idx,
@@ -2141,7 +2115,6 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
                 hid,
                 split_id,
                 split_count,
-                _,
                 work_valid,
             ) = _ragged_persistent_split_tile_coords(
                 tile_idx,
@@ -2871,11 +2844,6 @@ def launch_persistent(
     paged_kv_non_tma,
     exact_paged_kv_tiles,
     ragged_scheduler,
-    is_paged,
-    is_causal,
-    is_local,
-    is_alibi,
-    is_softcap,
     heads_in_l2,
     dynamic_scheduler,
     store_lse,
@@ -2921,11 +2889,10 @@ def launch_persistent(
     )
     if scheduler_counter is None:
         scheduler_counter = torch.empty((1,), dtype=torch.int32, device=output.device)
-    # Split-KV wraps the monotonically increasing ticket modulo the compact
-    # work count in-kernel, which keeps CUDA Graph replay valid without a
-    # separate reset launch on every attention invocation.
+    # Split-KV supplies a cached counter reset by its preceding combine.
+    # The non-split path has no combine, so initialize before each launch.
     if plan.dynamic_scheduler and not split_kv:
-        _reset_scheduler_counter(scheduler_counter)
+        scheduler_counter.zero_()
     if not split_kv:
         partial_out = output
         partial_lse = output

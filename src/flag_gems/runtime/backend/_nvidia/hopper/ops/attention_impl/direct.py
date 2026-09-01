@@ -32,7 +32,7 @@ from .common import (
     _ragged_persistent_tile_coords,
     _softmax_online_deferred,
 )
-from .scheduling import CommonSchedulingHeuristics, DirectSchedulingHeuristics
+from .kernel_config import CommonSchedulingHeuristics, DirectSchedulingHeuristics
 
 _prune_fa3_direct_configs = DirectSchedulingHeuristics.prune_autotune_configs
 _heur_block_k = CommonSchedulingHeuristics.block_k

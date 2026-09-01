@@ -545,10 +545,7 @@ def validate_fa3_plan(inputs: PreparedFA3Inputs, plan) -> None:
         raise RuntimeError("FA3 launcher requires a concrete kernel plan")
 
     pack_factor = plan.pack_factor
-    if (
-        plan.pack_gqa
-        and (pack_factor != inputs.num_heads // inputs.num_heads_k or pack_factor <= 1)
-    ) or (not plan.pack_gqa and pack_factor != 1):
+    if pack_factor not in (1, inputs.num_heads // inputs.num_heads_k):
         raise RuntimeError(
             "internal FA3 packed shape does not match the execution plan"
         )
@@ -683,9 +680,9 @@ def prepare_fa3_inputs(
     total_q, _, head_dim = q.shape
     block_size = k.size(1) if is_paged else 1
     num_pages = k.size(0) if is_paged else 0
-    page_table = block_table
-    if page_table is None:
-        page_table = torch.empty((0, 0), device=q.device, dtype=torch.int32)
+    # Dense kernels never read the page table. Reuse the int32 prefix tensor
+    # as its ABI placeholder without allocating another tensor.
+    page_table = cu_seqlens_q if block_table is None else block_table
 
     scale = head_dim**-0.5 if softmax_scale is None else float(softmax_scale)
     softcap = float(softcap)
@@ -703,7 +700,8 @@ def prepare_fa3_inputs(
     qo_tma_aligned = _tma_strides_are_aligned(q) and (
         out is None or _tma_strides_are_aligned(out)
     )
-    kv_tma_aligned = _tma_strides_are_aligned(k) and _tma_strides_are_aligned(v)
+    # K and V already have matching dtypes and strides.
+    kv_tma_aligned = _tma_strides_are_aligned(k)
 
     # Registration mutates global Triton runtime state, so do it only after all
     # argument validation and canonical tensor preparation have succeeded.

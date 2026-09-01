@@ -134,24 +134,7 @@ def flash_attn_varlen_func(
     )
     plan = FA3Scheduler.build(inputs)
     validate_fa3_plan(inputs, plan)
-    if plan.log_plan:
-        print(
-            "FLAG_GEMS_FA3_TLE_ROUTE "
-            f"layout={'paged' if inputs.is_paged else 'dense'} "
-            f"mode={plan.workload} family={plan.kernel.value} "
-            f"reason={plan.reason}"
-        )
-    # Enable exact logical KV stages for the paged D256 profile. The publisher
-    # issues one logical copy for N80; FlagTree selects and lowers its internal
-    # copy tiles, so the attention kernel does not encode an atom shape.
-    exact_paged_kv_tiles = (
-        plan.paged_d256_prefill_profile and plan.paged_kv_non_tma
-    )
-    result, softmax_lse = launch_fa3(
-        inputs,
-        plan,
-        exact_paged_kv_tiles=exact_paged_kv_tiles,
-    )
+    result, softmax_lse = launch_fa3(inputs, plan)
     return (result, softmax_lse) if inputs.return_softmax_lse else result
 
 

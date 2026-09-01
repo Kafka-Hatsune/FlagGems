@@ -20,7 +20,7 @@ import triton.language as tl
 from flag_gems.utils import libentry
 
 from .common import _ragged_persistent_tile_coords, _split_kv_count
-from .scheduling import PersistentSchedulingHeuristics
+from .kernel_config import PersistentSchedulingHeuristics
 
 
 @libentry()

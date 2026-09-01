@@ -2695,3 +2695,59 @@ def test_flash_attn_varlen_fa3_dense_d256_avoids_epilogue_smem_oor(
     assert torch.isfinite(output).all()
     assert not torch.isnan(lse).any()
     assert torch.isneginf(lse).any()
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.parametrize("batch_size", [28, 29, 32])
+@pytest.mark.parametrize("max_num_splits", [0, 32])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_flash_attn_varlen_fa3_logging_preserves_decode_route(
+    monkeypatch, batch_size: int, max_num_splits: int, dtype: torch.dtype
+) -> None:
+    import os
+
+    scheduling = _fa3_scheduling_module()
+    scheduler = scheduling.FA3Scheduler
+    for name in tuple(os.environ):
+        if name.startswith("FLAG_GEMS_FA3_TLE_"):
+            monkeypatch.delenv(name)
+    inputs = SimpleNamespace(
+        q=SimpleNamespace(dtype=dtype, element_size=lambda: 2),
+        batch_size=batch_size,
+        max_seqlen_q=1,
+        max_seqlen_k=4096,
+        total_q=batch_size,
+        num_heads=4,
+        num_heads_k=1,
+        head_dim=256,
+        has_cache_kv=True,
+        is_paged=True,
+        block_size=16,
+        qo_tma_aligned=True,
+        kv_tma_aligned=True,
+        arch=90,
+        num_sms=114,
+        alibi_slopes=None,
+        window=SimpleNamespace(causal=False, local=False),
+        is_softcap=False,
+        seqused_k=object(),
+        max_num_splits=max_num_splits,
+    )
+    scheduler.clear_config_cache()
+    try:
+        config = scheduler.load_config()
+        quiet = scheduler.build(inputs, config)
+        logged = scheduler.build(inputs, replace(config, log_plan=True))
+        # Page16/GQA4 becomes direct at one quarter of the 114-SM wave.
+        expected = (
+            scheduling.KernelFamily.DIRECT
+            if batch_size >= 29
+            else scheduling.KernelFamily.LONG
+        )
+        assert quiet.kernel is expected
+        assert logged.log_plan
+        assert replace(logged, log_plan=False) == quiet
+        scheduler.clear_config_cache()
+        assert scheduler.build(inputs, config) == quiet
+    finally:
+        scheduler.clear_config_cache()

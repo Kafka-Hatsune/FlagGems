@@ -429,7 +429,7 @@ def _ragged_persistent_split_tile_coords(
     selected_splits = 1
     selected_within = 0
 
-    while group_bid < batch_size:
+    while (group_bid < batch_size) & (~found):
         bids = group_bid + lane
         valid = (lane < 31) & (bids < batch_size)
         q_bos = tl.load(cu_seqlens_q_ptr + bids, mask=valid, other=0)
@@ -447,7 +447,7 @@ def _ragged_persistent_split_tile_coords(
         work_before = work_prefix - batch_work
         group_work = tl.sum(batch_work, axis=0)
         local_idx = tile_idx - group_start
-        in_group = (~found) & (local_idx >= 0) & (local_idx < group_work)
+        in_group = (local_idx >= 0) & (local_idx < group_work)
         hit = valid & (local_idx >= work_before) & (local_idx < work_prefix)
 
         hit_bid = tl.sum(tl.where(hit, bids, 0), axis=0)
@@ -476,7 +476,6 @@ def _ragged_persistent_split_tile_coords(
         hid,
         split_id,
         safe_splits,
-        group_start,
         found,
     )
 
@@ -490,21 +489,6 @@ def _split_n_block_range(n_block_min, n_block_max, split_id, split_count):
     split_min = n_block_min + split_id * blocks_per_split
     split_max = tl.minimum(n_block_max, split_min + blocks_per_split)
     return split_min, split_max
-
-
-@triton.jit
-def _fence_async_shared_cta():
-    """Publish generic-proxy shared-memory writes to the async proxy."""
-
-    # mov.u32 here because you must declare at least one output.
-    tl.inline_asm_elementwise(
-        "mov.u32 $0, 0x0; fence.proxy.async.shared::cta;",
-        constraints="=r",
-        args=(),
-        dtype=(tl.int32,),
-        is_pure=False,
-        pack=1,
-    )
 
 
 @triton.jit
