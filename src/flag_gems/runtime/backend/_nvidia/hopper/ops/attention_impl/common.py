@@ -493,21 +493,6 @@ def _split_n_block_range(n_block_min, n_block_max, split_id, split_count):
 
 
 @triton.jit
-def _fence_async_shared_cta():
-    """Publish generic-proxy shared-memory writes to the async proxy."""
-
-    # mov.u32 here because you must declare at least one output.
-    tl.inline_asm_elementwise(
-        "mov.u32 $0, 0x0; fence.proxy.async.shared::cta;",
-        constraints="=r",
-        args=(),
-        dtype=(tl.int32,),
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
 def _make_paged_kv_descriptor(
     base,
     num_blocks,

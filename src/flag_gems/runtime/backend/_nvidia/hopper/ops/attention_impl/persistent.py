@@ -35,7 +35,6 @@ from .common import (
     _copy_packed_gqa_tile_to_smem,
     _copy_paged_kv_tile_to_pipe,
     _copy_paged_kv_tma_tile_to_pipe,
-    _fence_async_shared_cta,
     _make_dense_kv_descriptor,
     _make_paged_kv_descriptor,
     _merge_attention_sink,
@@ -148,18 +147,6 @@ def _persistent_configs():
     return _normalize_persistent_config_schema(
         configs or PersistentSchedulingHeuristics.autotune_configs()
     )
-
-
-@libentry()
-@triton.jit
-def _reset_scheduler_counter_kernel(counter_ptr):
-    """Reset the persistent scheduler ticket on the current stream."""
-
-    tl.store(counter_ptr, 0)
-
-
-def _reset_scheduler_counter(counter):
-    _reset_scheduler_counter_kernel[(1,)](counter, num_warps=1)
 
 
 @triton.jit
@@ -475,7 +462,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer_body(
                         BM_SPLIT,
                         HEAD_DIM_PADDED,
                     )
-                    _fence_async_shared_cta()
                     tle.gpu.barrier_arrive(q_fulls_manual[q0_idx], phaseIdx=q_phase_idx)
                 else:
                     tle.gpu.barrier_wait(q_empties[q0_idx], phaseIdx=q_phase_idx)
@@ -489,7 +475,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer_body(
                         BM_SPLIT,
                         HEAD_DIM_PADDED,
                     )
-                    _fence_async_shared_cta()
                     tle.gpu.barrier_arrive(q_fulls_manual[q0_idx], phaseIdx=q_phase_idx)
 
                 kv_offset = n_block_min * ACTIVE_WGMMA_N
@@ -589,7 +574,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer_body(
                             BM_SPLIT,
                             HEAD_DIM_PADDED,
                         )
-                        _fence_async_shared_cta()
                         tle.gpu.barrier_arrive(
                             q_fulls_manual[q1_idx], phaseIdx=q_phase_idx
                         )
@@ -605,7 +589,6 @@ def _flash_varlen_fwd_v3_tle_persistent_producer_body(
                             BM_SPLIT,
                             HEAD_DIM_PADDED,
                         )
-                        _fence_async_shared_cta()
                         tle.gpu.barrier_arrive(
                             q_fulls_manual[q1_idx], phaseIdx=q_phase_idx
                         )
@@ -2925,7 +2908,7 @@ def launch_persistent(
     # work count in-kernel, which keeps CUDA Graph replay valid without a
     # separate reset launch on every attention invocation.
     if plan.dynamic_scheduler and not split_kv:
-        _reset_scheduler_counter(scheduler_counter)
+        scheduler_counter.zero_()
     if not split_kv:
         partial_out = output
         partial_lse = output

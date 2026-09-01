@@ -21,7 +21,7 @@ import torch
 from flag_gems.runtime import torch_device_fn
 
 from .direct import launch_direct
-from .persistent import _reset_scheduler_counter, launch_persistent
+from .persistent import launch_persistent
 from .scheduling import FA3ExecutionPlan, FA3Scheduler, KernelFamily
 from .split_combine import combine_persistent_split_kv
 from .validation import PreparedFA3Inputs
@@ -44,12 +44,11 @@ def _get_split_scheduler_counter(owner: torch.Tensor, plan: FA3ExecutionPlan):
     )
     counter = _split_scheduler_counters.get(key)
     if counter is None:
-        counter = torch.empty((1,), dtype=torch.int32, device=owner.device)
         # Split-KV intentionally keeps a monotonic ticket between calls and
         # reduces it modulo the compact work count. Initialize the graph-stable
-        # workspace once with a stream-ordered Triton kernel, without adding a
+        # workspace once on the current stream, without adding a
         # reset launch to every invocation.
-        _reset_scheduler_counter(counter)
+        counter = torch.zeros((1,), dtype=torch.int32, device=owner.device)
         _split_scheduler_counters[key] = counter
     return counter
 
