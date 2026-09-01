@@ -77,7 +77,6 @@ _PERSISTENT_AUTOTUNE_KEYS = (
     "is_alibi",
     "is_softcap",
     "is_s_aux",
-    "h_hk_ratio",
     "seqlen_q",
     "seqlen_k",
     "total_q",
@@ -92,7 +91,7 @@ _PERSISTENT_AUTOTUNE_KEYS = (
     "EXPLICIT_SPLIT_K_CHUNK",
     "STORE_LSE",
     "PAGED_PREFILL_PROFILE",
-    "DENSE_KV_TMA_PROFILE",
+    "SM_COUNT_PROFILE",
     "AUTOTUNE_POLICY_VERSION",
 )
 _PERSISTENT_AUTOTUNE_STRATEGY = tuple(
@@ -2275,7 +2274,7 @@ def flash_varlen_fwd_v3_tle_kernel(
     EXPLICIT_SPLIT_K_CHUNK: tl.constexpr,
     STORE_LSE: tl.constexpr,
     PAGED_PREFILL_PROFILE: tl.constexpr,
-    DENSE_KV_TMA_PROFILE: tl.constexpr,
+    SM_COUNT_PROFILE: tl.constexpr,
     EXACT_PAGED_KV_TILES: tl.constexpr,
     AUTOTUNE_POLICY_VERSION: tl.constexpr,
     PAGED_GATHER_MODE: tl.constexpr = 2,
@@ -2890,24 +2889,7 @@ def launch_persistent(
     """Launch the long family using its private persistent grid."""
     gqa_ratio = num_heads // num_heads_k
     split_kv = partial_out is not None
-    max_seqlen_q = effective_max_q // pack_factor
-    dense_kv_tma_profile = PersistentSchedulingHeuristics.use_dense_kv_tma(
-        batch_size=batch_size,
-        num_heads=num_heads,
-        num_heads_k=num_heads_k,
-        head_dim=head_size,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        total_q=total_q,
-        is_paged=is_paged,
-        is_causal=is_causal,
-        is_local=is_local,
-        is_alibi=is_alibi,
-        is_softcap=is_softcap,
-        pack_gqa=pack_gqa,
-        ragged_scheduler=ragged_scheduler,
-        split_kv=split_kv,
-    )
+    sm_count_profile = PersistentSchedulingHeuristics.sm_count_profile(num_sms)
     plan = PersistentSchedulingHeuristics.launch_plan(
         heads_in_l2=heads_in_l2,
         allow_head_swizzle=not split_kv,
@@ -2972,7 +2954,7 @@ def launch_persistent(
         EXPLICIT_SPLIT_K_CHUNK=explicit_split_k_chunk,
         STORE_LSE=store_lse,
         PAGED_PREFILL_PROFILE=paged_prefill_profile,
-        DENSE_KV_TMA_PROFILE=dense_kv_tma_profile,
+        SM_COUNT_PROFILE=sm_count_profile,
         EXACT_PAGED_KV_TILES=exact_paged_kv_tiles,
         AUTOTUNE_POLICY_VERSION=PersistentSchedulingHeuristics.AUTOTUNE_POLICY_VERSION,
         PAGED_GATHER_MODE=paged_gather_mode,

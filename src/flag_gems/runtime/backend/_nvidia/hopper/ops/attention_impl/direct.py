@@ -64,7 +64,6 @@ def _fa3_direct_configs():
         "is_local",
         "is_alibi",
         "is_s_aux",
-        "h_hk_ratio",
         "seqlen_q",
         "seqlen_k",
         "total_q",

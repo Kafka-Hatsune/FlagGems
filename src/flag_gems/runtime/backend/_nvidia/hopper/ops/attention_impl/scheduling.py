@@ -2028,7 +2028,12 @@ class PersistentSchedulingHeuristics:
     # Version 21 admits native-N80 for the explicit wide Split-KV schedule.
     # Invalidate cached group-2 winners so the newly legal candidate is
     # measured instead of silently retaining an older N64/N128 choice.
-    AUTOTUNE_POLICY_VERSION = 21
+    # Version 22 removes duplicate KV-transport candidates and separates
+    # candidate policy by a coarse SM-count profile.  On >=128-SM Hopper,
+    # restored-fence qwen36 measurements show native N80 beating both legacy
+    # group-2 N64 variants for every eligible wide prefill/Split-KV key, while
+    # the group-1 fallback remains available for the few shapes where it wins.
+    AUTOTUNE_POLICY_VERSION = 22
     DEFAULT_BLOCK_M = 128
     DEFAULT_NUM_MMA_GROUPS = 2
     DEFAULT_NUM_Q_BUFFERS = 1
@@ -2045,9 +2050,22 @@ class PersistentSchedulingHeuristics:
     COMPACT_1P2C_SMEM_BUDGET_BYTES = 225 * 1024
     MAX_ACTIVE_WGMMA_N = 128
     LEGACY_ACTIVE_WGMMA_N = 64
+    STANDARD_SM_COUNT_PROFILE = 0
+    LARGE_SM_COUNT_PROFILE = 1
+    LARGE_SM_COUNT_THRESHOLD = 128
     COMPACT_N_P50_TIE_FRACTION = 0.03
     COMPACT_N_ROBUST_TIE_FRACTION = 0.05
     AUTOTUNE_SPREAD_WEIGHT = 0.25
+
+    @classmethod
+    def sm_count_profile(cls, num_sms: int) -> int:
+        """Bucket Hopper devices by wave capacity for autotune policy."""
+
+        return (
+            cls.LARGE_SM_COUNT_PROFILE
+            if num_sms >= cls.LARGE_SM_COUNT_THRESHOLD
+            else cls.STANDARD_SM_COUNT_PROFILE
+        )
 
     @classmethod
     def select_stable_config(cls, timings):
@@ -2205,7 +2223,6 @@ class PersistentSchedulingHeuristics:
         block_m: int = DEFAULT_BLOCK_M,
         num_mma_groups: int | None = None,
         use_tma_qo: bool | None = None,
-        use_tma_kv: bool = True,
         stagger_kv: bool = False,
         active_wgmma_n: int | None = None,
         rescale_o_before_pv: bool = False,
@@ -2249,7 +2266,7 @@ class PersistentSchedulingHeuristics:
                 "FLAG_GEMS_FA3_TLE_EXPERIMENT_REUSE_Q_SMEM_O", reuse_default
             )
             == "1",
-            "USE_TMA_KV": use_tma_kv,
+            "USE_TMA_KV": True,
             "STAGGER_KV": stagger_kv,
             "ACTIVE_WGMMA_N": active_wgmma_n,
             "RESCALE_O_BEFORE_PV": rescale_o_before_pv,
@@ -2264,29 +2281,25 @@ class PersistentSchedulingHeuristics:
     def autotune_configs(cls):
         configs = []
 
-        def add_transport_pair(**config_kwargs):
-            configs.extend(
-                cls.make_config(use_tma_kv=use_tma_kv, **config_kwargs)
-                for use_tma_kv in (True, False)
-            )
+        def add_config(**config_kwargs):
+            configs.append(cls.make_config(**config_kwargs))
 
-        add_transport_pair(block_n=128, num_buffers_kv=2)
-        add_transport_pair(block_n=64, num_buffers_kv=2)
-        add_transport_pair(
+        add_config(block_n=128, num_buffers_kv=2)
+        add_config(block_n=64, num_buffers_kv=2)
+        add_config(
             block_n=64,
             num_buffers_kv=2,
             stagger_kv=True,
         )
         # The compact D256 candidate has one legal transport/topology after
         # the static contract and production pruner are applied: staggered
-        # K/V, early FP16 P carry, and dense-profile transport selection.
+        # K/V, early FP16 P carry, and descriptor/TMA K/V transport.
         compact_active_n = cls.max_active_wgmma_n_for_1p2c(256)
         if compact_active_n < cls.MAX_ACTIVE_WGMMA_N:
             configs.append(
                 cls.make_config(
                     block_n=cls.MAX_ACTIVE_WGMMA_N,
                     num_buffers_kv=2,
-                    use_tma_kv=True,
                     stagger_kv=True,
                     active_wgmma_n=compact_active_n,
                     rescale_o_before_pv=False,
@@ -2303,7 +2316,7 @@ class PersistentSchedulingHeuristics:
             == "1"
         )
         if forced_mma_groups in (None, "1"):
-            add_transport_pair(
+            add_config(
                 block_m=64,
                 block_n=64,
                 num_buffers_kv=2,
@@ -2327,21 +2340,21 @@ class PersistentSchedulingHeuristics:
                     )
                     or 2
                 )
-                add_transport_pair(
+                add_config(
                     block_m=16,
                     block_n=64,
                     num_buffers_kv=warp_mma_kv_buffers,
                     num_mma_groups=1,
                     use_tma_qo=False,
                 )
-                add_transport_pair(
+                add_config(
                     block_m=16,
                     block_n=128,
                     num_buffers_kv=warp_mma_kv_buffers,
                     num_mma_groups=1,
                     use_tma_qo=False,
                 )
-            add_transport_pair(
+            add_config(
                 block_m=64,
                 block_n=128,
                 num_buffers_kv=2,
@@ -2373,8 +2386,6 @@ class PersistentSchedulingHeuristics:
                 "capacity 1 is disabled because it produces invalid Hopper "
                 "shared-memory operands"
             )
-        if forced_kv_buffers == 2:
-            add_transport_pair(block_n=64, num_buffers_kv=2)
         if forced_block_m not in (0, 16, 64, 128):
             raise ValueError(
                 "FLAG_GEMS_FA3_TLE_EXPERIMENT_BLOCK_M must be 0, 16, 64, or " "128"
@@ -2429,30 +2440,6 @@ class PersistentSchedulingHeuristics:
         return (q_elems + kv_elems + implicit_o_elems) * 2
 
     @classmethod
-    def use_dense_kv_tma(
-        cls,
-        *,
-        batch_size,
-        num_heads,
-        num_heads_k,
-        head_dim,
-        max_seqlen_q,
-        max_seqlen_k,
-        total_q,
-        is_paged,
-        is_causal,
-        is_local,
-        is_alibi,
-        is_softcap,
-        pack_gqa,
-        ragged_scheduler,
-        split_kv,
-    ) -> bool:
-        """Keep the retained dense producer on its descriptor/TMA path."""
-
-        return True
-
-    @classmethod
     def prune_autotune_configs(cls, configs, nargs, **kwargs):
         head_dim = kwargs.get("d", nargs.get("d"))
         is_paged = kwargs.get("is_paged", nargs.get("is_paged"))
@@ -2477,30 +2464,10 @@ class PersistentSchedulingHeuristics:
         is_alibi = kwargs.get("is_alibi", nargs.get("is_alibi", False))
         is_softcap = kwargs.get("is_softcap", nargs.get("is_softcap", False))
         is_s_aux = kwargs.get("is_s_aux", nargs.get("is_s_aux", False))
-        use_tma_kv = kwargs.get(
-            "DENSE_KV_TMA_PROFILE",
-            nargs.get("DENSE_KV_TMA_PROFILE"),
+        sm_count_profile = kwargs.get(
+            "SM_COUNT_PROFILE",
+            nargs.get("SM_COUNT_PROFILE", cls.STANDARD_SM_COUNT_PROFILE),
         )
-        if use_tma_kv is None:
-            use_tma_kv = cls.use_dense_kv_tma(
-                batch_size=kwargs.get("b", nargs.get("b")),
-                num_heads=kwargs.get("h", nargs.get("h")),
-                num_heads_k=kwargs.get("hk", nargs.get("hk")),
-                head_dim=head_dim,
-                max_seqlen_q=kwargs.get("seqlen_q", nargs.get("seqlen_q")),
-                max_seqlen_k=kwargs.get("seqlen_k", nargs.get("seqlen_k")),
-                total_q=kwargs.get("total_q", nargs.get("total_q")),
-                is_paged=is_paged,
-                is_causal=is_causal,
-                is_local=is_local,
-                is_alibi=is_alibi,
-                is_softcap=is_softcap,
-                pack_gqa=pack_gqa,
-                ragged_scheduler=kwargs.get(
-                    "RAGGED_SCHEDULER", nargs.get("RAGGED_SCHEDULER", False)
-                ),
-                split_kv=split_kv,
-            )
         decode_packgqa_ws = (
             is_paged
             and paged_kv_non_tma
@@ -2548,6 +2515,9 @@ class PersistentSchedulingHeuristics:
             and is_seqused_k
             and not is_s_aux
         )
+        large_sm_count_profile = (
+            sm_count_profile == cls.LARGE_SM_COUNT_PROFILE
+        )
         active_wgmma_n_candidates = set(
             cls.active_wgmma_n_candidates(
                 head_dim,
@@ -2579,6 +2549,14 @@ class PersistentSchedulingHeuristics:
             return (
                 cls.config_smem_bytes(config, head_dim, pack_gqa=pack_gqa)
                 <= budget
+            )
+
+        def sm_profile_compatible(config):
+            return not (
+                large_sm_count_profile
+                and tiled_extent_policy
+                and config.kwargs["NUM_MMA_GROUPS"] == 2
+                and config.kwargs["ACTIVE_WGMMA_N"] == cls.LEGACY_ACTIVE_WGMMA_N
             )
 
         def selected_shape_config(config):
@@ -2685,7 +2663,8 @@ class PersistentSchedulingHeuristics:
             for config in configs
             if selected_shape_config(config)
             and page_extent_compatible(config)
-            and config.kwargs["USE_TMA_KV"] == use_tma_kv
+            and config.kwargs["USE_TMA_KV"]
+            and sm_profile_compatible(config)
             and not (
                 config.kwargs["NUM_MMA_GROUPS"] == 2
                 and config.kwargs["ACTIVE_WGMMA_N"]
@@ -2714,7 +2693,8 @@ class PersistentSchedulingHeuristics:
         fallback = [
             config
             for config in reversed(configs)
-            if config.kwargs["USE_TMA_KV"] == use_tma_kv
+            if config.kwargs["USE_TMA_KV"]
+            and sm_profile_compatible(config)
             and page_extent_compatible(config)
             and smem_compatible(config)
             and config.kwargs["ACTIVE_WGMMA_N"] == config.kwargs["BLOCK_N"]

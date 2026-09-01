@@ -855,49 +855,40 @@ def test_flash_attn_varlen_fa3_persistent_autotune_key_buckets() -> None:
         "is_softcap",
         "EXPLICIT_SPLIT_K_CHUNK",
         "PAGED_PREFILL_PROFILE",
-        "DENSE_KV_TMA_PROFILE",
+        "SM_COUNT_PROFILE",
         "AUTOTUNE_POLICY_VERSION",
     } <= set(tuner.keys)
+    assert "h_hk_ratio" not in tuner.keys
+    assert "DENSE_KV_TMA_PROFILE" not in tuner.keys
     assert (
         _fa3_scheduling_module().PersistentSchedulingHeuristics.AUTOTUNE_POLICY_VERSION
-        == 21
+        == 22
     )
+    heuristics = _fa3_scheduling_module().PersistentSchedulingHeuristics
+    assert heuristics.sm_count_profile(114) == heuristics.STANDARD_SM_COUNT_PROFILE
+    assert heuristics.sm_count_profile(132) == heuristics.LARGE_SM_COUNT_PROFILE
+    direct = import_module(
+        f"{flag_gems.flash_attn_varlen_func.__module__.split('.ops.', 1)[0]}"
+        ".ops.attention_impl.direct"
+    )
+    assert "h_hk_ratio" not in direct.flash_varlen_fwd_v3_tle_direct_kernel.fn.keys
 
 
 @pytest.mark.flash_attn_varlen_func
 def test_flash_attn_varlen_fa3_dense_producer_is_tma_only() -> None:
     scheduling = _fa3_scheduling_module()
     heuristics = scheduling.PersistentSchedulingHeuristics
+    configs = heuristics.autotune_configs()
 
-    common = dict(
-        batch_size=12,
-        num_heads=32,
-        num_heads_k=32,
-        head_dim=64,
-        max_seqlen_k=128,
-        is_paged=False,
-        is_causal=False,
-        is_local=False,
-        is_alibi=False,
-        is_softcap=False,
-        pack_gqa=False,
-        ragged_scheduler=False,
-        split_kv=False,
-    )
-    q255_tma = heuristics.use_dense_kv_tma(
-        **common,
-        max_seqlen_q=255,
-        total_q=3060,
-    )
-    q256_tma = heuristics.use_dense_kv_tma(
-        **common,
-        max_seqlen_q=256,
-        total_q=3072,
-    )
+    assert configs
+    assert all(config.kwargs["USE_TMA_KV"] for config in configs)
+    signatures = {
+        (tuple(sorted(config.kwargs.items())), config.num_warps, config.num_stages)
+        for config in configs
+    }
+    assert len(signatures) == len(configs)
 
-    assert q255_tma is True
-    assert q256_tma is True
-    # The retained dense producer no longer selects a pointer-copy profile.
+    # TMA is the sole retained dense producer, so it is not an autotune key.
     persistent = import_module(
         f"{flag_gems.flash_attn_varlen_func.__module__.split('.ops.', 1)[0]}"
         ".ops.attention_impl.persistent"
@@ -908,7 +899,7 @@ def test_flash_attn_varlen_fa3_dense_producer_is_tma_only() -> None:
     )
     assert strategies["seqlen_q"](255) == strategies["seqlen_q"](256)
     assert strategies["total_q"](3060) == strategies["total_q"](3072)
-    assert "DENSE_KV_TMA_PROFILE" in strategies
+    assert "DENSE_KV_TMA_PROFILE" not in strategies
 
 
 @pytest.mark.flash_attn_varlen_func
@@ -1893,16 +1884,19 @@ def test_flash_attn_varlen_fa3_d256_prefill_cost_model(
 
 @pytest.mark.flash_attn_varlen_func
 @pytest.mark.parametrize(
-    "seqlen_q,min_prefill_q",
+    "seqlen_q,min_prefill_q,sm_count_profile",
     [
-        pytest.param(1024, None, id="default-threshold"),
-        pytest.param(512, 512, id="lowered-threshold"),
+        pytest.param(1024, None, 0, id="h100-default-threshold"),
+        pytest.param(512, 512, 0, id="h100-lowered-threshold"),
+        pytest.param(1024, None, 1, id="h800-default-threshold"),
+        pytest.param(512, 512, 1, id="h800-lowered-threshold"),
     ],
 )
 def test_flash_attn_varlen_fa3_d256_prefill_autotune_candidates(
     monkeypatch,
     seqlen_q: int,
     min_prefill_q: Optional[int],
+    sm_count_profile: int,
 ) -> None:
     scheduling = _fa3_scheduling_module()
     heuristics = scheduling.PersistentSchedulingHeuristics
@@ -1942,6 +1936,7 @@ def test_flash_attn_varlen_fa3_d256_prefill_autotune_candidates(
             RAGGED_SCHEDULER=False,
             SPLIT_KV=False,
             PAGED_PREFILL_PROFILE=True,
+            SM_COUNT_PROFILE=sm_count_profile,
         )
     finally:
         scheduling.FA3Scheduler.clear_config_cache()
@@ -1960,12 +1955,18 @@ def test_flash_attn_varlen_fa3_d256_prefill_autotune_candidates(
     }
     compact_n = heuristics.max_active_wgmma_n_for_1p2c(256)
 
-    assert signatures == {
-        (128, 64, 2, True, False, 64, False, False),
-        (128, 64, 2, True, True, 64, False, False),
+    expected_signatures = {
         (128, 128, 2, True, True, compact_n, False, True),
         (64, 64, 1, False, False, 64, False, False),
     }
+    if sm_count_profile == heuristics.STANDARD_SM_COUNT_PROFILE:
+        expected_signatures.update(
+            {
+                (128, 64, 2, True, False, 64, False, False),
+                (128, 64, 2, True, True, 64, False, False),
+            }
+        )
+    assert signatures == expected_signatures
 
 
 @pytest.mark.flash_attn_varlen_func
@@ -2045,7 +2046,7 @@ def test_flash_attn_varlen_fa3_active_wgmma_n_heuristic(
         "RAGGED_SCHEDULER": False,
         "SPLIT_KV": False,
         "PAGED_PREFILL_PROFILE": False,
-        "DENSE_KV_TMA_PROFILE": True,
+        "SM_COUNT_PROFILE": 0,
     }
     for head_dim, expected_active_n in (
         (64, {64, 128}),
