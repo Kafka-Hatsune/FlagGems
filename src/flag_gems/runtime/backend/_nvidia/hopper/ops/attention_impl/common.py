@@ -590,7 +590,6 @@ def _copy_paged_kv_tile_to_pipe(
         slot.kv,
         [BLOCK_N, HEAD_DIM_PADDED],
         mask=copy_mask,
-        other=0.0,
     )
     writer.commit(iteration)
 
@@ -688,7 +687,6 @@ def _copy_dense_tile_to_smem(
         smem_tile,
         [BLOCK_ROWS, HEAD_DIM_PADDED],
         mask=mask,
-        other=0.0,
     )
 
 
@@ -727,7 +725,6 @@ def _copy_packed_gqa_tile_to_smem(
         smem_tile,
         [BLOCK_ROWS, HEAD_DIM_PADDED],
         mask=mask,
-        other=0.0,
     )
 
 

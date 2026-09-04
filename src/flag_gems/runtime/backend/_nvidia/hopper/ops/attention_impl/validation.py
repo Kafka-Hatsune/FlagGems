@@ -462,8 +462,8 @@ def _missing_fa3_primitives() -> tuple[str, ...]:
     buffered_tensor = getattr(gpu, "buffered_tensor", None)
 
     copy_params = _parameter_names(copy)
-    if not {"mask", "other"}.issubset(copy_params):
-        missing.append("masked tle.gpu.copy(mask=..., other=...)")
+    if "mask" not in copy_params:
+        missing.append("masked tle.gpu.copy(mask=...)")
 
     barrier_params = _parameter_names(alloc_barriers)
     if "arrival_mode" not in barrier_params:
