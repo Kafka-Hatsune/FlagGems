@@ -43,16 +43,6 @@ MAX_SPLIT_KV = 32
 _TMA_ALLOCATOR_REGISTERED = False
 
 
-@lru_cache(maxsize=None)
-def _parameter_names(function) -> frozenset[str]:
-    """Cache stable TLE primitive signatures used on every FA3 invocation."""
-
-    try:
-        return frozenset(inspect.signature(function).parameters)
-    except (TypeError, ValueError):
-        return frozenset()
-
-
 @dataclass(frozen=True)
 class NormalizedWindow:
     """Canonical causal/local-window state consumed by routing and kernels."""
@@ -458,16 +448,14 @@ def _missing_fa3_primitives() -> tuple[str, ...]:
     missing = []
     gpu = getattr(tle, "gpu", None)
     copy = getattr(gpu, "copy", None)
-    alloc_barriers = getattr(gpu, "alloc_barriers", None)
     buffered_tensor = getattr(gpu, "buffered_tensor", None)
 
-    copy_params = _parameter_names(copy)
+    try:
+        copy_params = inspect.signature(copy).parameters
+    except (TypeError, ValueError):
+        copy_params = {}
     if "mask" not in copy_params:
         missing.append("masked tle.gpu.copy(mask=...)")
-
-    barrier_params = _parameter_names(alloc_barriers)
-    if "arrival_mode" not in barrier_params:
-        missing.append("tle.gpu.alloc_barriers(arrival_mode=...)")
 
     if buffered_tensor is None or not hasattr(buffered_tensor, "reshape"):
         missing.append("tle.gpu.buffered_tensor.reshape")

@@ -2362,7 +2362,6 @@ def flash_varlen_fwd_v3_tle_kernel(
         num_barriers=Q_STAGE_CAPACITY,
         arrive_count=1,
         init=tle.gpu.READY,
-        arrival_mode="participant",
     )
     q_fulls = tle.gpu.alloc_barriers(
         num_barriers=Q_STAGE_CAPACITY,
@@ -2372,7 +2371,6 @@ def flash_varlen_fwd_v3_tle_kernel(
     q_fulls_manual = tle.gpu.alloc_barriers(
         num_barriers=Q_STAGE_CAPACITY,
         arrive_count=1,
-        arrival_mode="participant",
     )
     pingpong = tle.gpu.alloc_barriers(
         num_barriers=2,
