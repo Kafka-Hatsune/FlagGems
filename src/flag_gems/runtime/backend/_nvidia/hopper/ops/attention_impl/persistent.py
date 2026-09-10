@@ -35,8 +35,6 @@ from .common import (
     _copy_packed_gqa_tile_to_smem,
     _copy_paged_kv_tile_to_pipe,
     _copy_paged_kv_tma_tile_to_pipe,
-    _make_dense_kv_descriptor,
-    _make_paged_kv_descriptor,
     _merge_attention_sink,
     _paged_blockwise_cache_indices,
     _paged_tile_cache_state,
@@ -341,42 +339,30 @@ def _flash_varlen_fwd_v3_tle_persistent_producer_body(
                             block_shape=[BM_SPLIT, HEAD_DIM_PADDED],
                         )
                 if is_paged and (not PAGED_KV_NON_TMA):
-                    k_desc = _make_paged_kv_descriptor(
-                        k_base,
-                        bk,
-                        block_size,
-                        d,
-                        k_row_stride,
-                        page_stride_rows,
-                        ACTIVE_WGMMA_N,
-                        HEAD_DIM_PADDED,
+                    k_desc = tl.make_tensor_descriptor(
+                        base=k_base,
+                        shape=[bk, block_size, d],
+                        strides=[page_stride_rows * k_row_stride, k_row_stride, 1],
+                        block_shape=[1, ACTIVE_WGMMA_N, HEAD_DIM_PADDED],
                     )
-                    v_desc = _make_paged_kv_descriptor(
-                        v_base,
-                        bk,
-                        block_size,
-                        d,
-                        v_row_stride,
-                        page_stride_rows,
-                        ACTIVE_WGMMA_N,
-                        HEAD_DIM_PADDED,
+                    v_desc = tl.make_tensor_descriptor(
+                        base=v_base,
+                        shape=[bk, block_size, d],
+                        strides=[page_stride_rows * v_row_stride, v_row_stride, 1],
+                        block_shape=[1, ACTIVE_WGMMA_N, HEAD_DIM_PADDED],
                     )
                 elif not is_paged:
-                    k_desc = _make_dense_kv_descriptor(
-                        k_base,
-                        k_len,
-                        d,
-                        k_row_stride,
-                        ACTIVE_WGMMA_N,
-                        HEAD_DIM_PADDED,
+                    k_desc = tl.make_tensor_descriptor(
+                        base=k_base,
+                        shape=[k_len, d],
+                        strides=[k_row_stride, 1],
+                        block_shape=[ACTIVE_WGMMA_N, HEAD_DIM_PADDED],
                     )
-                    v_desc = _make_dense_kv_descriptor(
-                        v_base,
-                        k_len,
-                        d,
-                        v_row_stride,
-                        ACTIVE_WGMMA_N,
-                        HEAD_DIM_PADDED,
+                    v_desc = tl.make_tensor_descriptor(
+                        base=v_base,
+                        shape=[k_len, d],
+                        strides=[v_row_stride, 1],
+                        block_shape=[ACTIVE_WGMMA_N, HEAD_DIM_PADDED],
                     )
 
                 q_buf, q_phase_idx = _buf_phase_tle(tile_count, NUM_BUFFERS_Q)

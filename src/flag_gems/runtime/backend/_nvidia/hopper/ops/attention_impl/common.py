@@ -492,44 +492,6 @@ def _split_n_block_range(n_block_min, n_block_max, split_id, split_count):
 
 
 @triton.jit
-def _make_paged_kv_descriptor(
-    base,
-    num_blocks,
-    block_size,
-    d,
-    row_stride,
-    page_stride_rows,
-    BLOCK_N: tl.constexpr,
-    HEAD_DIM_PADDED: tl.constexpr,
-):
-    """Describe one complete logical KV block."""
-    return tl.make_tensor_descriptor(
-        base=base,
-        shape=[num_blocks, block_size, d],
-        strides=[page_stride_rows * row_stride, row_stride, 1],
-        block_shape=[1, BLOCK_N, HEAD_DIM_PADDED],
-    )
-
-
-@triton.jit
-def _make_dense_kv_descriptor(
-    base,
-    row_count,
-    d,
-    row_stride,
-    BLOCK_N: tl.constexpr,
-    HEAD_DIM_PADDED: tl.constexpr,
-):
-    """Describe one complete logical KV block."""
-    return tl.make_tensor_descriptor(
-        base=base,
-        shape=[row_count, d],
-        strides=[row_stride, 1],
-        block_shape=[BLOCK_N, HEAD_DIM_PADDED],
-    )
-
-
-@triton.jit
 def _copy_paged_kv_tile_to_pipe(
     writer,
     iteration,
