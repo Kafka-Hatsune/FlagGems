@@ -1807,6 +1807,30 @@ mv_row:
   - META: {BM: 16, BK: 512}
     num_warps: 8
     num_stages: 1
+  - META: {BM: 1, BK: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 1, BK: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 4, BK: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 4, BK: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 16, BK: 1024}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 32, BK: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 32, BK: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BM: 64, BK: 128}
+    num_warps: 4
+    num_stages: 1
 
 mv_column:
   - META: {BM: 16, BK: 32}

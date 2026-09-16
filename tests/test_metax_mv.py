@@ -160,7 +160,7 @@ def test_mv_invalid_calls_stop_before_dispatch(monkeypatch, invalid):
 def test_mv_cold_graph_rejected_before_dispatch(monkeypatch, layout):
     matrix, vector = _inputs(39, 131, torch.float32, layout)
     backend = importlib.import_module(flag_gems.mv.__module__)
-    monkeypatch.setattr(backend, "_MV_PLANS", {})
+    monkeypatch.setattr(backend, "_MV_WARMED", set())
 
     def unexpected_dispatch(*args, **kwargs):
         pytest.fail("cold captured MV reached dispatch")
