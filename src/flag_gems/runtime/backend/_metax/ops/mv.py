@@ -13,6 +13,7 @@ import hashlib
 import logging
 import threading
 from functools import cached_property, partial
+from typing import Callable, NamedTuple
 
 import torch
 import triton
@@ -287,12 +288,34 @@ _gemv_tuned = libentry()(
 )
 
 
-# Layout tuning caches metadata, never tensor data or temporary buffers.
-_ROW_PLANS = {}
-_ROW_PLAN_LOCK = threading.RLock()
+class _MvPlan(NamedTuple):
+    """An immutable execution choice; never owns tensors or workspace."""
+
+    launch: Callable
+    family: str
+    split_k: int = 1
 
 
-def _row_plan_key(a, x, out):
+class _MvCall(NamedTuple):
+    """Validated tensors and metadata for one invocation."""
+
+    a: torch.Tensor
+    x: torch.Tensor
+    out: torch.Tensor
+    m: int
+    k: int
+    a_strides: tuple
+    x_stride: int
+    out_stride: int
+    key: tuple
+    cached_plan: _MvPlan | None
+
+
+_MV_PLANS = {}
+_MV_PLAN_LOCK = threading.RLock()
+
+
+def _plan_key(a, x, out):
     return (
         a.device,
         *a.shape,
@@ -308,42 +331,85 @@ def _row_plan_key(a, x, out):
     )
 
 
-def _row_args(family, a, x, out):
-    """Map the same MV onto either orientation of the shared SIMT primitive."""
-    m, k = a.shape
-    am, ak = a.stride()
-    xk, ym = x.stride(0), out.stride(0)
-    if family == "matrix_vector":
-        return (a, x, out, m, 1, k, 0, am, ak, 0, xk, 0, 0, ym, 0)
-    return (x, a, out, 1, m, k, 0, 0, xk, 0, ak, am, 0, 0, ym)
+def _byte_span(tensor):
+    start = tensor.data_ptr()
+    if tensor.numel() == 0:
+        return start, start
+    last = sum(
+        (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
+    )
+    return start, start + (last + 1) * tensor.element_size()
 
 
-def _launch_row(family, a, x, out):
-    m, k = a.shape
-    if family == "row":
-        _row_kernel[lambda cfg: (triton.cdiv(m, cfg["BM"]), 1, 1)](
-            a,
-            x,
-            out,
-            m,
-            k,
-            1,
-            0,
-            *a.stride(),
-            0,
-            x.stride(0),
-            0,
-            out.stride(0),
-            SPLIT_K=1,
+def _validate_mv(input, vec, out, *, allow_fp32_output=False):
+    """Establish the complete call contract before dispatch or GPU execution.
+
+    A missing output is allocated here so its layout/alignment are also known.
+    This allocates storage only; no input is copied or materialized.
+    """
+    if input.layout != torch.strided or vec.layout != torch.strided:
+        raise NotImplementedError("MetaX mv supports strided dense tensors")
+    if input.ndim != 2 or vec.ndim != 1 or input.shape[1] != vec.shape[0]:
+        raise RuntimeError("mv expects a matrix [M, K] and a vector [K]")
+    if input.device != vec.device or input.dtype != vec.dtype:
+        raise RuntimeError("mv inputs must have the same device and dtype")
+    if input.device.type != "cuda":
+        raise NotImplementedError("MetaX mv requires a MetaX GPU")
+    if input.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise NotImplementedError("MetaX mv supports float16, bfloat16 and float32")
+
+    m, k = input.shape
+    tensors = (input, vec) if out is None else (input, vec, out)
+    if out is not None:
+        if out.layout != torch.strided:
+            raise NotImplementedError("mv out must be a strided dense tensor")
+        valid_dtype = out.dtype == input.dtype or (
+            allow_fp32_output and out.dtype == torch.float32
         )
+        if out.shape != (m,) or not valid_dtype or out.device != input.device:
+            raise RuntimeError(
+                "mv out must have shape [M] and a compatible dtype/device"
+            )
+        if m > 1 and out.stride(0) == 0:
+            raise NotImplementedError("mv out must not have overlapping elements")
+    if torch.is_grad_enabled() and any(t.requires_grad for t in tensors):
+        raise NotImplementedError("MetaX mv is inference-only; use torch.no_grad()")
+    # Only real dtypes are accepted above, so a separate conjugate check is redundant.
+    if any(t.is_neg() or any(s < 0 for s in t.stride()) for t in tensors):
+        raise NotImplementedError(
+            "MetaX mv does not support lazy negative views or negative strides"
+        )
+    if out is not None:
+        lo, hi = _byte_span(out)
+        for tensor in (input, vec):
+            other_lo, other_hi = _byte_span(tensor)
+            if max(lo, other_lo) < min(hi, other_hi):
+                raise NotImplementedError(
+                    "mv out must not overlap an input storage span"
+                )
     else:
-        args = _row_args(family, a, x, out)
-        rows, columns = args[3:5]
-        _gemv_tuned[lambda cfg: (rows * triton.cdiv(columns, cfg["BN"]),)](
-            *args,
-            BATCH=1,
-            SPLIT_K=1,
-        )
+        out = torch.empty((m,), device=input.device, dtype=input.dtype)
+
+    key = _plan_key(input, vec, out)
+    cached_plan = _MV_PLANS.get(key)
+    # A cached plan means every participating tuner was warmed outside capture.
+    # Empty/zero products do not autotune and can be captured on their first call.
+    if m and k and cached_plan is None:
+        with torch_device_fn.device(input.device):
+            if torch_device_fn.is_current_stream_capturing():
+                raise RuntimeError("warm MetaX mv before CUDA Graph capture")
+    return _MvCall(
+        input,
+        vec,
+        out,
+        m,
+        k,
+        input.stride(),
+        vec.stride(0),
+        out.stride(0),
+        key,
+        cached_plan,
+    )
 
 
 def _split_count(m, k):
@@ -356,155 +422,196 @@ def _split_count(m, k):
     return min(128, occupancy, reduction_work)
 
 
-def _launch_gemv(a, x, out):
-    """Execute a validated MV; BMM may also supply an FP32 output tensor.
+def _dispatch_mv(call):
+    """Choose a complete plan from valid metadata; cold autotuning runs candidates."""
+    if call.cached_plan is not None:
+        return call.cached_plan
+    if not call.m:
+        return _MvPlan(_launch_empty, "empty")
+    if not call.k:
+        return _MvPlan(_launch_zero, "zero")
 
-    Call under the input's device context. The public MV API below owns its
-    same-dtype checks; this shared executor owns layout selection and launches.
-    """
-    m, k = a.shape
-    if not m:
-        return
-    if not k:
-        _zero_kernel[(triton.cdiv(m, 256), 1)](out, m, 0, out.stride(0), num_warps=4)
-        return
+    with _MV_PLAN_LOCK:
+        plan = _MV_PLANS.get(call.key)
+        if plan is None:
+            if call.a_strides[0] >= call.a_strides[1]:
+                candidates = (
+                    _MvPlan(_launch_row, "row"),
+                    _MvPlan(_launch_matrix_vector, "matrix_vector"),
+                    _MvPlan(_launch_vector_matrix, "vector_matrix"),
+                )
+                for candidate in candidates:
+                    _launch_mv(candidate, call)
+                timings = [
+                    _graph_bench(
+                        lambda candidate=candidate: _launch_mv(candidate, call),
+                        quantiles=(0.5, 0.2, 0.8),
+                    )[0]
+                    for candidate in candidates
+                ]
+                plan = candidates[min(range(len(timings)), key=timings.__getitem__)]
+            else:
+                plan = _MvPlan(_launch_column, "column", _split_count(call.m, call.k))
+                # Warm both the main and optional reduction tuner before caching.
+                _launch_mv(plan, call)
+            _MV_PLANS[call.key] = plan
+    return plan
 
-    if a.stride(0) >= a.stride(1):
-        key = _row_plan_key(a, x, out)
-        family = _ROW_PLANS.get(key)
-        if family is None:
-            with _ROW_PLAN_LOCK:
-                family = _ROW_PLANS.get(key)
-                if family is None:
-                    if torch_device_fn.is_current_stream_capturing():
-                        raise RuntimeError("warm MetaX mv before CUDA Graph capture")
-                    candidates = ("row", "matrix_vector", "vector_matrix")
-                    for candidate in candidates:
-                        _launch_row(candidate, a, x, out)
-                    timings = {
-                        candidate: _graph_bench(
-                            lambda candidate=candidate: _launch_row(
-                                candidate, a, x, out
-                            ),
-                            quantiles=(0.5, 0.2, 0.8),
-                        )[0]
-                        for candidate in candidates
-                    }
-                    family = _ROW_PLANS[key] = min(timings, key=timings.get)
-        _launch_row(family, a, x, out)
-        return
 
-    split = _split_count(m, k)
-    if split > 1:
-        target = torch.empty((split, m), device=a.device, dtype=torch.float32)
-        target_strides = (split * m, 1)
-    else:
-        target, target_strides = out, (0, out.stride(0))
-    _column_kernel[lambda cfg: (triton.cdiv(m, cfg["BM"]), split, 1)](
-        a,
-        x,
-        target,
-        m,
-        k,
+def _launch_empty(call, split_k):
+    pass
+
+
+def _launch_zero(call, split_k):
+    _zero_kernel[(triton.cdiv(call.m, 256), 1)](
+        call.out, call.m, 0, call.out_stride, num_warps=4
+    )
+
+
+def _launch_row(call, split_k):
+    _row_kernel[lambda cfg: (triton.cdiv(call.m, cfg["BM"]), 1, 1)](
+        call.a,
+        call.x,
+        call.out,
+        call.m,
+        call.k,
         1,
         0,
-        *a.stride(),
+        *call.a_strides,
         0,
-        x.stride(0),
-        *target_strides,
-        SPLIT_K=split,
+        call.x_stride,
+        0,
+        call.out_stride,
+        SPLIT_K=1,
     )
-    if split > 1:
-        _reduce_kernel[lambda cfg: (triton.cdiv(m, cfg["BLOCK"]), 1)](
+
+
+def _launch_matrix_vector(call, split_k):
+    _gemv_tuned[lambda cfg: (call.m,)](
+        call.a,
+        call.x,
+        call.out,
+        call.m,
+        1,
+        call.k,
+        0,
+        *call.a_strides,
+        0,
+        call.x_stride,
+        0,
+        0,
+        call.out_stride,
+        0,
+        BATCH=1,
+        SPLIT_K=1,
+    )
+
+
+def _launch_vector_matrix(call, split_k):
+    am, ak = call.a_strides
+    _gemv_tuned[lambda cfg: (triton.cdiv(call.m, cfg["BN"]),)](
+        call.x,
+        call.a,
+        call.out,
+        1,
+        call.m,
+        call.k,
+        0,
+        0,
+        call.x_stride,
+        0,
+        ak,
+        am,
+        0,
+        0,
+        call.out_stride,
+        BATCH=1,
+        SPLIT_K=1,
+    )
+
+
+def _launch_column(call, split_k):
+    if split_k > 1:
+        target = torch.empty(
+            (split_k, call.m), device=call.a.device, dtype=torch.float32
+        )
+        target_strides = (split_k * call.m, 1)
+    else:
+        target, target_strides = call.out, (0, call.out_stride)
+    _column_kernel[lambda cfg: (triton.cdiv(call.m, cfg["BM"]), split_k, 1)](
+        call.a,
+        call.x,
+        target,
+        call.m,
+        call.k,
+        1,
+        0,
+        *call.a_strides,
+        0,
+        call.x_stride,
+        *target_strides,
+        SPLIT_K=split_k,
+    )
+    if split_k > 1:
+        _reduce_kernel[lambda cfg: (triton.cdiv(call.m, cfg["BLOCK"]), 1)](
             target,
-            out,
-            m,
+            call.out,
+            call.m,
             1,
-            split,
+            split_k,
             0,
-            out.stride(0),
+            call.out_stride,
         )
 
 
-def _byte_span(tensor):
-    start = tensor.data_ptr()
-    if tensor.numel() == 0:
-        return start, start
-    last = sum(
-        (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
-    )
-    return start, start + (last + 1) * tensor.element_size()
+def _launch_mv(plan, call):
+    """Execute exactly the selected plan; no validation or workload classification."""
+    plan.launch(call, plan.split_k)
+    return call.out
 
 
 def mv(input, vec, *, out=None):
-    """Compute a strided matrix-vector product in FP32 and round once to output."""
+    """Validate the call, dispatch its workload, then launch the selected plan."""
     logger.debug("GEMS METAX MV")
-    if input.layout != torch.strided or vec.layout != torch.strided:
-        raise NotImplementedError("MetaX mv supports strided dense tensors")
-    if input.ndim != 2 or vec.ndim != 1 or input.shape[1] != vec.shape[0]:
-        raise RuntimeError("mv expects a matrix [M, K] and a vector [K]")
-    if input.device != vec.device or input.dtype != vec.dtype:
-        raise RuntimeError("mv inputs must have the same device and dtype")
-    if input.device.type != "cuda":
-        raise NotImplementedError("MetaX mv requires a MetaX GPU")
-    if input.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise NotImplementedError("MetaX mv supports float16, bfloat16 and float32")
-    tensors = (input, vec) if out is None else (input, vec, out)
-    if out is not None and out.layout != torch.strided:
-        raise NotImplementedError("mv out must be a strided dense tensor")
-    if torch.is_grad_enabled() and any(t.requires_grad for t in tensors):
-        raise NotImplementedError("MetaX mv is inference-only; use torch.no_grad()")
-    if any(
-        t.is_conj() or t.is_neg() or any(s < 0 for s in t.stride()) for t in tensors
-    ):
-        raise NotImplementedError(
-            "MetaX mv does not support lazy conjugate/negative views"
-        )
-
-    m, k = input.shape
-    if out is None:
-        out = torch.empty((m,), device=input.device, dtype=input.dtype)
-    else:
-        if out.shape != (m,) or out.dtype != input.dtype or out.device != input.device:
-            raise RuntimeError(
-                "mv out must have shape [M] and match the input dtype/device"
-            )
-        if m > 1 and out.stride(0) == 0:
-            raise NotImplementedError("mv out must not have overlapping elements")
-        lo, hi = _byte_span(out)
-        for tensor in (input, vec):
-            other_lo, other_hi = _byte_span(tensor)
-            if max(lo, other_lo) < min(hi, other_hi):
-                raise NotImplementedError(
-                    "mv out must not overlap an input storage span"
-                )
-
+    call = _validate_mv(input, vec, out)
     with torch_device_fn.device(input.device):
-        _launch_gemv(input, vec, out)
-    return out
+        plan = _dispatch_mv(call)
+        return _launch_mv(plan, call)
+
+
+def _mv_for_bmm(input, vec, out):
+    """MV entry for BMM's additional half-input / FP32-output contract."""
+    call = _validate_mv(input, vec, out, allow_fp32_output=True)
+    with torch_device_fn.device(input.device):
+        plan = _dispatch_mv(call)
+        return _launch_mv(plan, call)
 
 
 def _selected_config(a, x, out):
-    """Inspect the chosen layout and tile after a warmup call."""
+    """Inspect the cached plan and tile after a warmup call."""
     m, k = a.shape
     if not m or not k:
         return dict(algorithm="empty" if not m else "zero")
-    column_major = a.stride(0) < a.stride(1)
-    if not column_major:
-        family = _ROW_PLANS[_row_plan_key(a, x, out)]
-        if family != "row":
-            args = _row_args(family, a, x, out)
-            key = (1, *args[3:], 1, str(a.dtype), str(x.dtype), str(out.dtype))
-            return dict(
-                algorithm="mv_" + family, split_k=1, best=str(_gemv_tuned.fn.cache[key])
-            )
-    split = _split_count(m, k) if column_major else 1
+    plan = _MV_PLANS[_plan_key(a, x, out)]
+    if plan.family in ("matrix_vector", "vector_matrix"):
+        am, ak = a.stride()
+        xk, ym = x.stride(0), out.stride(0)
+        meta = (
+            (m, 1, k, 0, am, ak, 0, xk, 0, 0, ym, 0)
+            if plan.family == "matrix_vector"
+            else (1, m, k, 0, 0, xk, 0, ak, am, 0, 0, ym)
+        )
+        key = (1, *meta, 1, str(a.dtype), str(x.dtype), str(out.dtype))
+        return dict(
+            algorithm="mv_" + plan.family,
+            split_k=1,
+            best=str(_gemv_tuned.fn.cache[key]),
+        )
+    split = plan.split_k
     strides = (split * m, 1) if split > 1 else (0, out.stride(0))
     key = (m, k, 1, 0, *a.stride(), 0, x.stride(0), *strides, split)
     key += (str(a.dtype), str(x.dtype), str(torch.float32 if split > 1 else out.dtype))
-    kernel = _column_kernel if column_major else _row_kernel
+    kernel = _column_kernel if plan.family == "column" else _row_kernel
     return dict(
-        algorithm="mv_column" if column_major else "mv_row",
-        split_k=split,
-        best=str(kernel.fn.cache[key]),
+        algorithm="mv_" + plan.family, split_k=split, best=str(kernel.fn.cache[key])
     )

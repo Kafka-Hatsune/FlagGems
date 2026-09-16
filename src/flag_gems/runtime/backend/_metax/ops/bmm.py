@@ -29,7 +29,7 @@ from flag_gems.utils import libentry, libtuner
 from flag_gems.utils.libentry import LibTuner
 
 from .mm import mm_out as _optimized_mm_out
-from .mv import _gemv_tuned, _graph_bench, _launch_gemv
+from .mv import _gemv_tuned, _graph_bench, _mv_for_bmm
 from .mv import _selected_config as _selected_mv_config
 
 logger = logging.getLogger(__name__)
@@ -1151,9 +1151,9 @@ def bmm(input, mat2, out_dtype=None, *, out=None):
     with runtime.torch_device_fn.device(input.device):
         route = _forward_kind(input, mat2, out)
         if route == "mv_column":
-            _launch_gemv(input[0], mat2[0, :, 0], out[0, :, 0])
+            _mv_for_bmm(input[0], mat2[0, :, 0], out[0, :, 0])
         elif route == "mv_row":
-            _launch_gemv(mat2[0].T, input[0, 0, :], out[0, 0, :])
+            _mv_for_bmm(mat2[0].T, input[0, 0, :], out[0, 0, :])
         elif route == "mm":
             _optimized_mm_out(input[0], mat2[0], out=out[0])
         else:

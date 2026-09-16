@@ -95,7 +95,7 @@ def test_bmm_forwarding_preserves_storage(
     monkeypatch.setattr(
         backend, "_optimized_mm_out", wrap(backend._optimized_mm_out, "mm")
     )
-    monkeypatch.setattr(backend, "_launch_gemv", wrap(backend._launch_gemv, "mv"))
+    monkeypatch.setattr(backend, "_mv_for_bmm", wrap(backend._mv_for_bmm, "mv"))
     result = flag_gems.bmm(a, b, out=out)
     assert result is out
     assert calls == ([] if expected == "batched" else [expected])
