@@ -8,7 +8,7 @@ from .amax import amax
 from .arange import arange, arange_start
 from .avg_pool3d import avg_pool3d_backward
 from .baddbmm import baddbmm, baddbmm_out
-from .bmm import bmm
+from .bmm import bmm, bmm_out
 from .broadcast_to import broadcast_to
 from .cholesky_solve import cholesky_solve, cholesky_solve_out
 from .conv_depthwise2d import _conv_depthwise2d
@@ -102,6 +102,7 @@ __all__ = [
     "baddbmm",
     "baddbmm_out",
     "bmm",
+    "bmm_out",
     "broadcast_to",
     "cholesky_solve",
     "cholesky_solve_out",

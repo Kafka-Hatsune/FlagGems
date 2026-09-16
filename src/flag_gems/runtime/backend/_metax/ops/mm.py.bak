@@ -1,13 +1,22 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""MetaX batched matmul with batch-aware scheduling and stride-aware kernels.
+"""MetaX MM and shared GEMM compute primitives.
 
-Batches share one CTA space, with GEMV, GEMM, dual-dot and split-K candidates.
-Batch-one vectors use mv.py. Compatible batch-one matrices call the optimized
-mm.py's mm_out; irregular views stay on this module's stride-aware path so
-forwarding never adds an input copy. The old MM is archived as mm.py.bak and
-is not imported. All packing/partial reductions belong to the chosen algorithm.
+The host builds one Features record and one Plan for every call. A plan selects
+GEMV (implemented in mv.py), GEMM (one tiled dot), or dual GEMM (two dots
+sharing an operand). BMM owns its batched plan/grid and shares these arithmetic
+and execution primitives; no arithmetic lives in bmm.py. Packing and deterministic
+split-K execute the decisions of the calling operator's plan.
+Each family has its own YAML candidates and exact stride/dtype autotune key.
+
+Dual GEMM trades some input reuse for smaller output tiles. It is considered
+when a long, aligned half-precision GEMM wastes a significant fraction of a
+device wave with square tiles. Grid size is derived from the actual workload;
+neither dimensions nor the number of SMs are an algorithm lookup table.
+
+All arithmetic is Triton with FP32 accumulation and IEEE FP32 dot precision.
+Warm each workload before CUDA Graph capture; first use may compile and tune.
 """
 
 import copy
@@ -24,13 +33,18 @@ from typing import Any, Callable, NamedTuple
 import torch
 import triton
 import triton.language as tl
-from flag_gems import runtime
-from flag_gems.utils import libentry, libtuner
-from flag_gems.utils.libentry import LibTuner
-
-from .mm import mm_out as _optimized_mm_out
-from .mv import _gemv_tuned, _graph_bench, _launch_gemv
-from .mv import _selected_config as _selected_mv_config
+from flaggems_vllm import runtime
+from flaggems_vllm.runtime.backend._metax.ops.mv import _launch_narrow
+from flaggems_vllm.runtime.backend._metax.ops.mv import (
+    _matrix_reduce_tuned as _reduce_tuned,
+)
+from flaggems_vllm.runtime.backend._metax.ops.mv import _mv_out, _narrow_split_count
+from flaggems_vllm.runtime.backend._metax.ops.mv import (
+    _selected_config as _selected_mv_config,
+)
+from flaggems_vllm.runtime.backend._metax.ops.mv import _selected_narrow
+from flaggems_vllm.utils import libentry, libtuner
+from flaggems_vllm.utils.libentry import LibTuner
 
 logger = logging.getLogger(__name__)
 
@@ -224,14 +238,8 @@ def _pack_profitable(f: _Features) -> bool:
 
 
 @lru_cache(maxsize=4096)
-def _make_bmm_plan(f: _Features, allow_dual: bool = True) -> _Plan:
-    """Choose for the whole batch, independently of MM's operator dispatch.
-
-    Cost helpers consume f.batch as well as matrix dimensions: available batch
-    parallelism can already fill device waves, making extra K partitions or
-    smaller dual tiles unnecessary. Packing reuse is evaluated per matrix;
-    input batch strides, including zero/broadcast strides, remain unchanged.
-    """
+def _make_plan(f: _Features, allow_dual: bool = True) -> _Plan:
+    """MM policy; BMM has its own policy using the shared hardware/cost helpers."""
     if not f.batch or not f.m or not f.n:
         return _Plan("empty")
     if not f.k:
@@ -552,6 +560,11 @@ def _prune_dual(configs, named_args, **kwargs):
     return result
 
 
+def _graph_bench(fn, quantiles):
+    # Use the same device execution mode as deployment, including short kernels.
+    return triton.testing.do_bench_cudagraph(fn, rep=20, quantiles=quantiles)
+
+
 class _KernelTuner(LibTuner):
     """Benchmark explicit tiles; prevent AABS from mutating them into invalid MMA layouts."""
 
@@ -769,16 +782,12 @@ def _make_tuner(kernel, name, key, prune=None, policy=_KernelTuner):
 
 
 if runtime.device.vendor_name == "metax":
-    _gemm_tuned = libentry()(
-        _make_tuner(_gemm_kernel, "bmm_lt", _MATRIX_KEY, _prune_gemm)
-    )
+    _gemm_tuned = libentry()(_make_tuner(_gemm_kernel, "bmm", _MATRIX_KEY, _prune_gemm))
     _pack_tuned = libentry()(
-        _make_tuner(
-            _pack_rhs_kernel, "bmm_lt_pack", ["BATCH", "R", "C", "SB", "SR", "SC"]
-        )
+        _make_tuner(_pack_rhs_kernel, "bmm_pack", ["BATCH", "R", "C", "SB", "SR", "SC"])
     )
     _dual_tuner = _make_tuner(
-        _dual_gemm_kernel, "bmm_lt_dual", _MATRIX_KEY[:-1], _prune_dual, _DualTuner
+        _dual_gemm_kernel, "bmm_dual", _MATRIX_KEY[:-1], _prune_dual, _DualTuner
     )
     _DUAL_TILES = tuple(
         sorted(
@@ -788,110 +797,6 @@ if runtime.device.vendor_name == "metax":
             }
         )
     )
-
-
-def _narrow_split_count(f):
-    """Preserve the existing feature-based split policy for narrow matrices."""
-    return (
-        8
-        if f.m == 1 and f.n >= 64 and f.reduction_tiles >= 32 and not f.rhs_k_contiguous
-        else 1
-    )
-
-
-@triton.jit
-def _matrix_reduce_kernel(
-    P,
-    C,
-    M: tl.constexpr,
-    N: tl.constexpr,
-    TOTAL: tl.constexpr,
-    SCB: tl.constexpr,
-    SCM: tl.constexpr,
-    SCN: tl.constexpr,
-    SPLIT_K: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """Each lane owns one output; add FP32 partials without atomic operations."""
-    i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    # Each lane owns its output throughout the reduction. Distributing the split
-    # dimension across warps introduces shared-memory exchanges for small outputs.
-    result = tl.full((BLOCK,), 0, tl.float32)
-    for s in tl.static_range(SPLIT_K):
-        result += tl.load(P + s * TOTAL + i, i < TOTAL, other=0)
-    offset = i // (M * N) * SCB + (i // N % M) * SCM + (i % N) * SCN
-    tl.store(C + offset, result, i < TOTAL)
-
-
-_reduce_tuned = libentry()(
-    _make_tuner(
-        _matrix_reduce_kernel,
-        "bmm_lt_reduce",
-        ["M", "N", "TOTAL", "SCB", "SCM", "SCN", "SPLIT_K"],
-    )
-)
-
-
-def _launch_narrow(
-    a, b, out, *, batch, m, n, k, a_strides, b_strides, out_strides, split_k=1
-):
-    """Batched vector-times-matrix reductions, retaining the original arithmetic."""
-    partial = (
-        torch.empty((split_k, batch, m, n), device=a.device, dtype=torch.float32)
-        if split_k > 1
-        else out
-    )
-    strides = (m * n, n, 1) if split_k > 1 else out_strides
-    grid = lambda cfg: (split_k * batch * m * triton.cdiv(n, cfg["BN"]),)
-    _gemv_tuned[grid](
-        a,
-        b,
-        partial,
-        m,
-        n,
-        k,
-        *a_strides,
-        *b_strides,
-        *strides,
-        BATCH=batch,
-        SPLIT_K=split_k,
-    )
-    if split_k > 1:
-        total = batch * m * n
-        _reduce_tuned[lambda cfg: (triton.cdiv(total, cfg["BLOCK"]),)](
-            partial,
-            out,
-            m,
-            n,
-            total,
-            *out_strides,
-            SPLIT_K=split_k,
-        )
-
-
-def _selected_narrow(f, split_k):
-    strides = (f.m * f.n, f.n, 1) if split_k > 1 else f.c_strides
-    key = (f.batch, f.m, f.n, f.k, *f.a_strides, *f.b_strides, *strides, split_k)
-    key += (
-        str(f.dtype),
-        str(f.dtype),
-        str(torch.float32 if split_k > 1 else f.out_dtype),
-    )
-    result = dict(
-        algorithm="gemv", split_k=split_k, best=str(_gemv_tuned.fn.cache[key])
-    )
-    if split_k > 1:
-        key = (
-            f.m,
-            f.n,
-            f.batch * f.m * f.n,
-            *f.c_strides,
-            split_k,
-            str(torch.float32),
-            str(f.out_dtype),
-        )
-        result["reduce"] = str(_reduce_tuned.fn.cache[key])
-    return result
 
 
 # Public API validation and execution.
@@ -1014,7 +919,7 @@ def _execute_matrix(plan: _Plan, f: _Features, a, b, c, *, gemm_grid=None):
         )
 
 
-def _selected_batched_config(input, mat2, out, *, planner=_make_bmm_plan):
+def _selected_config(input, mat2, out, *, planner=_make_plan):
     """Explain the selected family and actual configuration without computation."""
     f = _extract_features(input, mat2, out)
     plan = planner(f)
@@ -1097,82 +1002,36 @@ def _execute_plan(plan, f, input, mat2, out, *, fallback_plan, gemm_grid=None):
     return out
 
 
-def _batched_gemm_grid(f: _Features, split_k: int, config):
-    """One CTA space over batch × K partitions × output tiles.
-
-    The shared kernel decodes batch/split first, then applies GROUP_M ordering
-    within each matrix. This preserves the existing batch-major schedule;
-    interleaving batches or persistent work queues would be separate changes.
-    """
-    rows, columns = (f.n, f.m) if config.get("TRANSPOSE", False) else (f.m, f.n)
-    tiles_per_matrix = triton.cdiv(rows, config["BM"]) * triton.cdiv(
-        columns, config["BN"]
-    )
-    return (f.batch * split_k * tiles_per_matrix,)
-
-
-def _bmm_out(input, mat2, out):
-    """Launch a validated batch through shared kernels, not the MM interface."""
-    features = _extract_features(input, mat2, out)
-    plan = _make_bmm_plan(features)
-    return _execute_plan(
-        plan,
-        features,
-        input,
-        mat2,
-        out,
-        fallback_plan=lambda: _make_bmm_plan(features, allow_dual=False),
-        gemm_grid=_batched_gemm_grid,
-    )
-
-
-def _forward_kind(input, mat2, out):
-    """Select an interface only when it can consume the original views."""
-    if input.shape[0] != 1 or not out.numel() or not input.shape[-1]:
-        return "batched"
-    if mat2.shape[-1] == 1:
-        return "mv_column"
-    if input.shape[-2] == 1:
-        return "mv_row"
-    # The optimized MM materializes inputs with two non-unit strides; several
-    # specialized MM epilogues also assume contiguous output. Preserve these
-    # cases in BMM instead of introducing a forwarding copy or an out mismatch.
-    if out[0].is_contiguous() and all(
-        1 in tensor.stride()[-2:] for tensor in (input, mat2)
-    ):
-        return "mm"
-    return "batched"
-
-
-def bmm(input, mat2, out_dtype=None, *, out=None):
-    """Batch matmul; metadata-only forwarding preserves the caller's output."""
-    logger.debug("GEMS METAX BMM")
-    out = _validate_matmul(input, mat2, out_dtype, out, rank=3)
-    with runtime.torch_device_fn.device(input.device):
-        route = _forward_kind(input, mat2, out)
-        if route == "mv_column":
-            _launch_gemv(input[0], mat2[0, :, 0], out[0, :, 0])
-        elif route == "mv_row":
-            _launch_gemv(mat2[0].T, input[0, 0, :], out[0, 0, :])
-        elif route == "mm":
-            _optimized_mm_out(input[0], mat2[0], out=out[0])
-        else:
-            _bmm_out(input, mat2, out)
+def _mm_out(input, mat2, out):
+    """Shared checked-out entry for MM and batch-one BMM; views only."""
+    if mat2.shape[1] == 1:
+        _mv_out(input, mat2[:, 0], out[:, 0])
+    elif input.shape[0] == 1:
+        _mv_out(mat2.T, input[0], out[0])
+    else:
+        a, b, c = input.unsqueeze(0), mat2.unsqueeze(0), out.unsqueeze(0)
+        features = _extract_features(a, b, c)
+        _execute_plan(
+            _make_plan(features),
+            features,
+            a,
+            b,
+            c,
+            fallback_plan=lambda: _make_plan(features, allow_dual=False),
+        )
     return out
 
 
-def bmm_out(input, mat2, *, out):
-    """ATen bmm.out registration, sharing the same implementation and checks."""
-    return bmm(input, mat2, out=out)
+def mm(input, mat2, out_dtype=None, *, out=None):
+    """Inference MM with FP32 accumulation, explicit strides and optional FP32 out."""
+    out = _validate_matmul(input, mat2, out_dtype, out, rank=2)
+    with runtime.torch_device_fn.device(input.device):
+        return _mm_out(input, mat2, out)
 
 
-def _selected_config(input, mat2, out):
-    """Report the path that ran, without duplicating optimized MM dispatch."""
-    route = _forward_kind(input, mat2, out)
-    if route == "mv_column":
-        return _selected_mv_config(input[0], mat2[0, :, 0], out[0, :, 0])
-    if route == "mv_row":
-        return _selected_mv_config(mat2[0].T, input[0, 0, :], out[0, 0, :])
-    if route == "mm":
-        return {"algorithm": "mm", "implementation": _optimized_mm_out.__module__}
-    return _selected_batched_config(input, mat2, out)
+def _selected_mm_config(input, mat2, out):
+    if mat2.shape[1] == 1:
+        return _selected_mv_config(input, mat2[:, 0], out[:, 0])
+    if input.shape[0] == 1:
+        return _selected_mv_config(mat2.T, input[0], out[0])
+    return _selected_config(input.unsqueeze(0), mat2.unsqueeze(0), out.unsqueeze(0))
