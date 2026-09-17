@@ -121,6 +121,33 @@ class TunedConfigLoader(object):
                 for w in ranges["w"]
             ]
 
+        if op_name in ("mv_row", "mv_column"):
+            return [
+                triton.Config(
+                    {"BM": bm, "BK": bk},
+                    num_stages=s,
+                    num_warps=w,
+                    pre_hook=pre_hook,
+                )
+                for bm in ranges["BM"]
+                for bk in ranges["BK"]
+                for s in ranges["s"]
+                for w in ranges["w"]
+            ]
+
+        if op_name == "mv_reduce":
+            return [
+                triton.Config(
+                    {"BLOCK": block},
+                    num_stages=s,
+                    num_warps=w,
+                    pre_hook=pre_hook,
+                )
+                for block in ranges["BLOCK"]
+                for s in ranges["s"]
+                for w in ranges["w"]
+            ]
+
         if op_name == "addmm":
             return [
                 triton.Config(
@@ -613,6 +640,16 @@ class TunedConfigLoader(object):
                 "bmm", expand_yaml_path=self._get_expand_config_path("bmm")
             ),
             "bmm_sqmma": self._build_single_expand_spec("bmm_sqmma"),
+            # The MetaX MV kernels share one expand file named after the operator.
+            "mv_row": self._build_single_expand_spec(
+                "mv_row", expand_yaml_path=self._get_expand_config_path("mv")
+            ),
+            "mv_column": self._build_single_expand_spec(
+                "mv_column", expand_yaml_path=self._get_expand_config_path("mv")
+            ),
+            "mv_reduce": self._build_single_expand_spec(
+                "mv_reduce", expand_yaml_path=self._get_expand_config_path("mv")
+            ),
             "fused_marlin_moe_w4a16_int4": self._build_single_expand_spec(
                 "fused_marlin_moe_w4a16_int4",
                 expand_yaml_path=self._get_expand_config_path(

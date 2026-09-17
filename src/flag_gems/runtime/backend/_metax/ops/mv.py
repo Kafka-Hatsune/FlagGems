@@ -23,6 +23,17 @@ from flag_gems.utils.device_info import get_sm_count
 
 logger = logging.getLogger(__name__)
 
+# A BMxBK tile is accumulated in float32 private memory, of which MetaX allows
+# 4 KB per thread. A tile above _MAX_TILE_ELEMS overruns that even at the
+# maximum warp count, and one above _MAX_TILE_ELEMS_PER_WARP per warp overruns
+# it at the warp count it is paired with; either way the launch fails with
+# mcErrorMemoryValueTooLarge instead of falling back. Every config in
+# tune_configs.yaml stays under both limits, so these bounds only matter for
+# candidates added later.
+_MAX_TILE_ELEMS = 32768
+_MAX_TILE_ELEMS_PER_WARP = 16384
+
+
 def _prune_tiles(configs, named_args, **kwargs):
     # AABS may shrink a candidate in-place; keep the search space for later shapes.
     args = {**named_args, **kwargs}
@@ -32,6 +43,9 @@ def _prune_tiles(configs, named_args, **kwargs):
         for config in configs
         if config.kwargs["BM"] <= max(16, triton.next_power_of_2(m))
         and config.kwargs["BK"] <= max(128, triton.next_power_of_2(k))
+        and config.kwargs["BM"] * config.kwargs["BK"] <= _MAX_TILE_ELEMS
+        and config.kwargs["BM"] * config.kwargs["BK"]
+        <= _MAX_TILE_ELEMS_PER_WARP * config.num_warps
     ]
 
 
@@ -45,6 +59,7 @@ _KEY = ["M", "K", "BATCH", "SAB", "SAM", "SAK", "SXB", "SXK", "SYB", "SYM", "SPL
     prune_configs_by={"early_config_prune": _prune_tiles},
     use_cuda_graph=True,
     rep=20,
+    flagtune_op_name="mv_row",
 )
 @triton.jit
 def _mv_row_kernel(
@@ -83,6 +98,7 @@ def _mv_row_kernel(
     prune_configs_by={"early_config_prune": _prune_tiles},
     use_cuda_graph=True,
     rep=20,
+    flagtune_op_name="mv_column",
 )
 @triton.jit
 def _mv_column_kernel(
@@ -132,6 +148,7 @@ def _mv_column_kernel(
     },
     use_cuda_graph=True,
     rep=20,
+    flagtune_op_name="mv_reduce",
 )
 @triton.jit
 def _mv_reduce_kernel(
