@@ -10,9 +10,7 @@ and layout choices are cached; partial results are always call-local.
 """
 
 import copy
-import hashlib
 import logging
-from functools import cached_property, partial
 from typing import Callable, NamedTuple
 
 import torch
@@ -22,7 +20,6 @@ from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry, libtuner
 from flag_gems.utils.device_info import get_sm_count
-from flag_gems.utils.libentry import LibTuner
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +163,7 @@ class _MvPlan(NamedTuple):
 
 
 class _MvCall(NamedTuple):
-    """Validated tensors and metadata for one invocation."""
+    """Tensors and metadata for one invocation."""
 
     a: torch.Tensor
     x: torch.Tensor
@@ -176,75 +173,6 @@ class _MvCall(NamedTuple):
     a_strides: tuple
     x_stride: int
     out_stride: int
-
-
-def _byte_span(tensor):
-    start = tensor.data_ptr()
-    if tensor.numel() == 0:
-        return start, start
-    last = sum(
-        (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
-    )
-    return start, start + (last + 1) * tensor.element_size()
-
-
-def _validate_mv(input, vec, out):
-    """Establish the complete call contract before dispatch or GPU execution.
-
-    A missing output is allocated here so its layout/alignment are also known.
-    This allocates storage only; no input is copied or materialized.
-    """
-    if input.layout != torch.strided or vec.layout != torch.strided:
-        raise NotImplementedError("MetaX mv supports strided dense tensors")
-    if input.ndim != 2 or vec.ndim != 1 or input.shape[1] != vec.shape[0]:
-        raise RuntimeError("mv expects a matrix [M, K] and a vector [K]")
-    if input.device != vec.device or input.dtype != vec.dtype:
-        raise RuntimeError("mv inputs must have the same device and dtype")
-    if input.device.type != "cuda":
-        raise NotImplementedError("MetaX mv requires a MetaX GPU")
-    if input.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise NotImplementedError("MetaX mv supports float16, bfloat16 and float32")
-
-    m, k = input.shape
-    tensors = (input, vec) if out is None else (input, vec, out)
-    if out is not None:
-        if out.layout != torch.strided:
-            raise NotImplementedError("mv out must be a strided dense tensor")
-        valid_dtype = out.dtype == input.dtype
-        if out.shape != (m,) or not valid_dtype or out.device != input.device:
-            raise RuntimeError(
-                "mv out must have shape [M] and a compatible dtype/device"
-            )
-        if m > 1 and out.stride(0) == 0:
-            raise NotImplementedError("mv out must not have overlapping elements")
-    if torch.is_grad_enabled() and any(t.requires_grad for t in tensors):
-        raise NotImplementedError("MetaX mv is inference-only; use torch.no_grad()")
-    # Only real dtypes are accepted above, so a separate conjugate check is redundant.
-    if any(t.is_neg() or any(s < 0 for s in t.stride()) for t in tensors):
-        raise NotImplementedError(
-            "MetaX mv does not support lazy negative views or negative strides"
-        )
-    if out is not None:
-        lo, hi = _byte_span(out)
-        for tensor in (input, vec):
-            other_lo, other_hi = _byte_span(tensor)
-            if max(lo, other_lo) < min(hi, other_hi):
-                raise NotImplementedError(
-                    "mv out must not overlap an input storage span"
-                )
-    else:
-        out = torch.empty((m,), device=input.device, dtype=input.dtype)
-
-    return _MvCall(
-        input,
-        vec,
-        out,
-        m,
-        k,
-        input.stride(),
-        vec.stride(0),
-        out.stride(0)
-    )
 
 
 def _split_count(m, k):
@@ -316,9 +244,14 @@ def _launch_column(call, split_k = -1):
 
 
 def mv(input, vec, *, out=None):
-    """Validate the call, dispatch its workload, then launch the selected plan."""
+    """Dispatch the workload from tensor metadata, then launch the selected plan."""
     logger.debug("GEMS METAX MV")
-    call = _validate_mv(input, vec, out)
+    m, k = input.shape
+    if out is None:
+        out = torch.empty((m,), device=input.device, dtype=input.dtype)
+    call = _MvCall(
+        input, vec, out, m, k, input.stride(), vec.stride(0), out.stride(0)
+    )
     with torch_device_fn.device(input.device):
         plan = _dispatch_mv(call)
         plan.launch(call, plan.split_k)
