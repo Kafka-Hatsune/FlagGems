@@ -18,7 +18,7 @@ mv_row:
         BLOCK_M: block_m
       num_stages: stages
       num_warps: warps
-    block_n: 
+    block_n:
       - 1
       - 2
       - 4
@@ -26,7 +26,7 @@ mv_row:
       - 16
       - 32
       - 64
-    block_m: 
+    block_m:
       - 64
       - 128
       - 256
@@ -57,7 +57,7 @@ mv_column:
         BLOCK_M: block_m
       num_stages: stages
       num_warps: warps
-    block_n: 
+    block_n:
       - 1
       - 2
       - 4
@@ -69,7 +69,7 @@ mv_column:
       - 256
       - 512
       - 1024
-    block_m: 
+    block_m:
       - 16
       - 32
       - 64

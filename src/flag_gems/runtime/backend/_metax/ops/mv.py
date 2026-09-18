@@ -17,6 +17,7 @@ from typing import Callable, NamedTuple
 import torch
 import triton
 import triton.language as tl
+
 from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry, libtuner
@@ -233,7 +234,7 @@ def _launch_row(call, split_k):
     )
 
 
-def _launch_column(call, split_k = -1):
+def _launch_column(call, split_k=-1):
     if split_k > 1:
         target = torch.empty(
             (split_k, call.m), device=call.a.device, dtype=torch.float32
@@ -273,9 +274,7 @@ def mv(input, vec, *, out=None):
     m, k = input.shape
     if out is None:
         out = torch.empty((m,), device=input.device, dtype=input.dtype)
-    call = _MvCall(
-        input, vec, out, m, k, input.stride(), vec.stride(0), out.stride(0)
-    )
+    call = _MvCall(input, vec, out, m, k, input.stride(), vec.stride(0), out.stride(0))
     with torch_device_fn.device(input.device):
         plan = _dispatch_mv(call)
         plan.launch(call, plan.split_k)
