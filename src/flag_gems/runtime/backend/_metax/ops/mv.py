@@ -23,7 +23,7 @@ from flag_gems.utils.device_info import get_sm_count
 
 logger = logging.getLogger(__name__)
 
-# A BMxBK tile is accumulated in float32 private memory, of which MetaX allows
+# A BLOCK_N x BLOCK_M tile is accumulated in float32 private memory, of which MetaX allows
 # 4 KB per thread. A tile above _MAX_TILE_ELEMS overruns that even at the
 # maximum warp count, and one above _MAX_TILE_ELEMS_PER_WARP per warp overruns
 # it at the warp count it is paired with; either way the launch fails with
@@ -41,10 +41,10 @@ def _prune_tiles(configs, named_args, **kwargs):
     return [
         copy.deepcopy(config)
         for config in configs
-        if config.kwargs["BM"] <= max(16, triton.next_power_of_2(m))
-        and config.kwargs["BK"] <= max(128, triton.next_power_of_2(k))
-        and config.kwargs["BM"] * config.kwargs["BK"] <= _MAX_TILE_ELEMS
-        and config.kwargs["BM"] * config.kwargs["BK"]
+        if config.kwargs["BLOCK_N"] <= max(16, triton.next_power_of_2(m))
+        and config.kwargs["BLOCK_M"] <= max(128, triton.next_power_of_2(k))
+        and config.kwargs["BLOCK_N"] * config.kwargs["BLOCK_M"] <= _MAX_TILE_ELEMS
+        and config.kwargs["BLOCK_N"] * config.kwargs["BLOCK_M"]
         <= _MAX_TILE_ELEMS_PER_WARP * config.num_warps
     ]
 
@@ -72,15 +72,15 @@ def _mv_row_kernel(
     SAK: tl.constexpr,
     SXK: tl.constexpr,
     SYM: tl.constexpr,
-    BM: tl.constexpr,
-    BK: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
 ):
-    # BM=1 is one output per CTA; larger BM shares x across several rows.
-    rows = (tl.program_id(0) * BM + tl.arange(0, BM)).to(tl.int64)
-    offsets = tl.arange(0, BK).to(tl.int64)
-    acc = tl.zeros((BM, BK), tl.float32)
-    for block in range(tl.cdiv(K, BK)):
-        ks = block * BK + offsets
+    # BLOCK_N=1 is one output per CTA; larger BLOCK_N shares x across several rows.
+    rows = (tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
+    offsets = tl.arange(0, BLOCK_M).to(tl.int64)
+    acc = tl.zeros((BLOCK_N, BLOCK_M), tl.float32)
+    for block in range(tl.cdiv(K, BLOCK_M)):
+        ks = block * BLOCK_M + offsets
         x = tl.load(X + ks * SXK, ks < K, other=0).to(tl.float32)
         a = tl.load(
             A + rows[:, None] * SAM + ks[None, :] * SAK,
@@ -116,17 +116,17 @@ def _mv_column_kernel(
     SYB: tl.constexpr,
     SYM: tl.constexpr,
     SPLIT_K: tl.constexpr,
-    BM: tl.constexpr,
-    BK: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
 ):
-    rows = tl.program_id(0) * BM + tl.arange(0, BM)
+    rows = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
     part = tl.program_id(1)
     batch = tl.program_id(2)
-    offsets = tl.arange(0, BK)
+    offsets = tl.arange(0, BLOCK_M)
     # Rows are the inner dimension: contiguous column-major loads need no
     # materialized transpose, and each x element is reused across these rows.
-    acc = tl.zeros((BK, BM), tl.float32)
-    for start in range(part * BK, K, SPLIT_K * BK):
+    acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+    for start in range(part * BLOCK_M, K, SPLIT_K * BLOCK_M):
         ks = start + offsets
         a = tl.load(
             A + batch * SAB + ks[:, None] * SAK + rows[None, :] * SAM,
@@ -214,7 +214,7 @@ def _dispatch_mv(call):
 
 
 def _launch_row(call, split_k):
-    _mv_row_kernel[lambda cfg: (triton.cdiv(call.m, cfg["BM"]),)](
+    _mv_row_kernel[lambda cfg: (triton.cdiv(call.m, cfg["BLOCK_N"]),)](
         call.a,
         call.x,
         call.out,
@@ -234,7 +234,7 @@ def _launch_column(call, split_k = -1):
         target_strides = (split_k * call.m, 1)
     else:
         target, target_strides = call.out, (0, call.out_stride)
-    _mv_column_kernel[lambda cfg: (triton.cdiv(call.m, cfg["BM"]), split_k, 1)](
+    _mv_column_kernel[lambda cfg: (triton.cdiv(call.m, cfg["BLOCK_N"]), split_k, 1)](
         call.a,
         call.x,
         target,

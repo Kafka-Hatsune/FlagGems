@@ -121,20 +121,6 @@ class TunedConfigLoader(object):
                 for w in ranges["w"]
             ]
 
-        if op_name in ("mv_row", "mv_column"):
-            return [
-                triton.Config(
-                    {"BM": bm, "BK": bk},
-                    num_stages=s,
-                    num_warps=w,
-                    pre_hook=pre_hook,
-                )
-                for bm in ranges["BM"]
-                for bk in ranges["BK"]
-                for s in ranges["s"]
-                for w in ranges["w"]
-            ]
-
         if op_name == "mv_reduce":
             return [
                 triton.Config(
@@ -187,7 +173,7 @@ class TunedConfigLoader(object):
                 for w in ranges["w"]
             ]
 
-        if op_name == "mv":
+        if op_name in ("mv", "mv_row", "mv_column"):
             return [
                 triton.Config(
                     {

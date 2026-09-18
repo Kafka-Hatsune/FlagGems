@@ -1,23 +1,24 @@
 # Expanded MV search spaces for FlagTune. Only consulted in EXPANDED tuning
 # mode, so tune_configs.yaml keeps the typical candidates used at runtime.
 #
-# Generator source names upper-case to the kernel's META parameters: `bm` feeds
-# BM, `bk` feeds BK, `block` feeds BLOCK. Tiles that overrun MetaX private
-# memory are dropped later by _prune_tiles rather than being excluded here.
+# Generator source names upper-case to the kernel's META parameters: `block_n`
+# feeds BLOCK_N, `block_m` feeds BLOCK_M, `block` feeds BLOCK. Tiles that
+# overrun MetaX private memory are dropped later by _prune_tiles rather than
+# being excluded here.
 #
 # The row and column kernels sweep mirrored spaces on purpose. Each keeps the
 # matrix's unit-stride axis on the tile's inner dimension, so the row kernel
-# wants a wide BK and the column kernel a wide BM.
+# wants a wide BLOCK_M and the column kernel a wide BLOCK_N.
 
 mv_row:
   - config:
     param_map:
       META:
-        BM: bm
-        BK: bk
+        BLOCK_N: block_n
+        BLOCK_M: block_m
       num_stages: stages
       num_warps: warps
-    bm: 
+    block_n: 
       - 1
       - 2
       - 4
@@ -25,7 +26,7 @@ mv_row:
       - 16
       - 32
       - 64
-    bk: 
+    block_m: 
       - 64
       - 128
       - 256
@@ -52,11 +53,11 @@ mv_column:
   - config:
     param_map:
       META:
-        BM: bm
-        BK: bk
+        BLOCK_N: block_n
+        BLOCK_M: block_m
       num_stages: stages
       num_warps: warps
-    bm: 
+    block_n: 
       - 1
       - 2
       - 4
@@ -68,7 +69,7 @@ mv_column:
       - 256
       - 512
       - 1024
-    bk: 
+    block_m: 
       - 16
       - 32
       - 64

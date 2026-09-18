@@ -1744,59 +1744,59 @@ gru:
 # MetaX MV layout candidates.
 
 mv_row:
-  - META: {BM: 1, BK: 128}
+  - META: {BLOCK_N: 1, BLOCK_M: 128}
     num_warps: 1
     num_stages: 1
-  - META: {BM: 1, BK: 256}
+  - META: {BLOCK_N: 1, BLOCK_M: 256}
     num_warps: 4
     num_stages: 1
-  - META: {BM: 1, BK: 1024}
+  - META: {BLOCK_N: 1, BLOCK_M: 1024}
     num_warps: 4
     num_stages: 1
-  - META: {BM: 1, BK: 2048}
+  - META: {BLOCK_N: 1, BLOCK_M: 2048}
     num_warps: 4
     num_stages: 1
-  - META: {BM: 1, BK: 4096}
+  - META: {BLOCK_N: 1, BLOCK_M: 4096}
     num_warps: 8
     num_stages: 1
-  - META: {BM: 2, BK: 512}
+  - META: {BLOCK_N: 2, BLOCK_M: 512}
     num_warps: 2
     num_stages: 1
-  - META: {BM: 2, BK: 1024}
+  - META: {BLOCK_N: 2, BLOCK_M: 1024}
     num_warps: 4
     num_stages: 1
-  - META: {BM: 8, BK: 512}
+  - META: {BLOCK_N: 8, BLOCK_M: 512}
     num_warps: 4
     num_stages: 1
-  - META: {BM: 16, BK: 256}
+  - META: {BLOCK_N: 16, BLOCK_M: 256}
     num_warps: 4
     num_stages: 1
 mv_column:
-  - META: {BM: 2, BK: 64}
+  - META: {BLOCK_N: 2, BLOCK_M: 64}
     num_warps: 1
     num_stages: 1
-  - META: {BM: 32, BK: 32}
+  - META: {BLOCK_N: 32, BLOCK_M: 32}
     num_warps: 1
     num_stages: 1
-  - META: {BM: 32, BK: 64}
+  - META: {BLOCK_N: 32, BLOCK_M: 64}
     num_warps: 1
     num_stages: 1
-  - META: {BM: 64, BK: 32}
+  - META: {BLOCK_N: 64, BLOCK_M: 32}
     num_warps: 2
     num_stages: 1
-  - META: {BM: 64, BK: 128}
+  - META: {BLOCK_N: 64, BLOCK_M: 128}
     num_warps: 4
     num_stages: 1
-  - META: {BM: 128, BK: 16}
+  - META: {BLOCK_N: 128, BLOCK_M: 16}
     num_warps: 2
     num_stages: 1
-  - META: {BM: 128, BK: 64}
+  - META: {BLOCK_N: 128, BLOCK_M: 64}
     num_warps: 4
     num_stages: 1
-  - META: {BM: 128, BK: 128}
+  - META: {BLOCK_N: 128, BLOCK_M: 128}
     num_warps: 4
     num_stages: 1
-  - META: {BM: 256, BK: 128}
+  - META: {BLOCK_N: 256, BLOCK_M: 128}
     num_warps: 8
     num_stages: 1
 mv_reduce:
