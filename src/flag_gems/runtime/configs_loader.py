@@ -626,9 +626,6 @@ class TunedConfigLoader(object):
                 "bmm", expand_yaml_path=self._get_expand_config_path("bmm")
             ),
             "bmm_sqmma": self._build_single_expand_spec("bmm_sqmma"),
-            "mv_row": self._build_single_expand_spec("mv_row"),
-            "mv_column": self._build_single_expand_spec("mv_column"),
-            "mv_reduce": self._build_single_expand_spec("mv_reduce"),
             "fused_marlin_moe_w4a16_int4": self._build_single_expand_spec(
                 "fused_marlin_moe_w4a16_int4",
                 expand_yaml_path=self._get_expand_config_path(
@@ -678,6 +675,9 @@ class TunedConfigLoader(object):
             "mv": self._build_single_expand_spec(
                 "mv", expand_yaml_path=self._get_expand_config_path("mv")
             ),
+            "mv_row": self._build_single_expand_spec("mv_row"),
+            "mv_column": self._build_single_expand_spec("mv_column"),
+            "mv_reduce": self._build_single_expand_spec("mv_reduce"),
             "mul": self._build_single_expand_spec(
                 "mul", expand_yaml_path=self._get_expand_config_path("mul")
             ),
