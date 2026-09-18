@@ -11,6 +11,7 @@ and layout choices are cached; partial results are always call-local.
 
 import copy
 import logging
+import os
 from typing import Callable, NamedTuple
 
 import torch
@@ -22,6 +23,9 @@ from flag_gems.utils import libentry, libtuner
 from flag_gems.utils.device_info import get_sm_count
 
 logger = logging.getLogger(__name__)
+EXPAND_CONFIG_FILENAME = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "mv_metax_expand.yaml")
+)
 
 # A BLOCK_N x BLOCK_M tile is accumulated in float32 private memory, of which MetaX allows
 # 4 KB per thread. A tile above _MAX_TILE_ELEMS overruns that even at the
@@ -59,6 +63,8 @@ _KEY = ["M", "K", "BATCH", "SAB", "SAM", "SAK", "SXB", "SXK", "SYB", "SYM", "SPL
     prune_configs_by={"early_config_prune": _prune_tiles},
     rep=20,
     flagtune_op_name="mv_row",
+    flagtune_expand_op_name="mv_row",
+    flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
 )
 @triton.jit
 def _mv_row_kernel(
@@ -97,6 +103,8 @@ def _mv_row_kernel(
     prune_configs_by={"early_config_prune": _prune_tiles},
     rep=20,
     flagtune_op_name="mv_column",
+    flagtune_expand_op_name="mv_column",
+    flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
 )
 @triton.jit
 def _mv_column_kernel(
@@ -146,6 +154,8 @@ def _mv_column_kernel(
     },
     rep=20,
     flagtune_op_name="mv_reduce",
+    flagtune_expand_op_name="mv_reduce",
+    flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
 )
 @triton.jit
 def _mv_reduce_kernel(
