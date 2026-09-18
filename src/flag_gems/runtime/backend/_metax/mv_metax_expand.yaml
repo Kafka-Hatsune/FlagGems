@@ -17,10 +17,29 @@ mv_row:
         BK: bk
       num_stages: stages
       num_warps: warps
-    bm: [1, 2, 4, 8, 16, 32, 64]
-    bk: [64, 128, 256, 512, 1024, 2048, 4096]
-    stages: [1]
-    warps: [1, 2, 4, 8]
+    bm: 
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+    bk: 
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      - 2048
+      - 4096
+    stages:
+      - 1
+    warps:
+      - 1
+      - 2
+      - 4
+      - 8
   - strategy:
       M: align32
       K: align32
@@ -37,10 +56,32 @@ mv_column:
         BK: bk
       num_stages: stages
       num_warps: warps
-    bm: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
-    bk: [16, 32, 64, 128, 256, 512]
-    stages: [1]
-    warps: [1, 2, 4, 8]
+    bm: 
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+    bk: 
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+    stages:
+      - 1
+    warps:
+      - 1
+      - 2
+      - 4
+      - 8
   - strategy:
       M: align32
       K: align32
@@ -61,9 +102,18 @@ mv_reduce:
         BLOCK: block
       num_stages: stages
       num_warps: warps
-    block: [32, 64, 128, 256, 512]
-    stages: [1]
-    warps: [1, 2, 4]
+    block:
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+    stages:
+      - 1
+    warps:
+      - 1
+      - 2
+      - 4
   - strategy:
       M: align32
       BATCH: default
