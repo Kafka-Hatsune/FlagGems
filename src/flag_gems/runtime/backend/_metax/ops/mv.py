@@ -57,7 +57,6 @@ _KEY = ["M", "K", "BATCH", "SAB", "SAM", "SAK", "SXB", "SXK", "SYB", "SYM", "SPL
     configs=runtime.get_tuned_config("mv_row"),
     key=["M", "K", "SAM", "SAK", "SXK", "SYM"],
     prune_configs_by={"early_config_prune": _prune_tiles},
-    use_cuda_graph=True,
     rep=20,
     flagtune_op_name="mv_row",
 )
@@ -96,7 +95,6 @@ def _mv_row_kernel(
     configs=runtime.get_tuned_config("mv_column"),
     key=_KEY,
     prune_configs_by={"early_config_prune": _prune_tiles},
-    use_cuda_graph=True,
     rep=20,
     flagtune_op_name="mv_column",
 )
@@ -146,7 +144,6 @@ def _mv_column_kernel(
     prune_configs_by={
         "early_config_prune": lambda configs, named_args, **kw: copy.deepcopy(configs)
     },
-    use_cuda_graph=True,
     rep=20,
     flagtune_op_name="mv_reduce",
 )
