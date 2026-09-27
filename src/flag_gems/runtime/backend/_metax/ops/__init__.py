@@ -89,6 +89,7 @@ from .repeat_interleave import repeat_interleave_self_tensor
 from .replication_pad3d_backward import replication_pad3d_backward
 from .resolve_conj import resolve_conj
 from .rms_norm_w8a16_fp8 import rms_norm_w8a16_fp8
+from .router_gemm import router_gemm, router_gemm_bf16_fp32
 from .rsqrt import rsqrt, rsqrt_
 from .scalar_tensor import scalar_tensor
 from .segment_reduce import segment_reduce, segment_reduce_out
@@ -248,6 +249,8 @@ __all__ = [
     "replication_pad3d_backward",
     "resolve_conj",
     "rms_norm_w8a16_fp8",
+    "router_gemm",
+    "router_gemm_bf16_fp32",
     "rsqrt",
     "rsqrt_",
     "scalar_tensor",
