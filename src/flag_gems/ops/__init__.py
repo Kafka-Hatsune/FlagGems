@@ -108,6 +108,10 @@ from flag_gems.ops._histogramdd_from_bin_cts import (
     _histogramdd_from_bin_cts,
     _histogramdd_from_bin_cts_out,
 )
+from flag_gems.ops._histogramdd_from_bin_tensors import (
+    _histogramdd_from_bin_tensors,
+    _histogramdd_from_bin_tensors_out,
+)
 from flag_gems.ops._is_all_true import _is_all_true
 from flag_gems.ops._jagged_to_padded_dense_forward import (
     _jagged_to_padded_dense_forward,
@@ -641,10 +645,14 @@ from flag_gems.ops.index_put import _index_put_impl_, index_put, index_put_
 from flag_gems.ops.index_reduce import index_reduce, index_reduce_, index_reduce_out
 from flag_gems.ops.index_select import index_select
 from flag_gems.ops.index_select_backward import index_select_backward
+from flag_gems.ops.infinitely_differentiable_gelu_backward import (
+    infinitely_differentiable_gelu_backward,
+)
 from flag_gems.ops.inner import inner
 from flag_gems.ops.int_mm import int_mm, int_mm_out
 from flag_gems.ops.inverse import inverse
 from flag_gems.ops.ior_scalar import ior_scalar
+from flag_gems.ops.ior_tensor import ior_tensor
 from flag_gems.ops.is_nonzero import is_nonzero
 from flag_gems.ops.is_same_size import is_same_size
 from flag_gems.ops.isclose import allclose, isclose
@@ -1185,9 +1193,9 @@ from flag_gems.ops.sum_to_size import sum_to_size
 from flag_gems.ops.svd import svd
 from flag_gems.ops.sym_constrain_range import sym_constrain_range
 from flag_gems.ops.sym_numel import sym_numel
-from flag_gems.ops.sym_size import sym_size
+from flag_gems.ops.sym_size import sym_size, sym_size_int
 from flag_gems.ops.sym_storage_offset import sym_storage_offset
-from flag_gems.ops.sym_stride import sym_stride
+from flag_gems.ops.sym_stride import sym_stride, sym_stride_int
 from flag_gems.ops.t_ import t_
 from flag_gems.ops.t_copy import t_copy, t_copy_out
 from flag_gems.ops.take import take, take_out
@@ -1387,6 +1395,8 @@ __all__ = [
     "_has_compatible_shallow_copy_type",
     "_histogramdd_from_bin_cts",
     "_histogramdd_from_bin_cts_out",
+    "_histogramdd_from_bin_tensors",
+    "_histogramdd_from_bin_tensors_out",
     "_index_put_impl_",
     "_is_all_true",
     "_jagged_to_padded_dense_forward",
@@ -1936,11 +1946,13 @@ __all__ = [
     "index_reduce_out",
     "index_select",
     "index_select_backward",
+    "infinitely_differentiable_gelu_backward",
     "inner",
     "int_mm",
     "int_mm_out",
     "inverse",
     "ior_scalar",
+    "ior_tensor",
     "is_nonzero",
     "is_same_size",
     "isclose",
@@ -2531,8 +2543,10 @@ __all__ = [
     "sym_constrain_range",
     "sym_numel",
     "sym_size",
+    "sym_size_int",
     "sym_storage_offset",
     "sym_stride",
+    "sym_stride_int",
     "t_",
     "t_copy",
     "t_copy_out",
