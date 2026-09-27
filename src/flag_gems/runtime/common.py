@@ -43,6 +43,8 @@ class vendors(Enum):
 
 
 DEFAULT_STRATEGIES = {
+    "addmm_gemm": ["default"] * 15,
+    "addmm_vector": ["default"] * 16,
     "mm_dense": ["default"] * 3,
     "mm_gemm": ["default"] * 10,
     "mm_nt_rows": ["default"] * 10,
@@ -191,6 +193,41 @@ DEFAULT_STRATEGIES = {
 }
 
 OP_KEY_ORDERS = {
+    "addmm_gemm": [
+        "M",
+        "N",
+        "K",
+        "SAM",
+        "SAK",
+        "SBK",
+        "SBN",
+        "SCM",
+        "SCN",
+        "SIM",
+        "SIN",
+        "BETA_ZERO",
+        "ALPHA_ONE",
+        "BETA_ONE",
+        "MAX_SPLIT",
+    ],
+    "addmm_vector": [
+        "M",
+        "N",
+        "K",
+        "SAM",
+        "SAK",
+        "SBK",
+        "SBN",
+        "SCM",
+        "SCN",
+        "SIM",
+        "SIN",
+        "BETA_ZERO",
+        "ALPHA_ONE",
+        "BETA_ONE",
+        "MAX_SPLIT",
+        "TRANSPOSE",
+    ],
     "mm_dense": ["M", "N", "K"],
     "mm_gemm": ["M", "N", "K", "SAM", "SAK", "SBK", "SBN", "SCM", "SCN", "SPLIT_K"],
     "mm_nt_rows": ["M", "N", "K", "SAM", "SAK", "SBK", "SBN", "SCM", "SCN", "SPLIT_K"],

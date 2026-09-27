@@ -116,6 +116,19 @@ class TunedConfigLoader(object):
             )
         else:
             fields = {
+                "addmm_gemm": (
+                    "BM",
+                    "BN",
+                    "BK",
+                    "GROUP_M",
+                    "TRANSPOSE",
+                    "STATIC_K",
+                    "FLAT_EPILOGUE",
+                    "SPLIT_K",
+                    "pipeline",
+                    "scenario",
+                ),
+                "addmm_vector": ("BN", "BK", "SPLIT_K"),
                 "mm_syrk": ("BT", "BK", "pipeline", "scenario"),
                 "mm_pack": ("BR", "BC"),
                 "mm_reduce": ("BLOCK",),
@@ -829,6 +842,8 @@ class TunedConfigLoader(object):
 
     def _build_expand_registry(self):
         return {
+            "addmm_gemm": self._build_single_expand_spec("addmm_gemm"),
+            "addmm_vector": self._build_single_expand_spec("addmm_vector"),
             "mm_dense": self._build_single_expand_spec("mm_dense"),
             "mm_gemm": self._build_single_expand_spec("mm_gemm"),
             "mm_nt_rows": self._build_single_expand_spec("mm_nt_rows"),
