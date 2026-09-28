@@ -11,6 +11,7 @@ from typing import Callable, NamedTuple
 import torch
 import triton
 import triton.language as tl
+
 from flag_gems import runtime
 from flag_gems.utils import libentry, libtuner
 from flag_gems.utils.libentry import LibTuner
@@ -365,7 +366,7 @@ def _launch_router(c, p):
         *c.f.x_strides,
         *c.f.w_strides,
         p.max_split,
-        p.allow_simt
+        p.allow_simt,
     )
     if meta["SPLIT_K"] > 1:
         _router_finish[(triton.cdiv(c.f.m * c.f.n, 256),)](
