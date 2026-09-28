@@ -43,6 +43,9 @@ class vendors(Enum):
 
 
 DEFAULT_STRATEGIES = {
+    "bmm_gemm": ["default"] * 14,
+    "bmm_wide": ["default"] * 14,
+    "bmm_vector": ["default"] * 12,
     "addmm_gemm": ["default"] * 15,
     "addmm_vector": ["default"] * 16,
     "baddbmm_gemm": ["default"] * 20,
@@ -196,6 +199,52 @@ DEFAULT_STRATEGIES = {
 }
 
 OP_KEY_ORDERS = {
+    "bmm_gemm": [
+        "BATCH",
+        "M",
+        "N",
+        "K",
+        "SAB",
+        "SBB",
+        "SCB",
+        "SAM",
+        "SAK",
+        "SBK",
+        "SBN",
+        "SCM",
+        "SCN",
+        "SPLIT_K",
+    ],
+    "bmm_wide": [
+        "BATCH",
+        "M",
+        "N",
+        "K",
+        "SAB",
+        "SBB",
+        "SCB",
+        "SAM",
+        "SAK",
+        "SBK",
+        "SBN",
+        "SCM",
+        "SCN",
+        "SPLIT_K",
+    ],
+    "bmm_vector": [
+        "R",
+        "K",
+        "BATCH",
+        "SAB",
+        "SAR",
+        "SAK",
+        "SXB",
+        "SXK",
+        "SYB",
+        "SYR",
+        "SPLIT_K",
+        "COLUMN",
+    ],
     "addmm_gemm": [
         "M",
         "N",

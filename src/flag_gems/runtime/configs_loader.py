@@ -102,8 +102,15 @@ class TunedConfigLoader(object):
         return triton.Config(single_config["META"], **kwargs)
 
     def _build_configs_by_op(self, op_name, ranges, pre_hook=None):
-        # Current MetaX MM families keep their kernel parameter names.
-        if op_name in ("mm_gemm", "mm_dense", "mm_nt_rows", "mm_wide"):
+        # MetaX matrix families keep their kernel parameter names.
+        if op_name in (
+            "mm_gemm",
+            "mm_dense",
+            "mm_nt_rows",
+            "mm_wide",
+            "bmm_gemm",
+            "bmm_wide",
+        ):
             fields = (
                 "BM",
                 "BN",
@@ -157,6 +164,7 @@ class TunedConfigLoader(object):
                 "mm_reduce": ("BLOCK",),
                 "mm_simt_row": ("BN", "BK"),
                 "mm_simt_column": ("BM", "BK"),
+                "bmm_vector": ("BR", "BK"),
             }.get(op_name)
         if fields is not None:
             return [
@@ -865,6 +873,9 @@ class TunedConfigLoader(object):
 
     def _build_expand_registry(self):
         return {
+            "bmm_gemm": self._build_single_expand_spec("bmm_gemm"),
+            "bmm_wide": self._build_single_expand_spec("bmm_wide"),
+            "bmm_vector": self._build_single_expand_spec("bmm_vector"),
             "addmm_gemm": self._build_single_expand_spec("addmm_gemm"),
             "addmm_vector": self._build_single_expand_spec("addmm_vector"),
             "baddbmm_gemm": self._build_single_expand_spec("baddbmm_gemm"),
