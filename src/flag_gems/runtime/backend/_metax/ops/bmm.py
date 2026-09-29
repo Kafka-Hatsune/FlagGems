@@ -16,7 +16,7 @@ from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import get_device_properties, libentry, libtuner
 from flag_gems.utils.libentry import LibTuner
 
-from .mm import mm
+from .mm import _combine_fp32_kernel, _pack_fp32_kernel, mm
 
 logger = logging.getLogger(__name__)
 EXPAND_CONFIG_FILENAME = os.path.normpath(
@@ -413,6 +413,42 @@ def _bmm_wide_kernel(
 
 @libentry()
 @triton.jit
+def _bmm_dense_kernel(
+    A,
+    B,
+    C,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    B_COLUMN_MAJOR: tl.constexpr = False,
+):
+    """Complete dense tiles; batching remains part of BMM's own launch."""
+    batch = tl.program_id(1).to(tl.int64)
+    nm, nn = M // 128, N // 128
+    pid = tl.program_id(0)
+    first_m = pid // (8 * nn) * 8
+    group_m = tl.minimum(nm - first_m, 8)
+    local = pid % (8 * nn)
+    mi = (first_m + local % group_m) * 128 + tl.arange(0, 128)
+    ni = local // group_m * 128 + tl.arange(0, 128)
+    ki = tl.arange(0, 128)
+    ap = A + batch * M * K + mi[:, None].to(tl.int64) * K + ki[None, :]
+    if B_COLUMN_MAJOR:
+        # Keep the K term first to avoid register spills in MetaX lowering.
+        bp = B + batch * N * K + ki[:, None].to(tl.int64) + ni[None, :].to(tl.int64) * K
+    else:
+        bp = B + batch * N * K + ki[:, None].to(tl.int64) * N + ni[None, :]
+    acc = tl.zeros((128, 128), tl.float32)
+    for _ in tl.range(0, K // 128, num_stages=4):
+        acc = tl.dot(tl.load(ap), tl.load(bp), acc, allow_tf32=False)
+        ap += 128
+        bp += 128 if B_COLUMN_MAJOR else 128 * N
+    cp = C + batch * M * N + mi[:, None].to(tl.int64) * N + ni[None, :]
+    tl.store(cp, acc, (mi[:, None] < M) & (ni[None, :] < N))
+
+
+@libentry()
+@triton.jit
 def _bmm_long_k_tf32(
     A,
     B,
@@ -573,48 +609,6 @@ def _bmm_pack_rhs(B, P, K: tl.constexpr, N: tl.constexpr):
 
 @libentry()
 @triton.jit
-def _bmm_pack_fp32(
-    X,
-    H,
-    L,
-    R: tl.constexpr,
-    C: tl.constexpr,
-    SB: tl.constexpr,
-    SR: tl.constexpr,
-    SC: tl.constexpr,
-    COLUMN: tl.constexpr,
-):
-    batch = tl.program_id(1).to(tl.int64)
-    r = (tl.program_id(0) // tl.cdiv(C, 32) * 32 + tl.arange(0, 32)).to(tl.int64)
-    c = (tl.program_id(0) % tl.cdiv(C, 32) * 32 + tl.arange(0, 32)).to(tl.int64)
-    mask = (r[:, None] < R) & (c[None, :] < C)
-    x = tl.load(X + batch * SB + r[:, None] * SR + c[None, :] * SC, mask, 0)
-    hi = x.to(tl.bfloat16)
-    lo = (x - hi.to(tl.float32)).to(tl.bfloat16)
-    offsets = batch * R * C
-    if COLUMN:
-        offsets += r[:, None] + c[None, :] * R
-    else:
-        offsets += r[:, None] * C + c[None, :]
-    tl.store(H + offsets, hi, mask)
-    tl.store(L + offsets, lo, mask)
-
-
-@libentry()
-@triton.jit
-def _bmm_combine_fp32(P, Q, R, Y, SIZE: tl.constexpr):
-    x = tl.program_id(0).to(tl.int64) * 1024 + tl.arange(0, 1024)
-    p = tl.load(P + x, x < SIZE, 0)
-    q = tl.load(Q + x, x < SIZE, 0)
-    r = tl.load(R + x, x < SIZE, 0)
-    # Cross terms of an infinite high component can contain inf*0. Preserve
-    # the main product's nonfinite result instead of contaminating it.
-    value = tl.where(tl.abs(r) < float("inf"), (p + q) + r, r)
-    tl.store(Y + x, value, x < SIZE)
-
-
-@libentry()
-@triton.jit
 def _bmm_combine_chunked_fp32(
     P,
     Q,
@@ -724,6 +718,20 @@ def _bmm_vector_kernel(
 
 def _bmm_fp32_components(ah, al, bh, bl, parts, b, m, n, k):
     for x, y, out in ((ah, bl, parts[0]), (al, bh, parts[1]), (ah, bh, parts[2])):
+        if m % 128 == n % 128 == k % 128 == 0:
+            _bmm_dense_kernel[(m // 128 * (n // 128), b)](
+                x,
+                y,
+                out,
+                m,
+                n,
+                k,
+                B_COLUMN_MAJOR=True,
+                num_warps=4,
+                num_stages=4,
+                pipeline="cpasync",
+            )
+            continue
         _bmm_kernel.jit_function[(b * triton.cdiv(m, 256) * triton.cdiv(n, 256),)](
             x,
             y,
@@ -754,7 +762,7 @@ def _bmm_compensated(a, b, out, chunk_n=None):
     n = b.shape[2]
     ah = torch.empty((batch, m, k), device=a.device, dtype=torch.bfloat16)
     al = torch.empty_like(ah)
-    _bmm_pack_fp32[(triton.cdiv(m, 32) * triton.cdiv(k, 32), batch)](
+    _pack_fp32_kernel[(triton.cdiv(m, 32) * triton.cdiv(k, 32), batch)](
         a, ah, al, m, k, *a.stride(), False, num_warps=4
     )
     if chunk_n is None:
@@ -763,11 +771,11 @@ def _bmm_compensated(a, b, out, chunk_n=None):
         ).transpose(1, 2)
         bl = torch.empty_like(bh)
         parts = [torch.empty_like(out) for _ in range(3)]
-        _bmm_pack_fp32[(triton.cdiv(k, 32) * triton.cdiv(n, 32), batch)](
+        _pack_fp32_kernel[(triton.cdiv(k, 32) * triton.cdiv(n, 32), batch)](
             b, bh, bl, k, n, *b.stride(), True, num_warps=4
         )
         _bmm_fp32_components(ah, al, bh, bl, parts, batch, m, n, k)
-        _bmm_combine_fp32[(triton.cdiv(out.numel(), 1024),)](
+        _combine_fp32_kernel[(triton.cdiv(out.numel(), 1024),)](
             *parts, out, out.numel(), num_warps=4
         )
         return
@@ -784,7 +792,7 @@ def _bmm_compensated(a, b, out, chunk_n=None):
             torch.empty((batch, m, width), device=a.device, dtype=torch.float32)
             for _ in range(3)
         ]
-        _bmm_pack_fp32[(triton.cdiv(k, 32) * triton.cdiv(width, 32), batch)](
+        _pack_fp32_kernel[(triton.cdiv(k, 32) * triton.cdiv(width, 32), batch)](
             bv, bh, bl, k, width, *bv.stride(), True, num_warps=4
         )
         _bmm_fp32_components(ah, al, bh, bl, parts, batch, m, width, k)
@@ -907,11 +915,17 @@ def bmm(a, b, *, out=None):
             )
             return out
         if (
-            a.dtype == torch.float32
-            and torch.backends.cuda.matmul.allow_tf32
+            a.dtype == out.dtype == torch.float32
             and min(m, n) >= 1024
             and k >= 512
             and out.is_contiguous()
+            and (
+                torch.backends.cuda.matmul.allow_tf32
+                or (
+                    m % 128 == n % 128 == k % 128 == 0
+                    and batch * (m // 128) * (n // 128) >= 128
+                )
+            )
         ):
             # Two BF16 components per input, and three FP32 output partials.
             workspace = torch.float32.itemsize * batch * (m * k + k * n + 3 * m * n)
@@ -964,6 +978,31 @@ def bmm(a, b, *, out=None):
                 split = min(_MAX_VECTOR_SPLIT_K, 1 << (wanted - 1).bit_length())
             _bmm_vector(a, b, out, split, m == 1, column)
             return out
+        # Balanced dense products amortize the four-stage NN pipeline.
+        if (
+            half
+            and out.dtype == a.dtype
+            and min(m, n) >= 1024
+            and max(m, n) <= 2 * min(m, n)
+            and 512 <= k <= 2 * min(m, n)
+            and m % 128 == n % 128 == k % 128 == 0
+            and a.is_contiguous()
+            and b.is_contiguous()
+            and out.is_contiguous()
+        ):
+            _bmm_dense_kernel[(m // 128 * (n // 128), batch)](
+                a,
+                b,
+                out,
+                m,
+                n,
+                k,
+                num_warps=4,
+                num_stages=4,
+                pipeline="cpasync",
+            )
+            return out
+
         if half and 2 <= m <= 32 and n >= 512 and k >= 512:
             kernel = _bmm_wide_kernel
         else:
