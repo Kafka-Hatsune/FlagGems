@@ -16,16 +16,15 @@ from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import get_device_properties, libentry, libtuner
 from flag_gems.utils.libentry import LibTuner
 
-from .mm import _combine_fp32_kernel, _pack_fp32_kernel, mm
+from .mm import mm
 
 logger = logging.getLogger(__name__)
 EXPAND_CONFIG_FILENAME = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "bmm_metax_expand.yaml")
 )
 
-# Packing budgets include both BF16 components and the FP32 partial outputs.
+# Bound the temporary storage used to pack a batched RHS.
 _MAX_PACKING_WORKSPACE_BYTES = 8 * 1024**3
-_MAX_CHUNK_WORKSPACE_BYTES = 4 * 1024**3
 _MAX_VECTOR_SPLIT_K = 32
 _VECTOR_PROGRAMS_PER_SM = 4
 
@@ -39,6 +38,8 @@ def _prune_bmm(configs, named_args, **kwargs):
     for config in configs:
         meta = config.kwargs
         bm, bn, bk = meta["BM"], meta["BN"], meta["BK"]
+        if bk == 16 and size != 4:
+            continue
         mt, nt = (n, m) if meta["TRANSPOSE"] else (m, n)
         # Dense outputs already expose many CTAs. Tiny output tiles only
         # repeat operand traffic, especially for the long-K model workloads.
@@ -69,12 +70,19 @@ def _prune_bmm(configs, named_args, **kwargs):
             ):
                 continue
         if meta["scenario"] == "reduceSmemUsage" and not (
-            size == 2 and args["SBK"] == 1
+            (size == 2 and args["SBK"] == 1) or (size == 4 and bk == 16)
         ):
             continue
         if meta["TRANSPOSE"] and not (
             args.get("wide", False)
             or args["SAM"] == 1
+            or (
+                size == 4
+                and bk == 16
+                and k >= 512
+                and min(m, n) >= 512
+                and args["SAK"] == args["SBN"] == 1
+            )
             or (
                 args["SBN"] == 1
                 and (k <= 256 or (size == 2 and args["SAK"] == 1 and min(m, n) >= 64))
@@ -607,28 +615,6 @@ def _bmm_pack_rhs(B, P, K: tl.constexpr, N: tl.constexpr):
     )
 
 
-@libentry()
-@triton.jit
-def _bmm_combine_chunked_fp32(
-    P,
-    Q,
-    R,
-    Y,
-    M: tl.constexpr,
-    N: tl.constexpr,
-    SCB: tl.constexpr,
-    SCM: tl.constexpr,
-):
-    batch = tl.program_id(1).to(tl.int64)
-    i = tl.program_id(0).to(tl.int64) * 1024 + tl.arange(0, 1024)
-    offset = batch * M * N + i
-    p = tl.load(P + offset, i < M * N, 0)
-    q = tl.load(Q + offset, i < M * N, 0)
-    r = tl.load(R + offset, i < M * N, 0)
-    value = tl.where(tl.abs(r) < float("inf"), (p + q) + r, r)
-    tl.store(Y + batch * SCB + (i // N) * SCM + i % N, value, i < M * N)
-
-
 def _prune_vector(configs, named_args, **kwargs):
     args = {**named_args, **kwargs}
     return [
@@ -714,93 +700,6 @@ def _bmm_vector_kernel(
             acc = tl.fma(a, x[None, :], acc)
     value = tl.sum(acc, 0 if COLUMN else 1)
     tl.store(Y + batch * SYB + part.to(tl.int64) * R + r * SYR, value, r < R)
-
-
-def _bmm_fp32_components(ah, al, bh, bl, parts, b, m, n, k):
-    for x, y, out in ((ah, bl, parts[0]), (al, bh, parts[1]), (ah, bh, parts[2])):
-        if m % 128 == n % 128 == k % 128 == 0:
-            _bmm_dense_kernel[(m // 128 * (n // 128), b)](
-                x,
-                y,
-                out,
-                m,
-                n,
-                k,
-                B_COLUMN_MAJOR=True,
-                num_warps=4,
-                num_stages=4,
-                pipeline="cpasync",
-            )
-            continue
-        _bmm_kernel.jit_function[(b * triton.cdiv(m, 256) * triton.cdiv(n, 256),)](
-            x,
-            y,
-            out,
-            b,
-            x.stride(0),
-            y.stride(0),
-            out.stride(0),
-            m,
-            n,
-            k,
-            *x.stride()[1:],
-            *y.stride()[1:],
-            *out.stride()[1:],
-            BM=256,
-            BN=256,
-            BK=32,
-            GROUP_M=1,
-            num_warps=8,
-            num_stages=2,
-            pipeline="basic",
-            scenario="reduceSmemUsage",
-        )
-
-
-def _bmm_compensated(a, b, out, chunk_n=None):
-    batch, m, k = a.shape
-    n = b.shape[2]
-    ah = torch.empty((batch, m, k), device=a.device, dtype=torch.bfloat16)
-    al = torch.empty_like(ah)
-    _pack_fp32_kernel[(triton.cdiv(m, 32) * triton.cdiv(k, 32), batch)](
-        a, ah, al, m, k, *a.stride(), False, num_warps=4
-    )
-    if chunk_n is None:
-        bh = torch.empty(
-            (batch, n, k), device=a.device, dtype=torch.bfloat16
-        ).transpose(1, 2)
-        bl = torch.empty_like(bh)
-        parts = [torch.empty_like(out) for _ in range(3)]
-        _pack_fp32_kernel[(triton.cdiv(k, 32) * triton.cdiv(n, 32), batch)](
-            b, bh, bl, k, n, *b.stride(), True, num_warps=4
-        )
-        _bmm_fp32_components(ah, al, bh, bl, parts, batch, m, n, k)
-        _combine_fp32_kernel[(triton.cdiv(out.numel(), 1024),)](
-            *parts, out, out.numel(), num_warps=4
-        )
-        return
-
-    for start in range(0, n, chunk_n):
-        width = min(chunk_n, n - start)
-        bv = b[:, :, start : start + width]
-        cv = out[:, :, start : start + width]
-        bh = torch.empty(
-            (batch, width, k), device=a.device, dtype=torch.bfloat16
-        ).transpose(1, 2)
-        bl = torch.empty_like(bh)
-        parts = [
-            torch.empty((batch, m, width), device=a.device, dtype=torch.float32)
-            for _ in range(3)
-        ]
-        _pack_fp32_kernel[(triton.cdiv(k, 32) * triton.cdiv(width, 32), batch)](
-            bv, bh, bl, k, width, *bv.stride(), True, num_warps=4
-        )
-        _bmm_fp32_components(ah, al, bh, bl, parts, batch, m, width, k)
-        _bmm_combine_chunked_fp32[(triton.cdiv(m * width, 1024), batch)](
-            *parts, cv, m, width, cv.stride(0), cv.stride(1), num_warps=4
-        )
-        # Allow the allocator and CUDA Graph to reuse each chunk's workspace.
-        del bh, bl, parts
 
 
 def _bmm_vector(a, b, out, split, transpose, column):
@@ -914,32 +813,6 @@ def bmm(a, b, *, out=None):
                 pipeline="basic",
             )
             return out
-        if (
-            a.dtype == out.dtype == torch.float32
-            and min(m, n) >= 1024
-            and k >= 512
-            and out.is_contiguous()
-            and (
-                torch.backends.cuda.matmul.allow_tf32
-                or (
-                    m % 128 == n % 128 == k % 128 == 0
-                    and batch * (m // 128) * (n // 128) >= 128
-                )
-            )
-        ):
-            # Two BF16 components per input, and three FP32 output partials.
-            workspace = torch.float32.itemsize * batch * (m * k + k * n + 3 * m * n)
-            if workspace <= _MAX_PACKING_WORKSPACE_BYTES:
-                _bmm_compensated(a, b, out)
-                return out
-            available = (
-                _MAX_CHUNK_WORKSPACE_BYTES - torch.float32.itemsize * batch * m * k
-            )
-            max_n = available // (torch.float32.itemsize * batch * (k + 3 * m))
-            if max_n >= 1024:
-                chunk_n = 1 << (max_n.bit_length() - 1)
-                _bmm_compensated(a, b, out, chunk_n=chunk_n)
-                return out
         if (
             batch == 1
             and a.dtype == out.dtype

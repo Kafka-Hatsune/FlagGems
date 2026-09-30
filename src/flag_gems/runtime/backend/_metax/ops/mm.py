@@ -147,6 +147,8 @@ def _prune_gemm(configs, named_args, **kwargs):
             continue
         mt, nt = (n, m) if meta["TRANSPOSE"] else (m, n)
         bm, bn, bk = meta["BM"], meta["BN"], meta["BK"]
+        if bk == 16 and size != 4:
+            continue
         if bm < _MMA_MIN or bn < _MMA_MIN or bk < _MMA_MIN:
             continue
         if meta["scenario"] == "unprefetch" and (mt % bm or nt % bn or k % bk):
@@ -239,6 +241,13 @@ def _prune_gemm(configs, named_args, **kwargs):
                 args.get("wide_transpose", False)
                 or args["SAM"] == 1
                 or (args["SBN"] == 1 and k <= 256 and min(m, n) >= 64)
+                or (
+                    size == 4
+                    and bk == 16
+                    and k >= 512
+                    and min(m, n) >= 512
+                    and args["SAK"] == args["SBN"] == 1
+                )
             ):
                 continue
         # FlagTree's AABS mutates a config while benchmarking it. Keep the YAML
@@ -940,103 +949,6 @@ def mm_kernel_splitk_reduce(
     tl.store(C + i // N * SCM + i % N * SCN, result, i < TOTAL)
 
 
-@libentry()
-@triton.jit
-def _pack_fp32_kernel(
-    X,
-    H,
-    L,
-    R: tl.constexpr,
-    C: tl.constexpr,
-    SB: tl.constexpr,
-    SR: tl.constexpr,
-    SC: tl.constexpr,
-    COLUMN: tl.constexpr,
-):
-    batch = tl.program_id(1).to(tl.int64)
-    r = (tl.program_id(0) // tl.cdiv(C, 32) * 32 + tl.arange(0, 32)).to(tl.int64)
-    c = (tl.program_id(0) % tl.cdiv(C, 32) * 32 + tl.arange(0, 32)).to(tl.int64)
-    mask = (r[:, None] < R) & (c[None, :] < C)
-    x = tl.load(X + batch * SB + r[:, None] * SR + c[None, :] * SC, mask, 0)
-    hi = x.to(tl.bfloat16)
-    lo = (x - hi.to(tl.float32)).to(tl.bfloat16)
-    offsets = batch * R * C
-    if COLUMN:
-        offsets += r[:, None] + c[None, :] * R
-    else:
-        offsets += r[:, None] * C + c[None, :]
-    tl.store(H + offsets, hi, mask)
-    tl.store(L + offsets, lo, mask)
-
-
-@libentry()
-@triton.jit
-def _combine_fp32_kernel(P, Q, R, Y, SIZE: tl.constexpr):
-    x = tl.program_id(0).to(tl.int64) * 1024 + tl.arange(0, 1024)
-    p = tl.load(P + x, x < SIZE, 0)
-    q = tl.load(Q + x, x < SIZE, 0)
-    r = tl.load(R + x, x < SIZE, 0)
-    # Cross terms of an infinite high component can contain inf*0. Preserve
-    # the main product's nonfinite result instead of contaminating it.
-    value = tl.where(tl.abs(r) < float("inf"), (p + q) + r, r)
-    tl.store(Y + x, value, x < SIZE)
-
-
-@libentry()
-@triton.jit
-def _mm_compensated_kernel(A, B, C, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
-    """A BF16 component product with FP32 output and complete 128-wide tiles."""
-    nm, nn = M // 128, N // 128
-    pid = tl.program_id(0)
-    first_m = pid // (8 * nn) * 8
-    group_m = tl.minimum(nm - first_m, 8)
-    local = pid % (8 * nn)
-    mi = (first_m + local % group_m) * 128 + tl.arange(0, 128)
-    ni = local // group_m * 128 + tl.arange(0, 128)
-    ki = tl.arange(0, 128)
-    ap = A + mi[:, None].to(tl.int64) * K + ki[None, :]
-    # K-first addressing avoids a spilling MetaX MMA-to-store conversion.
-    bp = B + ki[:, None].to(tl.int64) + ni[None, :].to(tl.int64) * K
-    acc = tl.zeros((128, 128), tl.float32)
-    for _ in tl.range(0, K // 128, num_stages=4):
-        acc = tl.dot(tl.load(ap), tl.load(bp), acc, allow_tf32=False)
-        ap += 128
-        bp += 128
-    cp = C + mi[:, None].to(tl.int64) * N + ni[None, :]
-    tl.store(cp, acc, (mi[:, None] < M) & (ni[None, :] < N))
-
-
-def _mm_compensated(a, b, out):
-    m, k = a.shape
-    n = b.shape[1]
-    ah = torch.empty((m, k), device=a.device, dtype=torch.bfloat16)
-    al = torch.empty_like(ah)
-    bh = torch.empty_strided((k, n), (1, k), device=b.device, dtype=torch.bfloat16)
-    bl = torch.empty_like(bh)
-    parts = [torch.empty_like(out) for _ in range(3)]
-    _pack_fp32_kernel[(triton.cdiv(m, 32) * triton.cdiv(k, 32), 1)](
-        a, ah, al, m, k, 0, *a.stride(), False, num_warps=4
-    )
-    _pack_fp32_kernel[(triton.cdiv(k, 32) * triton.cdiv(n, 32), 1)](
-        b, bh, bl, k, n, 0, *b.stride(), True, num_warps=4
-    )
-    # Retain the cross terms before adding the high product. This is a
-    # compensated FP32 route, independent of single-product TF32 permission.
-    for x, y, partial in ((ah, bl, parts[0]), (al, bh, parts[1]), (ah, bh, parts[2])):
-        _mm_compensated_kernel[(m // 128 * (n // 128),)](
-            x,
-            y,
-            partial,
-            m,
-            n,
-            k,
-            num_warps=4,
-            num_stages=4,
-            pipeline="cpasync",
-        )
-    _combine_fp32_kernel[(triton.cdiv(m * n, 1024),)](*parts, out, m * n, num_warps=4)
-
-
 def _floor_power_of_two(value):
     return 1 << (int(value).bit_length() - 1) if value >= 1 else 0
 
@@ -1077,9 +989,9 @@ def _split_count(
     shared_bytes,
     l2_bytes,
 ):
-    # Short, medium-sized half-precision GEMMs do not amortize a reduction pass.
+    # Short, medium-sized GEMMs do not amortize a separate reduction pass.
     if (
-        dense_half
+        (dense_half or (element_size == 4 and rhs_n_contiguous))
         and 256 <= min(m, n) <= max(m, n) <= 512
         and 256 <= k <= 512
         and m % 64 == n % 64 == k % 64 == 0
@@ -1314,25 +1226,6 @@ def mm(a, b, *, out=None):
             mv(b.transpose(0, 1), a[0], out=out[0])
             return out
 
-        self_transpose = (
-            a.data_ptr() == b.data_ptr()
-            and a.shape == b.shape[::-1]
-            and a_strides == b_strides[::-1]
-        )
-        # Packing is amortized by large, complete tiles. Bound the two BF16
-        # components and three FP32 partials before allocating the workspace.
-        if (
-            a.dtype == out.dtype == torch.float32
-            and not self_transpose
-            and min(m, n) >= 2048
-            and k >= 1024
-            and m % 128 == n % 128 == k % 128 == 0
-            and out.is_contiguous()
-            and 4 * (m * k + k * n + 3 * m * n) <= 8 * 1024**3
-        ):
-            _mm_compensated(a, b, out)
-            return out
-
         properties = get_device_properties(a.device.index)
         tuned, split_k, pack_rhs = _dispatch_mm(
             m,
@@ -1344,7 +1237,9 @@ def mm(a, b, *, out=None):
             a.dtype,
             out.dtype,
             all(t.data_ptr() % _VECTOR_ALIGNMENT_BYTES == 0 for t in (a, b, out)),
-            self_transpose,
+            a.data_ptr() == b.data_ptr()
+            and a.shape == b.shape[::-1]
+            and a_strides == b_strides[::-1],
             properties.multi_processor_count,
             properties.shared_memory_per_block,
             properties.L2_cache_size,

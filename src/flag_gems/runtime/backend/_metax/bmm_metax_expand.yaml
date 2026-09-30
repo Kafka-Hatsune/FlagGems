@@ -19,6 +19,42 @@ bmm_gemm:
       num_warps: warps
       num_stages: stages
     bm:
+      - 64
+    bn:
+      - 64
+      - 128
+    bk:
+      - 16
+    group_m:
+      - 8
+    transpose:
+      - false
+      - true
+    static_k:
+      - false
+    pipeline:
+      - "basic"
+    scenario:
+      - ""
+      - "reduceSmemUsage"
+    warps:
+      - 8
+    stages:
+      - 2
+  - config:
+    param_map:
+      META:
+        BM: bm
+        BN: bn
+        BK: bk
+        GROUP_M: group_m
+        TRANSPOSE: transpose
+        STATIC_K: static_k
+        pipeline: pipeline
+        scenario: scenario
+      num_warps: warps
+      num_stages: stages
+    bm:
       - 16
     bn:
       - 32
