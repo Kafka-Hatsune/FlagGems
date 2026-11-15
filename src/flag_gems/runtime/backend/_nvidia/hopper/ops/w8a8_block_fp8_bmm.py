@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from inspect import signature
 from typing import List, Optional
 
 import torch
 import triton
 import triton.language as tl
+from triton.language.core import builtin
 
 from flag_gems import runtime
 from flag_gems.utils import libentry, libtuner
@@ -34,6 +36,38 @@ if has_triton_tle(3, 6, 0):
 else:
     tle = None
     HAS_TLE_W8A8_BLOCK_FP8_BMM = False
+
+
+_HAS_COPY_POLICY = (
+    tle is not None
+    and hasattr(tle.gpu, "copy")
+    and "cache_policy" in signature(tle.gpu.copy).parameters
+)
+if _HAS_COPY_POLICY:
+    _copy_with_cache_policy = tle.gpu.copy
+else:
+
+    @builtin
+    def _copy_with_cache_policy(
+        src, dst, shape, offsets, barrier, cache_policy, _semantic=None
+    ):
+        return tle.gpu.copy(
+            src, dst, shape, offsets, barrier=barrier, _semantic=_semantic
+        )
+
+
+def _l2_policy(priority):
+    if (
+        _HAS_COPY_POLICY
+        and hasattr(tle.gpu, "CachePolicy")
+        and hasattr(tle.gpu, "FractionalEvictionPolicy")
+    ):
+        return tle.gpu.CachePolicy(l2=tle.gpu.FractionalEvictionPolicy(priority))
+    return None
+
+
+_EVICT_FIRST = tl.constexpr(_l2_policy("evict_first"))
+_EVICT_LAST = tl.constexpr(_l2_policy("evict_last"))
 
 
 def _set_triton_descriptor_allocator(device: torch.device) -> None:
@@ -232,6 +266,14 @@ def _tle_w8a8_block_fp8_bmm_load_partition(
     num_stages: tl.constexpr,
     num_sms: tl.constexpr,
 ):
+    # Retain X only for the large single-batch reuse regime.
+    use_cache_hint: tl.constexpr = K >= 4096 and M <= 512 and N >= 512
+    x_policy: tl.constexpr = (
+        (_EVICT_LAST if B == 1 and M >= 512 and N >= 8192 else _EVICT_FIRST)
+        if use_cache_hint
+        else None
+    )
+    y_policy: tl.constexpr = _EVICT_FIRST if use_cache_hint else None
     start_pid = tl.program_id(0)
     num_m_tiles: tl.constexpr = M_aligned // BLOCK_M
     num_n_tiles: tl.constexpr = N // BLOCK_N
@@ -251,20 +293,22 @@ def _tle_w8a8_block_fp8_bmm_load_partition(
             phase = k_block_idx // num_stages
             k_start = k_block_idx * BLOCK_K
             tle.gpu.barrier_wait(empty_x[index], phaseIdx=phase)
-            tle.gpu.copy(
+            _copy_with_cache_policy(
                 x_desc,
                 x_smem.slot(index),
                 [1, BLOCK_M, BLOCK_K],
                 [batch_id, m_start, k_start],
                 barrier=full_x[index],
+                cache_policy=x_policy,
             )
             tle.gpu.barrier_wait(empty_y[index], phaseIdx=phase)
-            tle.gpu.copy(
+            _copy_with_cache_policy(
                 y_desc,
                 y_smem.slot(index),
                 [BLOCK_N, BLOCK_K],
                 [y_row, k_start],
                 barrier=full_y[index],
+                cache_policy=y_policy,
             )
 
 
