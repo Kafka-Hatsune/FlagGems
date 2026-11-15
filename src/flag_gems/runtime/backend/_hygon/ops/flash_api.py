@@ -21,6 +21,7 @@ import triton
 import flag_gems
 from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
+from flag_gems.utils import cache_hint
 from flag_gems.utils.random_utils import philox_backend_seed_offset
 
 from .flash_kernel import (
@@ -568,7 +569,35 @@ def mha_varlan_fwd(
         logger.debug(
             "GEMS_HYGON Running flash_varlen_fwd_kernel with config: %s", cfg_params
         )
-        kernel(*args, **cfg_params)
+        cache_policy = None
+        if (
+            flag_gems.vendor_name == "hygon"
+            and q_dtype == torch.bfloat16
+            and (
+                (
+                    head_size == 128
+                    and batch_size * max_seqlen_q * max_seqlen_k >= 16 * 1024 * 1024
+                )
+                or (
+                    head_size == 192
+                    and max_seqlen_q >= 128
+                    and num_heads <= 2 * num_heads_k
+                    and min(
+                        k.numel() * k.element_size(),
+                        v.numel() * v.element_size(),
+                    )
+                    >= 2**31
+                )
+            )
+            and max_seqlen_k >= 8192
+            and max_seqlen_q >= 64
+            and page_table is not None
+            and not is_softcap
+            and not is_alibi
+            and not return_softmax
+        ):
+            cache_policy = cache_hint.HCU_CS
+        kernel(*args, **cfg_params, CACHE_POLICY=cache_policy)
 
         if seqlenq_ngroups_swapped:
             out = out.reshape(

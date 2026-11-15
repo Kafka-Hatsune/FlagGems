@@ -22,7 +22,7 @@ import triton  # noqa: E402
 import triton.language as tl  # noqa: E402
 
 from flag_gems import runtime  # noqa: E402
-from flag_gems.utils import libentry, tl_extra_shim  # noqa: E402
+from flag_gems.utils import cache_hint, libentry, tl_extra_shim  # noqa: E402
 
 
 @triton.jit
@@ -1214,6 +1214,7 @@ def load_from_kvcache(
     k_row_stride,
     BLOCK_K: tl.constexpr,
     boundary_check: tl.constexpr = False,
+    CACHE_POLICY: tl.constexpr = None,
 ):
     kvcache_idx = virtual_to_cache(
         virtual_index, max_virtual_index, page_table_ptr, block_size, boundary_check
@@ -1221,14 +1222,20 @@ def load_from_kvcache(
     k_offset = tl.arange(0, BLOCK_K)[:, None] + kvcache_idx[None, :] * k_row_stride
     v_offset = tl.arange(0, BLOCK_K)[None, :] + kvcache_idx[:, None] * k_row_stride
     if d == BLOCK_K:
-        bK = tl.load(k_ptr_base + k_offset)
+        bK = cache_hint.load(k_ptr_base + k_offset, cache_policy=CACHE_POLICY)
         bV = tl.load(v_ptr_base + v_offset)
     else:
-        bK = tl.load(
-            k_ptr_base + k_offset, mask=tl.arange(0, BLOCK_K)[:, None] < d, other=0.0
+        bK = cache_hint.load(
+            k_ptr_base + k_offset,
+            mask=tl.arange(0, BLOCK_K)[:, None] < d,
+            other=0.0,
+            cache_policy=CACHE_POLICY,
         )
-        bV = tl.load(
-            v_ptr_base + v_offset, mask=tl.arange(0, BLOCK_K)[None, :] < d, other=0.0
+        bV = cache_hint.load(
+            v_ptr_base + v_offset,
+            mask=tl.arange(0, BLOCK_K)[None, :] < d,
+            other=0.0,
+            cache_policy=CACHE_POLICY if d == 192 else None,
         )
     return bK, bV
 
@@ -1319,6 +1326,7 @@ def flash_varlen_fwd_kernel(
     BLOCK_K: tl.constexpr,
     num_warps: tl.constexpr,
     num_stages: tl.constexpr,
+    CACHE_POLICY: tl.constexpr = None,
 ):
     m_block = tl.program_id(0)
     bid = tl.program_id(1)
@@ -1435,6 +1443,7 @@ def flash_varlen_fwd_kernel(
             k_row_stride,
             BLOCK_K=BLOCK_K,
             boundary_check=True,
+            CACHE_POLICY=CACHE_POLICY,
         )
         S = tl.dot(bQ, bK, out_dtype=tl.float32)
         S = apply_softcap(S, softcap, is_softcap)
@@ -1506,6 +1515,7 @@ def flash_varlen_fwd_kernel(
             d,
             k_row_stride,
             BLOCK_K=BLOCK_K,
+            CACHE_POLICY=CACHE_POLICY,
         )
         S = tl.dot(bQ, bK, out_dtype=tl.float32)
         S = apply_softcap(S, softcap, is_softcap)
