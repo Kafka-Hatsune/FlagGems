@@ -19,8 +19,9 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
-from flag_gems.utils import libentry
+from flag_gems.utils import cache_hint, libentry
 from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,7 @@ def skip_layer_norm_loop_kernel(
     N,  # number of columns in X
     eps,  # epsilon to avoid division by zero
     BLOCK_SIZE: tl.constexpr,
+    STORE_CACHE_POLICY: tl.constexpr = None,
 ):
     pid = ext.program_id(0)
     row_start = pid * N
@@ -131,7 +133,9 @@ def skip_layer_norm_loop_kernel(
         x_hat = (x - mean) * rstd
         y = w * x_hat + b
         y = y.to(Y.dtype.element_ty)
-        tl.store(Y + row_start + cols, y, mask=mask)
+        cache_hint.store(
+            Y + row_start + cols, y, mask=mask, cache_policy=STORE_CACHE_POLICY
+        )
 
 
 class SkipLayerNorm(torch.autograd.Function):
@@ -156,8 +160,24 @@ class SkipLayerNorm(torch.autograd.Function):
                 )
             else:
                 BLOCK_SIZE = 1024
+                store_cache_policy = (
+                    cache_hint.HCU_CS
+                    if runtime.device.vendor_name == "hygon"
+                    and x.dtype in (torch.bfloat16, torch.float16)
+                    and N == 8192
+                    and M * N * x.element_size() >= 1024 * 1024 * 1024
+                    else None
+                )
                 skip_layer_norm_loop_kernel[M,](
-                    y, x, residual, weight, bias, N, eps, BLOCK_SIZE
+                    y,
+                    x,
+                    residual,
+                    weight,
+                    bias,
+                    N,
+                    eps,
+                    BLOCK_SIZE,
+                    STORE_CACHE_POLICY=store_cache_policy,
                 )
         return y
 
