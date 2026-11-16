@@ -20,7 +20,7 @@ import triton.language as tl
 
 from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
-from flag_gems.utils import libentry
+from flag_gems.utils import cache_hint, libentry
 from flag_gems.utils import triton_lang_extension as ext
 
 _ONE_PASS_HEURISTICS = runtime.get_heuristic_config("post_layer_norm_residual")
@@ -95,6 +95,7 @@ def post_layer_norm_residual_loop_kernel(
     eps,
     SAVE_STATS: tl.constexpr,
     TILE_N: tl.constexpr,
+    STORE_CACHE_POLICY: tl.constexpr = None,
 ):
     pid = ext.program_id(0)
 
@@ -155,7 +156,12 @@ def post_layer_norm_residual_loop_kernel(
         weight = tl.load(weight_ptr + col_offsets, mask=mask, other=0.0)
         bias = tl.load(bias_ptr + col_offsets, mask=mask, other=0.0)
         output = weight * (input - mean) * rstd + bias + residual
-        tl.store(output_ptr + pid * N + col_offsets, output, mask=mask)
+        cache_hint.store(
+            output_ptr + pid * N + col_offsets,
+            output,
+            mask=mask,
+            cache_policy=STORE_CACHE_POLICY,
+        )
 
     for start_n in range(TILE_N, N, TILE_N):
         col_offsets = previous_multiple - start_n + tl.arange(0, TILE_N)
@@ -168,7 +174,9 @@ def post_layer_norm_residual_loop_kernel(
         weight = tl.load(weight_ptr + col_offsets)
         bias = tl.load(bias_ptr + col_offsets)
         output = weight * (input - mean) * rstd + bias + residual
-        tl.store(output_ptr + pid * N + col_offsets, output)
+        cache_hint.store(
+            output_ptr + pid * N + col_offsets, output, cache_policy=STORE_CACHE_POLICY
+        )
 
 
 def _normalize_shape(normalized_shape):
@@ -250,6 +258,14 @@ def _post_layer_norm_residual_forward(
                 SAVE_STATS=save_stats,
             )
         else:
+            store_cache_policy = (
+                cache_hint.HCU_CS
+                if runtime.device.vendor_name == "hygon"
+                and input.dtype in (torch.bfloat16, torch.float16)
+                and N % 128 == 0
+                and M * N * input.element_size() >= 128 * 1024 * 1024
+                else None
+            )
             post_layer_norm_residual_loop_kernel[(M, 1, 1)](
                 input,
                 residual,
@@ -262,6 +278,7 @@ def _post_layer_norm_residual_forward(
                 N,
                 eps,
                 SAVE_STATS=save_stats,
+                STORE_CACHE_POLICY=store_cache_policy,
             )
 
     return output, mean, rstd, M, N
