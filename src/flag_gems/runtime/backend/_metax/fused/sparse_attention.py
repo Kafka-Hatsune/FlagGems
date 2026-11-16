@@ -35,6 +35,8 @@ import torch  # noqa: E402
 import triton  # noqa: E402
 import triton.language as tl  # noqa: E402
 
+from flag_gems.utils import cache_hint
+
 _SPARSE_ATTN_COMPILER_ENV = {
     "TRITON_DISABLE_SWIZZLE": "1",
     "TRITON_ENABLE_MACA_OPT_MOVE_DOT_OPERANDS_OUT_LOOP": "1",
@@ -341,6 +343,7 @@ def _sparse_attn_kernel_v_chunked(
     D: tl.constexpr,
     BV: tl.constexpr,
     H: tl.constexpr,
+    V_CACHE_POLICY: tl.constexpr = None,
 ):
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1)
@@ -388,10 +391,11 @@ def _sparse_attn_kernel_v_chunked(
         p = tl.exp(acc_s - scores_max[:, None])
 
         v_ptrs = kv_base + idxs[:, None] * stride_kvn + offs_bv[None, :] * stride_kvd
-        v_block = tl.load(
+        v_block = cache_hint.load(
             v_ptrs,
             mask=valid_mask[:, None] & bv_mask[None, :],
             other=0.0,
+            cache_policy=V_CACHE_POLICY,
         )
 
         acc_o = acc_o * correction[:, None]
@@ -454,6 +458,11 @@ def _sparse_attn_triton_impl(
 
     # Tier 0: NSA-style V-chunked kernel
     BV = 128
+    v_cache_policy = (
+        cache_hint.METAX_CS
+        if q.dtype == torch.bfloat16 and d == 256 and b * m >= 128 and topk >= 256
+        else None
+    )
     try:
         NV = (d + BV - 1) // BV
         grid = (m, b, NV)
@@ -485,6 +494,7 @@ def _sparse_attn_triton_impl(
             BV=BV,
             H=h_padded,
             num_warps=4,
+            V_CACHE_POLICY=v_cache_policy,
         )
         return o
     except Exception:
