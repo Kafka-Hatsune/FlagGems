@@ -21,7 +21,7 @@ import triton.language as tl
 
 from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
-from flag_gems.utils import libentry
+from flag_gems.utils import cache_hint, libentry
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,8 @@ def rms_norm_kernel(
     N,  # number of columns in X
     eps,  # epsilon to avoid division by zero
     BLOCK_SIZE: tl.constexpr,
+    LOAD_CACHE_POLICY: tl.constexpr = None,
+    STORE_CACHE_POLICY: tl.constexpr = None,
 ):
     if tl.constexpr(in_ptr.dtype.element_ty == tl.float16) or tl.constexpr(
         in_ptr.dtype.element_ty == tl.bfloat16
@@ -59,7 +61,9 @@ def rms_norm_kernel(
 
     mask = tl.arange(0, BLOCK_SIZE) < N
     cols = tl.arange(0, BLOCK_SIZE)
-    x = tl.load(in_ptr + cols * x_stride_c, mask, other=0.0).to(cdtype)
+    x = cache_hint.load(
+        in_ptr + cols * x_stride_c, mask, other=0.0, cache_policy=LOAD_CACHE_POLICY
+    ).to(cdtype)
 
     var = tl.sum(x * x, axis=0) / N
     rrms = 1 / tl.sqrt(var + eps)
@@ -69,7 +73,9 @@ def rms_norm_kernel(
     # to align with vLLM native: x.to(weight.dtype) * weight
     x_normed = (x * rrms).to(in_ptr.dtype.element_ty)
     y = x_normed * w
-    tl.store(out_ptr + cols * y_stride_c, y, mask=mask)
+    cache_hint.store(
+        out_ptr + cols * y_stride_c, y, mask=mask, cache_policy=STORE_CACHE_POLICY
+    )
     tl.store(INV_RMS + pid, rrms)
 
 
@@ -87,6 +93,7 @@ def rms_norm_loop_kernel(
     N,
     eps,
     TILE_N: tl.constexpr,
+    CACHE_POLICY: tl.constexpr = None,
 ):
     if tl.constexpr(in_ptr.dtype.element_ty == tl.float16) or tl.constexpr(
         in_ptr.dtype.element_ty == tl.bfloat16
@@ -135,7 +142,9 @@ def rms_norm_loop_kernel(
         # Cast x_normed back to input dtype before multiplying with weight
         x_normed = (x * rrms).to(in_ptr.dtype.element_ty)
         y = x_normed * w
-        tl.store(out_ptr + pid * N + n_offsets, y, mask=mask)
+        cache_hint.store(
+            out_ptr + pid * N + n_offsets, y, mask=mask, cache_policy=CACHE_POLICY
+        )
 
     for start_n in range(TILE_N, N, TILE_N):
         n_offsets = (prev_multiple - start_n) + tl.arange(0, TILE_N)
@@ -147,7 +156,7 @@ def rms_norm_loop_kernel(
         # Cast x_normed back to input dtype before multiplying with weight
         x_normed = (x * rrms).to(in_ptr.dtype.element_ty)
         y = x_normed * w
-        tl.store(out_ptr + pid * N + n_offsets, y)
+        cache_hint.store(out_ptr + pid * N + n_offsets, y, cache_policy=CACHE_POLICY)
 
 
 @libentry()
@@ -319,7 +328,28 @@ def rms_norm_forward(x, normalized_shape, weight, eps=1e-5):
     with torch_device_fn.device(x.device):
         if N <= 4096:
             BLOCK_SIZE = triton.next_power_of_2(N)
-            rms_norm_kernel[M,](y, inv_rms, x, weight, N, 1, N, 1, N, eps, BLOCK_SIZE)
+            load_cache_policy = (
+                cache_hint.PPU_LU
+                if runtime.device.vendor_name == "thead"
+                and x.dtype == torch.float32
+                and M >= 1024
+                and 1024 <= N <= 4096
+                else None
+            )
+            rms_norm_kernel[M,](
+                y,
+                inv_rms,
+                x,
+                weight,
+                N,
+                1,
+                N,
+                1,
+                N,
+                eps,
+                BLOCK_SIZE,
+                LOAD_CACHE_POLICY=load_cache_policy,
+            )
         else:
             rms_norm_loop_kernel[M,](y, inv_rms, x, weight, N, eps)
 
