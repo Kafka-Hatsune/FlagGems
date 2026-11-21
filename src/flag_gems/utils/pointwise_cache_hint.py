@@ -123,6 +123,7 @@ _VENDOR_FAMILIES = {
         "gelu_none",
         "neg_func",
         "relu_forward",
+        "rsqrt_func",
     },
 }
 
