@@ -117,6 +117,7 @@ _VENDOR_FAMILIES = {
     "thead": {
         "abs_func",
         "ceil_func",
+        "cos_func",
     },
 }
 
