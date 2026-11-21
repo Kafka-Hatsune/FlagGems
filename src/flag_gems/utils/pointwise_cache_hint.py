@@ -112,6 +112,7 @@ _VENDOR_FAMILIES = {
         "sigmoid_forward",
         "silu_forward",
         "sin_func",
+        "square_func",
     },
 }
 
