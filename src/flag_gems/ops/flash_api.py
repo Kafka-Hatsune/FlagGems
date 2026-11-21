@@ -590,6 +590,18 @@ def mha_varlan_fwd(
             cache_policy = (
                 cache_hint.PPU_NC if seqlenq_ngroups_swapped else cache_hint.PPU_CS
             )
+        elif (
+            flag_gems.vendor_name == "metax"
+            and q_dtype == torch.bfloat16
+            and head_size == 256
+            and max_seqlen_k >= 32768
+            and max_seqlen_q == 128
+            and batch_size * num_heads == 32
+            and num_heads > num_heads_k
+            and num_heads_k in (8, 16)
+            and not is_paged
+        ):
+            cache_policy = cache_hint.METAX_CS
         kernel(*args, **cfg_params, CACHE_POLICY=cache_policy)
 
         if seqlenq_ngroups_swapped:
