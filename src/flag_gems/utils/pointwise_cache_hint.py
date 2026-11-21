@@ -64,6 +64,7 @@ _VENDOR_FAMILIES = {
         "cos_func",
         "floor_func",
         "gelu_none",
+        "neg_func",
     },
 }
 
