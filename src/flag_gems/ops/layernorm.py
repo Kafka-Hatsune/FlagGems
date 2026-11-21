@@ -399,6 +399,14 @@ def layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5):
         elif N <= 4096:
             TILE_N = triton.next_power_of_2(N)
             grid = (M, 1, 1)
+            store_cache_policy = (
+                cache_hint.MUSA_NORM_STORE
+                if runtime.device.vendor_name == "mthreads"
+                and input.dtype == torch.float32
+                and M * N >= 8 * 1024 * 1024
+                and 1024 <= N <= 4096
+                else None
+            )
             layer_norm_persistent_kernel[grid](
                 input,
                 y,
@@ -410,6 +418,7 @@ def layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5):
                 N,
                 eps,
                 TILE_N,
+                STORE_CACHE_POLICY=store_cache_policy,
             )
         else:
             grid = (M, 1, 1)
