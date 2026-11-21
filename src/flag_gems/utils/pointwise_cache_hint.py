@@ -92,6 +92,7 @@ _VENDOR_FAMILIES = {
         "exp_func",
         "floor_func",
         "frac_func",
+        "neg_func",
     },
 }
 
