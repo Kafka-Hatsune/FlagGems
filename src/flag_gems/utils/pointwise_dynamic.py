@@ -27,6 +27,11 @@ from flag_gems.utils.code_cache import code_cache_dir
 from flag_gems.utils.code_utils import IndentedBuffer, write_atomic
 from flag_gems.utils.codegen_config_utils import CodeGenConfig, get_codegen_config
 from flag_gems.utils.device_info import get_device_capability
+from flag_gems.utils.pointwise_cache_hint import (
+    POLICIES,
+    pointwise_family,
+    select_policy,
+)
 from flag_gems.utils.shape_utils import (
     MemOverlap,
     all_c_contiguous,
@@ -279,6 +284,8 @@ class KernelGenerator:
 
         self.fn_name = scalar_fn.__name__
         self.fn_module = scalar_fn.__module__
+        self.load_cache_kw = ""
+        self.store_cache_kw = ""
 
     def gen_import_function(self, code: IndentedBuffer):
         code.writeline("@triton.jit")
@@ -457,7 +464,7 @@ class KernelGenerator:
         code.writeline("# loads")
         for i in range(schema.num_input_tensors()):
             code.writeline(
-                f"in{i} = tl.load(in{i}_ptr).to(in{i}_ptr.type.element_ty) "
+                f"in{i} = tl.load(in{i}_ptr{self.load_cache_kw}).to(in{i}_ptr.type.element_ty) "
                 "# workaround the bug on bool, we should use the pointer's dtype)"
             )
         code.newline()
@@ -471,7 +478,7 @@ class KernelGenerator:
         code.writeline("# stores")
         for i in range(schema.num_output_tensors()):
             code.writeline(
-                f"tl.store(out{i}_ptr, out{i}.to(out{i}_ptr.type.element_ty))"
+                f"tl.store(out{i}_ptr, out{i}.to(out{i}_ptr.type.element_ty){self.store_cache_kw})"
             )
         code.newline()
         return code
@@ -523,7 +530,8 @@ class KernelGenerator:
                 f"in{i}_ptr, ({shape}), ({strides}), ({offsets}), ({tile_sizes}), order=({order}))"
             )
             code.writeline(
-                f"in{i} = tl.load(in{i}_bptr, boundary_check=({order})).to(in{i}_ptr.type.element_ty) "
+                f"in{i} = tl.load(in{i}_bptr, boundary_check=({order}){self.load_cache_kw})"
+                f".to(in{i}_ptr.type.element_ty) "
                 "# workaround the bug on bool, we should use the original pointer's dtype(instead of block pointer's)"
             )
         code.newline()
@@ -557,7 +565,8 @@ class KernelGenerator:
                 f"out{i}_ptr, ({shape}), ({strides}), ({offsets}), ({tile_sizes}), order=({order}))"
             )
             code.writeline(
-                f"tl.store(out{i}_bptr, out{i}.to(out{i}_bptr.type.element_ty), boundary_check=({order}))"
+                f"tl.store(out{i}_bptr, out{i}.to(out{i}_bptr.type.element_ty),"
+                f" boundary_check=({order}){self.store_cache_kw})"
             )
 
     def gen_body_gsl_with_bptr(self, code):
@@ -605,7 +614,8 @@ class KernelGenerator:
             )
             offset_combine = " + ".join(offsets)
             code.writeline(
-                f"in{i} = tl.load(in{i}_ptr + {offset_combine}, mask=mask).to(in{i}_ptr.type.element_ty)"
+                f"in{i} = tl.load(in{i}_ptr + {offset_combine}, mask=mask{self.load_cache_kw})"
+                f".to(in{i}_ptr.type.element_ty)"
             )
 
         code.newline()
@@ -633,7 +643,7 @@ class KernelGenerator:
             )
             offset_combine = " + ".join(offsets)
             code.writeline(
-                f"in{i} = tl.store(out{i}_ptr + {offset_combine}, out{i}, mask=mask)"
+                f"in{i} = tl.store(out{i}_ptr + {offset_combine}, out{i}, mask=mask{self.store_cache_kw})"
             )
 
     def gen_body_gsl_without_bptr(self, code):
@@ -727,7 +737,8 @@ class KernelGenerator:
             offsets = tuple(f"i{j} * in{i}_stride{j}" for j in range(ndim))
             offset_combine = " + ".join(offsets)
             code.writeline(
-                f"in{i} = tl.load(in{i}_ptr + {offset_combine}, mask=mask).to(in{i}_ptr.type.element_ty)"
+                f"in{i} = tl.load(in{i}_ptr + {offset_combine}, mask=mask{self.load_cache_kw})"
+                f".to(in{i}_ptr.type.element_ty)"
             )
 
         code.newline()
@@ -752,7 +763,7 @@ class KernelGenerator:
             offsets = tuple(f"i{j} * out{i}_stride{j}" for j in range(ndim))
             offset_combine = " + ".join(offsets)
             code.writeline(
-                f"in{i} = tl.store(out{i}_ptr + {offset_combine}, out{i}, mask=mask)"
+                f"in{i} = tl.store(out{i}_ptr + {offset_combine}, out{i}, mask=mask{self.store_cache_kw})"
             )
 
     def gen_body_gsl_1d_tile(self, code):
@@ -1118,8 +1129,10 @@ class ModuleGenerator:
         jit_fn_name: str,
         wrapper_name: str,
         config: CodeGenConfig,
+        cache_hint=None,
     ):
         self.config = config
+        self.cache_hint = cache_hint
         self.scalar_fn = scalar_fn
         self.wrapper_gen = WrapperGenerator(
             function_schema, jit_fn_name, ndim, wrapper_name, config
@@ -1127,6 +1140,15 @@ class ModuleGenerator:
         self.kernel_gen = KernelGenerator(
             function_schema, scalar_fn, ndim, jit_fn_name, config
         )
+
+        if cache_hint is not None:
+            load, store = POLICIES[cache_hint]
+            if load:
+                self.kernel_gen.load_cache_kw = ", cache_policy=_pointwise_load_policy"
+            if store:
+                self.kernel_gen.store_cache_kw = (
+                    ", cache_policy=_pointwise_store_policy"
+                )
 
     @staticmethod
     def _collect_jit_deps(scalar_fn):
@@ -1215,6 +1237,15 @@ class ModuleGenerator:
         code.writeline("import torch")
         code.writeline("import triton")
         code.writeline("from triton import language as tl")
+        if self.cache_hint is not None:
+            for direction, policy in zip(("load", "store"), POLICIES[self.cache_hint]):
+                if policy:
+                    code.writeline(
+                        f"from flag_gems.utils.pointwise_cache_hint import {policy} as _pointwise_{direction}_policy"
+                    )
+                    code.writeline(
+                        f"_pointwise_{direction}_policy = tl.constexpr(_pointwise_{direction}_policy)"
+                    )
         code.newline()
         code.writeline("from flag_gems.utils.shape_utils import (")
         code.writeline("    heuristics_for_tile_size,")
@@ -1331,6 +1362,7 @@ class PointwiseDynamicFunction:
 
         assert isinstance(scalar_fn, JITFunction)
         self._scalar_fn = scalar_fn
+        self._cache_hint_family = pointwise_family(scalar_fn)
         self._scalar_fn_cache_key = scalar_fn.cache_key
         self.pid = os.getpid()
 
@@ -1398,7 +1430,12 @@ class PointwiseDynamicFunction:
     def _call_real_impl(self, *args, **kwargs):
         """Single entry point for real kernel invocation."""
         ndim, args, kwargs = self.prepare_args(*args, **kwargs)
-        overload = self.instantiate(ndim)
+        cache_hint = None
+        if self._cache_hint_family is not None:
+            cache_hint = select_policy(self._cache_hint_family, args, kwargs)
+        overload = (
+            self.instantiate(ndim, cache_hint) if cache_hint else self.instantiate(ndim)
+        )
         out = overload(*args, **kwargs)
         # Record allocated outputs so that a subsequent graph-capture run can
         # reuse the same buffers instead of calling empty_like / empty.
@@ -1802,11 +1839,13 @@ class PointwiseDynamicFunction:
 
         return kernel_name, wrapper_name, file_path
 
-    def instantiate(self, ndim):
+    def instantiate(self, ndim, cache_hint=None):
         # NOTE: manually instantiated overload does not have `prepare_args` as
         # preprocessing, so you have to manually allocate output and make sure that
         # the inputs & ouputs actually fits the manually instantiated overload
         key = f"{ndim}_{self.config.prefer_block_pointer}_{self.config.balance_grid}"
+        if cache_hint is not None:
+            key += "_" + cache_hint
         if key in self.overloads:
             return self.overloads[key]
 
@@ -1814,6 +1853,8 @@ class PointwiseDynamicFunction:
 
         # Use helper to compute names (single source of truth)
         kernel_name, wrapper_name, file_path = self._compute_kernel_names(ndim)
+        if cache_hint is not None:
+            file_path = file_path[:-3] + "_" + cache_hint + ".py"
 
         module_gen = ModuleGenerator(
             self.fx,
@@ -1822,6 +1863,7 @@ class PointwiseDynamicFunction:
             kernel_name,
             wrapper_name,
             self.config,
+            cache_hint,
         )
         module_gen.codegen(code)
 
