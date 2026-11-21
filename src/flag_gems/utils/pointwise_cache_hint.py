@@ -128,6 +128,7 @@ _VENDOR_FAMILIES = {
         "silu_forward",
         "sin_func",
         "square_func",
+        "tanh_kernel",
     },
 }
 
