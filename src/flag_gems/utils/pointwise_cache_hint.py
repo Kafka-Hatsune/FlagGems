@@ -73,6 +73,7 @@ _VENDOR_FAMILIES = {
     "mthreads": {
         "abs_func",
         "ceil_func",
+        "cos_func",
     },
 }
 
