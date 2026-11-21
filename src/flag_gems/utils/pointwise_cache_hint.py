@@ -61,6 +61,7 @@ _VENDOR_FAMILIES = {
     "nvidia": {
         "abs_func",
         "ceil_func",
+        "cos_func",
     },
 }
 
