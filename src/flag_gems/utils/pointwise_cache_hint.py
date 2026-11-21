@@ -114,6 +114,9 @@ _VENDOR_FAMILIES = {
         "sin_func",
         "square_func",
     },
+    "thead": {
+        "abs_func",
+    },
 }
 
 
