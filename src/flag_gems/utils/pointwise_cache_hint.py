@@ -62,6 +62,7 @@ _VENDOR_FAMILIES = {
         "abs_func",
         "ceil_func",
         "cos_func",
+        "floor_func",
     },
 }
 
