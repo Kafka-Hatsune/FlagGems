@@ -80,6 +80,7 @@ _VENDOR_FAMILIES = {
         "log1p_func",
         "neg_func",
         "relu_forward",
+        "rsqrt_func",
     },
 }
 
