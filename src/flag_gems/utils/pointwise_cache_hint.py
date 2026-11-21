@@ -86,6 +86,9 @@ _VENDOR_FAMILIES = {
         "sin_func",
         "square_func",
     },
+    "hygon": {
+        "abs_func",
+    },
 }
 
 
