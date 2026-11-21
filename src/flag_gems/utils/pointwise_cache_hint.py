@@ -94,6 +94,7 @@ _VENDOR_FAMILIES = {
         "frac_func",
         "neg_func",
         "relu_forward",
+        "sqrt_func",
     },
 }
 
