@@ -70,6 +70,9 @@ _VENDOR_FAMILIES = {
         "sin_func",
         "square_func",
     },
+    "mthreads": {
+        "abs_func",
+    },
 }
 
 
