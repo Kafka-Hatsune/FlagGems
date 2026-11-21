@@ -89,6 +89,7 @@ _VENDOR_FAMILIES = {
     "hygon": {
         "abs_func",
         "ceil_func",
+        "exp_func",
     },
 }
 
