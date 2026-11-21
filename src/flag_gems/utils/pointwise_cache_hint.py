@@ -90,6 +90,7 @@ _VENDOR_FAMILIES = {
         "abs_func",
         "ceil_func",
         "exp_func",
+        "floor_func",
     },
 }
 
