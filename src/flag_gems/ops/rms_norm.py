@@ -360,7 +360,17 @@ def rms_norm_forward(x, normalized_shape, weight, eps=1e-5):
                 STORE_CACHE_POLICY=store_cache_policy,
             )
         else:
-            rms_norm_loop_kernel[M,](y, inv_rms, x, weight, N, eps)
+            cache_policy = (
+                cache_hint.HCU_CS
+                if runtime.device.vendor_name == "hygon"
+                and x.dtype == torch.bfloat16
+                and N >= 8192
+                and M * N >= 16 * 1024 * 1024
+                else None
+            )
+            rms_norm_loop_kernel[M,](
+                y, inv_rms, x, weight, N, eps, CACHE_POLICY=cache_policy
+            )
 
     return y, inv_rms
 
