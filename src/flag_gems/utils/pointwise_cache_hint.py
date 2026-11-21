@@ -78,6 +78,7 @@ _VENDOR_FAMILIES = {
         "floor_func",
         "gelu_none",
         "log1p_func",
+        "neg_func",
     },
 }
 
