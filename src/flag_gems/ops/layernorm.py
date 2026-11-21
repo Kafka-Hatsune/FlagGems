@@ -21,7 +21,7 @@ import triton.language as tl
 
 from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
-from flag_gems.utils import libentry
+from flag_gems.utils import cache_hint, libentry
 from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
@@ -50,6 +50,7 @@ def layer_norm_persistent_kernel(
     N,
     eps,
     TILE_N: tl.constexpr,
+    STORE_CACHE_POLICY: tl.constexpr = None,
 ):
     # using 1d tile makes code clean
     # Map the program id to the row of X and Y it should compute.
@@ -79,7 +80,12 @@ def layer_norm_persistent_kernel(
         b = tl.load(bias_ptr + n_offsets, mask=mask)
     out = (x - m) * rstd * w + b
 
-    tl.store(out_ptr + pid * N + n_offsets, out, mask=mask)
+    cache_hint.store(
+        out_ptr + pid * N + n_offsets,
+        out,
+        mask=mask,
+        cache_policy=STORE_CACHE_POLICY,
+    )
 
 
 @libentry()
@@ -100,6 +106,7 @@ def layer_norm_persistent_kernel_multiline(
     eps,
     TILE_M: tl.constexpr,
     TILE_N: tl.constexpr,
+    LOAD_CACHE_POLICY: tl.constexpr = None,
 ):
     # Map the program id to the row of X and Y it should compute.
     pid = ext.program_id(0)
@@ -110,9 +117,12 @@ def layer_norm_persistent_kernel_multiline(
     n_mask = n_offsets < N
     mask = m_mask[:, None] & n_mask
 
-    x = tl.load(in_ptr + m_offsets[:, None] * N + n_offsets, mask, other=0.0).to(
-        tl.float32
-    )
+    x = cache_hint.load(
+        in_ptr + m_offsets[:, None] * N + n_offsets,
+        mask,
+        other=0.0,
+        cache_policy=LOAD_CACHE_POLICY,
+    ).to(tl.float32)
     m = tl.sum(x, axis=1) / N
     d = x - m[:, None]  # deviation
     s = tl.where(mask, d * d, 0)
@@ -153,6 +163,7 @@ def layer_norm_loop_kernel(
     N,
     eps,
     TILE_N: tl.constexpr,
+    STORE_CACHE_POLICY: tl.constexpr = None,
 ):
     # Map the program id to the row of X and Y it should compute.
     pid = ext.program_id(0)
@@ -214,7 +225,12 @@ def layer_norm_loop_kernel(
         else:
             b = tl.load(bias_ptr + n_offsets, mask=mask)
         out = w * (x - m) * rstd + b
-        tl.store(out_ptr + pid * N + n_offsets, out, mask=mask)
+        cache_hint.store(
+            out_ptr + pid * N + n_offsets,
+            out,
+            mask=mask,
+            cache_policy=STORE_CACHE_POLICY,
+        )
 
     for start_n in range(TILE_N, N, TILE_N):
         n_offsets = (prev_multiple - start_n) + tl.arange(0, TILE_N)
@@ -230,7 +246,9 @@ def layer_norm_loop_kernel(
         else:
             b = tl.load(bias_ptr + n_offsets)
         out = w * (x - m) * rstd + b
-        tl.store(out_ptr + pid * N + n_offsets, out)
+        cache_hint.store(
+            out_ptr + pid * N + n_offsets, out, cache_policy=STORE_CACHE_POLICY
+        )
 
 
 @libentry()

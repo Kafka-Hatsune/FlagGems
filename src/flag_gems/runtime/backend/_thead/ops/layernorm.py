@@ -25,7 +25,7 @@ from flag_gems.ops.layernorm import (
     layer_norm_persistent_kernel_multiline,
 )
 from flag_gems.runtime import torch_device_fn
-from flag_gems.utils import libentry
+from flag_gems.utils import cache_hint, libentry
 
 logger = logging.getLogger(__name__)
 PERSISTENT_WIDTH_LIMIT = 16384
@@ -102,6 +102,13 @@ def layer_norm(
     rstd = torch.empty_like(mean)
     with torch_device_fn.device(input.device):
         if width <= PERSISTENT_WIDTH_LIMIT:
+            load_cache_policy = (
+                cache_hint.PPU_LU
+                if input.dtype == torch.float32
+                and rows >= 1024
+                and 1024 <= width <= 4096
+                else None
+            )
             layer_norm_rows_kernel[lambda meta: (triton.cdiv(rows, meta["TILE_M"]),)](
                 input,
                 output,
@@ -113,6 +120,7 @@ def layer_norm(
                 width,
                 eps,
                 TILE_N=triton.next_power_of_2(width),
+                LOAD_CACHE_POLICY=load_cache_policy,
             )
         else:
             layer_norm_loop_kernel[(rows, 1, 1)](
