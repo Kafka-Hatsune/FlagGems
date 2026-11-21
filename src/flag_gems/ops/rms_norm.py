@@ -336,6 +336,14 @@ def rms_norm_forward(x, normalized_shape, weight, eps=1e-5):
                 and 1024 <= N <= 4096
                 else None
             )
+            store_cache_policy = (
+                cache_hint.MUSA_NORM_STORE
+                if runtime.device.vendor_name == "mthreads"
+                and x.dtype == torch.float32
+                and M * N >= 8 * 1024 * 1024
+                and 1024 <= N <= 4096
+                else None
+            )
             rms_norm_kernel[M,](
                 y,
                 inv_rms,
@@ -349,6 +357,7 @@ def rms_norm_forward(x, normalized_shape, weight, eps=1e-5):
                 eps,
                 BLOCK_SIZE,
                 LOAD_CACHE_POLICY=load_cache_policy,
+                STORE_CACHE_POLICY=store_cache_policy,
             )
         else:
             rms_norm_loop_kernel[M,](y, inv_rms, x, weight, N, eps)
