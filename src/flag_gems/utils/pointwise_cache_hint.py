@@ -60,6 +60,7 @@ POLICIES = {
 _VENDOR_FAMILIES = {
     "nvidia": {
         "abs_func",
+        "ceil_func",
     },
 }
 
