@@ -25,6 +25,7 @@ from flag_gems.ops.layernorm import (
     layer_norm_persistent_kernel_multiline,
 )
 from flag_gems.runtime import torch_device_fn
+from flag_gems.utils import cache_hint
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +61,28 @@ def layer_norm(
                 input, output, weight, bias, mean, rstd, M, N, eps, tile_n
             )
         else:
+            tensor_bytes = M * N * input.element_size()
+            store_cache_policy = (
+                cache_hint.HCU_CS
+                if N % 128 == 0
+                and input.dtype in (torch.bfloat16, torch.float16)
+                and (
+                    tensor_bytes >= 2**31
+                    or (N == 16384 and tensor_bytes >= 128 * 1024 * 1024)
+                )
+                else None
+            )
             layer_norm_loop_kernel[(M,)](
-                input, output, weight, bias, mean, rstd, M, N, eps
+                input,
+                output,
+                weight,
+                bias,
+                mean,
+                rstd,
+                M,
+                N,
+                eps,
+                STORE_CACHE_POLICY=store_cache_policy,
             )
     return output, mean, rstd
 
