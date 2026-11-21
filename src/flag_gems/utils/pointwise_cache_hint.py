@@ -95,6 +95,7 @@ _VENDOR_FAMILIES = {
         "neg_func",
         "relu_forward",
         "sqrt_func",
+        "square_func",
     },
 }
 
