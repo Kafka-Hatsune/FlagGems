@@ -105,6 +105,7 @@ _VENDOR_FAMILIES = {
         "exp_func",
         "floor_func",
         "gelu_none",
+        "log1p_func",
     },
 }
 
