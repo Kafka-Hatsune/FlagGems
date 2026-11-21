@@ -100,6 +100,7 @@ _VENDOR_FAMILIES = {
     },
     "metax": {
         "abs_func",
+        "ceil_func",
     },
 }
 
