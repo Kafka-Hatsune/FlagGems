@@ -98,6 +98,9 @@ _VENDOR_FAMILIES = {
         "square_func",
         "trunc_func",
     },
+    "metax": {
+        "abs_func",
+    },
 }
 
 
