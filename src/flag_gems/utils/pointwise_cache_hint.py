@@ -107,6 +107,7 @@ _VENDOR_FAMILIES = {
         "gelu_none",
         "log1p_func",
         "neg_func",
+        "relu_forward",
     },
 }
 
