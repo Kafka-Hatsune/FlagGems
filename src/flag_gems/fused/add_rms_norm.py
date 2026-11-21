@@ -220,6 +220,14 @@ def add_rms_norm(x1, x2, normalized_shape, weight, eps=1e-5):
                 and 1024 <= N <= 4096
                 else None
             )
+            store_cache_policy = (
+                cache_hint.MUSA_NORM_STORE
+                if runtime.device.vendor_name == "mthreads"
+                and x1.dtype == torch.float32
+                and M * N >= 8 * 1024 * 1024
+                and 1024 <= N <= 4096
+                else None
+            )
             add_rms_norm_kernel[M,](
                 y,
                 x1,
@@ -235,6 +243,7 @@ def add_rms_norm(x1, x2, normalized_shape, weight, eps=1e-5):
                 eps,
                 BLOCK_SIZE,
                 LOAD_CACHE_POLICY=load_cache_policy,
+                STORE_CACHE_POLICY=store_cache_policy,
             )
         else:
             add_rms_norm_loop_kernel[M,](y, x1, x2, weight, N, eps)
