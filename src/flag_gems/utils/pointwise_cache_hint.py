@@ -96,6 +96,7 @@ _VENDOR_FAMILIES = {
         "relu_forward",
         "sqrt_func",
         "square_func",
+        "trunc_func",
     },
 }
 
