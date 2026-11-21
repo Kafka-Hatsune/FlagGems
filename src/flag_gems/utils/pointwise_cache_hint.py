@@ -110,6 +110,7 @@ _VENDOR_FAMILIES = {
         "relu_forward",
         "rsqrt_func",
         "sigmoid_forward",
+        "silu_forward",
     },
 }
 
