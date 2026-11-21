@@ -29,6 +29,7 @@ from flag_gems.ops.flash_kernel import (
     flash_varlen_fwd_kernel,
 )
 from flag_gems.runtime import torch_device_fn
+from flag_gems.utils import cache_hint
 from flag_gems.utils.random_utils import philox_backend_seed_offset
 
 logger = logging.getLogger(__name__)
@@ -576,7 +577,20 @@ def mha_varlan_fwd(
         }
 
         logger.debug("Running flash_varlen_fwd_kernel with config: %s", cfg_params)
-        kernel(*args, **cfg_params)
+        cache_policy = None
+        if (
+            flag_gems.vendor_name == "thead"
+            and q_dtype == torch.bfloat16
+            and head_size == 128
+            and max_seqlen_k >= 16384
+            and max_seqlen_q <= 256
+            and (seqlenq_ngroups_swapped or num_heads > num_heads_k)
+            and not is_paged
+        ):
+            cache_policy = (
+                cache_hint.PPU_NC if seqlenq_ngroups_swapped else cache_hint.PPU_CS
+            )
+        kernel(*args, **cfg_params, CACHE_POLICY=cache_policy)
 
         if seqlenq_ngroups_swapped:
             out = out.reshape(

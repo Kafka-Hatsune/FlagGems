@@ -16,7 +16,7 @@ import triton
 import triton.language as tl
 
 from flag_gems import runtime
-from flag_gems.utils import libentry, tl_extra_shim
+from flag_gems.utils import cache_hint, libentry, tl_extra_shim
 
 
 @triton.jit
@@ -1346,6 +1346,7 @@ def flash_varlen_fwd_kernel(
     BLOCK_K: tl.constexpr,
     num_warps: tl.constexpr,
     num_stages: tl.constexpr,
+    CACHE_POLICY: tl.constexpr = None,
 ):
     m_block = tl.program_id(0)
     bid = tl.program_id(1)
@@ -1486,9 +1487,9 @@ def flash_varlen_fwd_kernel(
                 block_shape=(BLOCK_N, BLOCK_K),
                 order=(0, 1),
             )
-            bK = tl.load(gK, boundary_check=(0, 1))
+            bK = cache_hint.load(gK, boundary_check=(0, 1), cache_policy=CACHE_POLICY)
             bK = tl.trans(bK)
-            bV = tl.load(gV, boundary_check=(0, 1))
+            bV = cache_hint.load(gV, boundary_check=(0, 1), cache_policy=CACHE_POLICY)
         S = tl.dot(bQ, bK, out_dtype=tl.float32)
         S = apply_softcap(S, softcap, is_softcap)
         S = apply_alibi(
@@ -1582,9 +1583,9 @@ def flash_varlen_fwd_kernel(
                 block_shape=(BLOCK_N, BLOCK_K),
                 order=(0, 1),
             )
-            bK = tl.load(gK)
+            bK = cache_hint.load(gK, cache_policy=CACHE_POLICY)
             bK = tl.trans(bK)
-            bV = tl.load(gV)
+            bV = cache_hint.load(gV, cache_policy=CACHE_POLICY)
         S = tl.dot(bQ, bK, out_dtype=tl.float32)
         S = apply_softcap(S, softcap, is_softcap)
         S = apply_alibi(
