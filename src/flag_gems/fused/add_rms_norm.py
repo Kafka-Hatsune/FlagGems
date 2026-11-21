@@ -246,6 +246,16 @@ def add_rms_norm(x1, x2, normalized_shape, weight, eps=1e-5):
                 STORE_CACHE_POLICY=store_cache_policy,
             )
         else:
-            add_rms_norm_loop_kernel[M,](y, x1, x2, weight, N, eps)
+            cache_policy = (
+                cache_hint.HCU_CS
+                if runtime.device.vendor_name == "hygon"
+                and x1.dtype == torch.bfloat16
+                and N >= 8192
+                and M * N >= 16 * 1024 * 1024
+                else None
+            )
+            add_rms_norm_loop_kernel[M,](
+                y, x1, x2, weight, N, eps, CACHE_POLICY=cache_policy
+            )
 
     return y
