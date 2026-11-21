@@ -122,6 +122,7 @@ _VENDOR_FAMILIES = {
         "floor_func",
         "gelu_none",
         "neg_func",
+        "relu_forward",
     },
 }
 
